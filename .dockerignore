@@ -1,0 +1,16 @@
+.git
+.env
+**/.env
+**/.env.local
+**/.venv
+**/__pycache__
+**/*.db*
+**/credentials
+backend/firebase.json
+backend/publisher.json
+.build
+node_modules
+dist
+src-tauri/target
+src-tauri/binaries
+publisher/data

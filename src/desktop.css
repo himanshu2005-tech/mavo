@@ -1,0 +1,157 @@
+/* The desktop widget: the M on the desktop, its menu, the agents and missed lists, the update pill
+   and card. One quiet popover above the icon, never anything over the whole screen. Same curve,
+   hairlines and type as the main window. */
+
+/* The popover: frosted, a hairline edge, one soft shadow; it grows out of the icon. */
+.orb-menu.dmenu { padding: 6px; border-radius: 14px; background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(20px) saturate(1.4);
+  box-shadow: 0 0 0 1px rgb(var(--ink-rgb) / .09), 0 12px 32px rgb(0 0 0 / .32); transform-origin: bottom right;
+  animation: dmenu-in .32s cubic-bezier(.32, .72, 0, 1) both; min-height: 0; overflow-y: auto; scrollbar-width: none; }
+:root[data-theme=light] .orb-menu.dmenu { box-shadow: 0 0 0 1px rgb(var(--ink-rgb) / .08), 0 12px 32px rgb(20 20 40 / .14); }
+@keyframes dmenu-in { from { opacity: 0; transform: translateY(6px) scale(.96); } }
+.orb-menu-stage { gap: 8px; }
+
+.dmenu-head { display: flex; align-items: center; gap: 12px; height: 30px; padding: 0 6px 0 8px; margin-bottom: 2px; }
+.dmenu-title { flex: 1 0 auto; font-size: 13px; font-weight: 600; letter-spacing: -.01em; color: var(--text); }
+.dmenu-status { display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dmenu-status i { flex: none; }
+.dmenu-status-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dmenu-status i { width: 6px; height: 6px; border-radius: 99px; background: var(--faint); }
+.dmenu-status[data-tone=good] i { background: var(--good); animation: mv-breathe 3.2s ease-in-out infinite; }
+.dmenu-status[data-tone=warn] { color: var(--warn); }
+.dmenu-status[data-tone=warn] i { background: var(--warn); }
+.dmenu-back { display: grid; place-items: center; width: 24px; height: 24px; margin-left: -4px; border-radius: 7px; color: var(--muted); transition: background .15s, color .15s; }
+.dmenu-back:hover { background: rgb(var(--ink-rgb) / .06); color: var(--text); }
+
+/* Rows, like a menu: an icon, a word, a count, a chevron. Hover is a soft fill. */
+.dmenu-rows { display: flex; flex-direction: column; }
+.dmenu-row { display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 8px; border-radius: 8px; font-size: 13px; color: var(--text); text-align: left;
+  transition: background .12s; }
+.dmenu-row svg { flex: none; color: var(--muted); }
+.dmenu-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmenu-row em { font-style: normal; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.dmenu-row .dmenu-chev { color: var(--faint); margin-right: -2px; }
+.dmenu-row:hover { background: rgb(var(--ink-rgb) / .07); }
+.dmenu-row:hover svg { color: var(--text); }
+.dmenu-row[data-tone=warn], .dmenu-row[data-tone=warn] svg:first-child { color: var(--warn); }
+.dmenu-quit, .dmenu-quit svg { color: var(--muted); }
+/* One agent waiting: its name, and why, on two lines. */
+.dmenu-need { height: auto; min-height: 44px; padding-top: 6px; padding-bottom: 6px; align-items: flex-start; }
+.dmenu-need svg:first-child { margin-top: 2px; }
+.dmenu-need .dmenu-chev { align-self: center; }
+.dmenu-need span { display: grid; gap: 1px; white-space: normal; }
+.dmenu-need b { font-weight: 500; color: var(--warn); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmenu-need small { font-size: 11.5px; line-height: 1.35; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.dmenu-sep { height: 1px; margin: 5px 8px; background: rgb(var(--ink-rgb) / .07); }
+
+/* Mute: a word and three small choices, all on one line. */
+.dmenu-mute { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 4px 0 8px; font-size: 13px; color: var(--text); }
+.dmenu-mute svg { flex: none; color: var(--muted); }
+.dmenu-mute > span { flex: 1; }
+.dmenu-seg { display: flex; padding: 2px; border-radius: 8px; background: rgb(var(--ink-rgb) / .06); }
+.dmenu-seg button { padding: 3px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 500; color: var(--muted); transition: background .12s, color .12s; }
+.dmenu-seg button:hover { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .18); }
+.dmenu-pill { padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 500; color: var(--text); background: rgb(var(--ink-rgb) / .07); transition: background .12s; }
+.dmenu-pill:hover:not(:disabled) { background: rgb(var(--ink-rgb) / .12); }
+.dmenu-pill[data-tone=bad] { color: #fff; background: var(--bad); }
+.dmenu-pill[data-tone=bad]:hover { background: color-mix(in srgb, var(--bad) 85%, #000); }
+.dmenu-confirm { display: flex; align-items: center; gap: 6px; height: 32px; padding: 0 4px 0 8px; font-size: 12.5px; color: var(--muted); }
+.dmenu-confirm span { flex: 1; }
+
+/* The lists (agents, missed): the popover, taller, scrolling inside. */
+.orb-menu.dlist { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; padding: 6px; }
+.dlist-empty, .orb-menu.dlist .missed-empty { padding: 28px 8px; text-align: center; font-size: 12.5px; color: var(--faint); }
+.dlist-rows { list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; }
+.dlist-row { position: relative; display: flex; align-items: center; border-radius: 9px; transition: background .12s; }
+.dlist-row:hover { background: rgb(var(--ink-rgb) / .06); }
+.dlist-open { flex: 1; min-width: 0; display: grid; gap: 3px; padding: 8px 4px 8px 8px; text-align: left; }
+.dlist-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dlist-line b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--text); }
+.dlist-dot { width: 6px; height: 6px; flex: none; border-radius: 99px; background: var(--faint); }
+.dlist-row[data-state=running] .dlist-dot { background: var(--good); }
+.dlist-row[data-state=working] .dlist-dot { background: var(--good); animation: map-ping 1.6s infinite; }
+.dlist-row[data-state=needs] .dlist-dot { background: var(--warn); }
+.dlist-row[data-state=stopped] .dlist-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--faint); }
+.dlist-next { padding-left: 14px; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dlist-next[data-tone=wait] { color: var(--warn); }
+.dlist-bar { display: block; height: 2px; margin: 2px 4px 0 14px; border-radius: 2px; background: rgb(var(--ink-rgb) / .07); overflow: hidden; }
+.dlist-bar i { display: block; height: 100%; border-radius: 2px; background: var(--clock); transition: width 1s linear; }
+/* Run now: there when you point at the row (or tab to it), a small round button. */
+.dlist-run { flex: none; display: grid; place-items: center; width: 26px; height: 26px; margin-right: 6px; border-radius: 99px; color: var(--text); background: rgb(var(--ink-rgb) / .08);
+  opacity: 0; scale: .85; transition: opacity .2s, scale .3s cubic-bezier(.32, .72, 0, 1), background .12s; }
+.dlist-row:hover .dlist-run, .dlist-run:focus-visible, .dlist-run:disabled { opacity: 1; scale: 1; }
+.dlist-run:hover:not(:disabled) { background: rgb(var(--ink-rgb) / .14); }
+.dlist-run:disabled { opacity: .45; }
+.orb-menu.dlist .missed-list { gap: 0; }
+.orb-menu.dlist .missed-list button { border-radius: 9px; padding: 8px; }
+.orb-menu.dlist .missed-list button:hover { background: rgb(var(--ink-rgb) / .06); }
+
+/* The update pill and card: the same glass as the menu. */
+.pill { border-radius: 99px; background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(20px) saturate(1.4);
+  box-shadow: 0 0 0 1px rgb(var(--ink-rgb) / .09), 0 12px 32px rgb(0 0 0 / .3); transition: transform .4s cubic-bezier(.32, .72, 0, 1), box-shadow .3s; }
+.pill:hover { transform: translateY(-1px); box-shadow: 0 0 0 1px rgb(var(--ink-rgb) / .14), 0 14px 36px rgb(0 0 0 / .34); }
+.toast-shell { border-radius: 16px; background: color-mix(in srgb, var(--surface) 92%, transparent); backdrop-filter: blur(20px) saturate(1.4);
+  box-shadow: 0 0 0 1px rgb(var(--ink-rgb) / .09), 0 16px 40px rgb(0 0 0 / .32); animation: dmenu-in .4s cubic-bezier(.32, .72, 0, 1) both; transform-origin: bottom right; }
+
+/* ── The settings sheet: a plain title, not a banner with art. ── */
+.workspace-body .hero { background: none !important; border: 0 !important; box-shadow: none !important; min-height: 0 !important; margin: 0 !important;
+  padding: 32px 48px 4px !important; border-radius: 0 !important; }
+.workspace-body .hero::before, .workspace-body .hero::after { display: none !important; }
+.workspace-body .hero-scene { display: none !important; }
+.workspace-body .hero h1, .workspace-body .hero-copy h1 { font-size: 22px !important; line-height: 30px !important; letter-spacing: -.02em !important; }
+.workspace-body .hero p { font-size: 13px !important; color: var(--muted) !important; }
+
+/* ── What happened ── */
+.happened { display: flex; flex-direction: column; gap: 22px; }
+.happened h3 { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: var(--faint); }
+.happened-attention { display: flex; flex-direction: column; gap: 6px; }
+.trouble { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 14px; border-radius: 12px; text-align: left;
+  background: rgb(from var(--warn) r g b / .07); box-shadow: inset 0 0 0 1px rgb(from var(--warn) r g b / .18); transition: background .15s; }
+.trouble:hover:not(:disabled) { background: rgb(from var(--warn) r g b / .12); }
+.trouble:disabled { cursor: default; }
+.trouble > svg:first-child { flex: none; color: var(--warn); }
+.trouble-text { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.trouble-text b { font-size: 13px; font-weight: 600; color: var(--text); }
+.trouble-text span { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trouble time { flex: none; font-size: 11.5px; color: var(--faint); }
+.trouble-go { flex: none; color: var(--faint); }
+.happened-bar { display: flex; align-items: center; justify-content: space-between; }
+.dmenu-seg button[aria-pressed=true] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgb(0 0 0 / .18); }
+.happened-empty { display: flex; align-items: center; gap: 8px; padding: 24px 0; font-size: 13px; color: var(--faint); }
+.happened-day ul { list-style: none; margin: 0; padding: 0; }
+.happened-day li { border-bottom: 1px solid rgb(var(--ink-rgb) / .05); }
+.happened-day li:last-child { border-bottom: 0; }
+.happening { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 40px; padding: 8px 6px; border-radius: 8px; text-align: left; transition: background .12s; }
+.happening:hover { background: rgb(var(--ink-rgb) / .04); }
+.happening time { flex: none; width: 64px; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.happening-dot { width: 6px; height: 6px; flex: none; border-radius: 99px; background: var(--good); opacity: .8; }
+[data-outcome=failed] .happening-dot { background: var(--bad); opacity: 1; }
+[data-outcome=waiting] .happening-dot { background: var(--warn); }
+[data-outcome=said] .happening-dot { background: var(--pool); }
+.happening-text { flex: 1; min-width: 0; display: flex; gap: 8px; align-items: baseline; overflow: hidden; }
+.happening-text b { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 500; color: var(--text); }
+.happening-text span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--muted); }
+.happening-tag { flex: none; padding: 1px 8px; border-radius: 99px; font-size: 11px; color: var(--bad); background: rgb(from var(--bad) r g b / .1); }
+.happening-tag[data-tone=wait] { color: var(--warn); background: rgb(from var(--warn) r g b / .1); }
+.happening-more { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 2px 6px 14px 90px; font-size: 12.5px; color: var(--muted); }
+.happening-reason { color: var(--text); }
+.happening-more pre { width: 100%; max-height: 220px; overflow: auto; margin: 0; padding: 10px 12px; border-radius: 10px; background: rgb(var(--ink-rgb) / .04);
+  font: 12px/1.55 ui-monospace, "Cascadia Code", monospace; color: var(--muted); white-space: pre-wrap; }
+
+/* An agent is working: a thin arc of light circles the icon, and its dot breathes. It stops the
+   moment the work is done. */
+.status-orb[data-state=working]::before { content: ""; position: absolute; inset: -4px; border-radius: 50%; padding: 2px; pointer-events: none;
+  background: conic-gradient(from var(--sweep), transparent 0deg, var(--clock) 70deg, rgb(from var(--clock) r g b / .15) 140deg, transparent 220deg);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+  animation: sweep 1.6s linear infinite; }
+.status-orb[data-state=working] .orb-dot { background: var(--clock); transform: scale(1); animation: orb-busy 1.6s ease-in-out infinite; }
+@keyframes orb-busy { 50% { box-shadow: 0 0 0 2px #161615, 0 0 0 5px rgb(from var(--clock) r g b / .3); } }
+.dmenu-status[data-tone=busy] { color: var(--clock); }
+.dmenu-status[data-tone=busy] i { background: var(--clock); animation: orb-busy-dot 1.2s ease-in-out infinite; }
+@keyframes orb-busy-dot { 50% { transform: scale(1.6); opacity: .6; } }
+
+/* The icon: a little lift under the pointer, a little give when pressed. */
+.status-orb { transition: transform .4s cubic-bezier(.32, .72, 0, 1), box-shadow .3s, background .3s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .orb-menu.dmenu, .toast-shell, .dmenu-status i, .dlist-dot, .status-orb::before, .status-orb .orb-dot { animation: none !important; }
+}

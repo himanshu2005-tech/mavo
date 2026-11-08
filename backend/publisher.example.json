@@ -1,0 +1,4 @@
+{
+  "google_client_id": "",
+  "description": "Publisher's public Desktop OAuth client ID only. Never include service-account keys or web client secrets."
+}

@@ -1,0 +1,7 @@
+{$MAVO_CORE_HOST} {
+    request_body {
+        max_size 256KB
+    }
+    reverse_proxy gateway:8741
+    header X-Content-Type-Options nosniff
+}

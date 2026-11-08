@@ -1,0 +1,107 @@
+/* ───────────────────────────── Crew cards and their living illustrations ─────────────────────────────
+   Every kind of Crew has its own hue (--hue, set on the card) and its own small scene. The scenes
+   move while the Crew works and rest, muted, while it is stopped; hovering wakes any of them. */
+
+.crew-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 20px; }
+.crew-card { position: relative; display: flex; flex-direction: column; border-radius: 24px; background: var(--surface); box-shadow: var(--shadow-card), inset 0 0 0 1px var(--border); overflow: hidden; text-align: left; color: var(--text);
+  transition: transform .35s var(--ease), box-shadow .35s var(--ease); animation: rise .45s var(--ease) both; }
+.crew-card:hover { transform: translateY(-5px); box-shadow: 0 26px 50px rgb(0 0 0 / .22), inset 0 0 0 1px rgb(var(--ink-rgb) / .16); }
+.crew-card-hit { position: absolute; inset: 0; z-index: 1; border-radius: inherit; background: transparent; }
+
+/* The stage: a soft gradient in the Crew's hue with two slow, blurred lights drifting behind the scene. */
+.crew-art, .drawer-art, .hero, .tile-art { --art: hsl(var(--hue, 250) 72% 50%); --art-2: hsl(calc(var(--hue, 250) + 42) 84% 60%);
+  position: relative; display: grid; place-items: center; overflow: hidden; isolation: isolate;
+  background: linear-gradient(150deg, hsl(var(--hue, 250) 92% 96%), hsl(calc(var(--hue, 250) + 30) 86% 91%)); }
+:root:not([data-theme=light]) .crew-art, :root:not([data-theme=light]) .drawer-art, :root:not([data-theme=light]) .hero, :root:not([data-theme=light]) .tile-art { --art: hsl(var(--hue, 250) 90% 72%); --art-2: hsl(calc(var(--hue, 250) + 36) 88% 68%);
+  background: linear-gradient(150deg, hsl(var(--hue, 250) 30% 15%), hsl(calc(var(--hue, 250) + 24) 34% 10%)); }
+:root:not([data-theme=light]) .crew-art::before, :root:not([data-theme=light]) .drawer-art::before, :root:not([data-theme=light]) .hero::before, :root:not([data-theme=light]) .tile-art::before { background: hsl(calc(var(--hue, 250) + 20) 70% 42%); opacity: .34; }
+:root:not([data-theme=light]) .crew-art::after, :root:not([data-theme=light]) .drawer-art::after, :root:not([data-theme=light]) .hero::after, :root:not([data-theme=light]) .tile-art::after { background: hsl(var(--hue, 250) 72% 40%); opacity: .3; }
+:root:not([data-theme=light]) .pp { fill: var(--raised); stroke: rgb(var(--ink-rgb) / .2); }
+.crew-art { height: 150px; }
+.drawer-art { height: 188px; }
+.crew-art::before, .crew-art::after, .drawer-art::before, .drawer-art::after, .hero::before, .hero::after, .tile-art::before, .tile-art::after { content: ""; position: absolute; z-index: -1; width: 62%; aspect-ratio: 1; border-radius: 50%; filter: blur(34px); opacity: .5; animation: blob 14s ease-in-out infinite alternate; }
+.crew-art::before, .drawer-art::before, .hero::before, .tile-art::before { left: -14%; top: -40%; background: var(--art-2); }
+.crew-art::after, .drawer-art::after, .hero::after, .tile-art::after { right: -16%; bottom: -46%; background: var(--art); animation-duration: 18s; animation-direction: alternate-reverse; }
+@keyframes blob { from { transform: translate(0, 0) scale(1); } to { transform: translate(18%, 12%) scale(1.25); } }
+
+.crew-art-svg { width: 78%; height: 100%; padding: 10px 0; overflow: visible; transition: opacity .4s, filter .4s; }
+.drawer-art .crew-art-svg { width: 300px; padding: 16px 0; }
+.crew-art-svg * { transform-box: fill-box; transform-origin: center; }
+
+/* Palette for the drawings */
+.pp { fill: var(--surface); stroke: rgb(var(--ink-rgb) / .12); stroke-width: 1.2; filter: drop-shadow(0 6px 10px rgb(0 0 0 / .13)); }
+.ac { fill: var(--art); } .ac2 { fill: var(--art-2); }
+.as { fill: color-mix(in srgb, var(--art) 22%, transparent); }
+.al { fill: none; stroke: var(--art); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.il { fill: none; stroke: rgb(var(--ink-rgb) / .3); stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.is { fill: rgb(var(--ink-rgb) / .12); }
+
+/* Motion */
+.a-float { animation: a-float 4.6s ease-in-out infinite; }
+.a-pulse { animation: a-pulse 2.2s ease-in-out infinite; }
+.a-pop { animation: a-pop 1.8s ease-in-out infinite; }
+.a-beat { animation: a-beat 1.5s ease-in-out infinite; }
+.a-grow { transform-origin: 50% 100%; animation: a-grow 2.8s ease-in-out infinite; animation-delay: var(--dl, 0s); }
+.a-blink { animation: a-blink 1.1s steps(1) infinite; }
+.a-spin { animation: a-spin 8s linear infinite; }
+.a-lift { animation: a-lift 2.4s ease-in-out infinite; }
+.a-ecg { stroke-dasharray: 60 140; animation: a-dash 2.2s linear infinite; }
+.a-scan { animation: a-scan 4.6s ease-in-out infinite; }
+.a-move { animation: a-move 5.2s ease-in-out infinite; }
+.a-slide { animation: a-slide 3.4s ease-in-out infinite; }
+.a-travel { offset-rotate: auto; animation: a-travel 3.6s linear infinite; animation-delay: var(--dl, 0s); }
+.a-drift { animation: a-drift 7s ease-in-out infinite; animation-delay: var(--dl, 0s); }
+.a-flicker { animation: a-flicker 3.2s ease-in-out infinite; animation-delay: var(--dl, 0s); }
+.a-smoke { animation: a-smoke 3.6s ease-out infinite; animation-delay: var(--dl, 0s); }
+.a-breathe { animation: a-breathe 4.8s ease-in-out infinite; }
+.a-ripple { animation: a-ripple 4.8s ease-out infinite; animation-delay: var(--dl, 0s); }
+.a-tick { stroke-dasharray: 1; animation: a-tick 4.8s ease-in-out infinite; animation-delay: var(--dl, 0s); }
+.a-flip { transform-origin: 0% 50%; animation: a-flip 4.4s ease-in-out infinite; }
+.a-orbit { offset-rotate: 0deg; animation: a-travel 5s linear infinite; }
+@keyframes a-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+@keyframes a-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.28); opacity: .72; } }
+@keyframes a-pop { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.35); } }
+@keyframes a-beat { 0%, 100% { transform: scale(1); } 12% { transform: scale(1.13); } 24% { transform: scale(.98); } 36% { transform: scale(1.08); } 54% { transform: scale(1); } }
+@keyframes a-grow { 0%, 100% { transform: scaleY(.4); } 50% { transform: scaleY(1); } }
+@keyframes a-blink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+@keyframes a-spin { to { transform: rotate(360deg); } }
+@keyframes a-lift { 0%, 100% { transform: translateY(7px); } 50% { transform: translateY(-8px); } }
+@keyframes a-dash { from { stroke-dashoffset: 60; } to { stroke-dashoffset: -140; } }
+@keyframes a-scan { 0%, 100% { transform: translate(-30px, 4px); } 50% { transform: translate(8px, -8px); } }
+@keyframes a-move { 0%, 14% { transform: translateX(0); } 44%, 70% { transform: translateX(41px); } 100% { transform: translateX(0); } }
+@keyframes a-slide { 0%, 100% { transform: translateY(2px); } 50% { transform: translateY(-15px); } }
+@keyframes a-travel { to { offset-distance: 100%; } }
+@keyframes a-drift { 0% { transform: translateX(-12px); opacity: 0; } 25%, 75% { opacity: .95; } 100% { transform: translateX(16px); opacity: 0; } }
+@keyframes a-flicker { 0%, 100% { opacity: 1; } 38% { opacity: .55; } 52% { opacity: 1; } 70% { opacity: .78; } }
+@keyframes a-smoke { 0% { transform: translateY(0) scale(.6); opacity: .85; } 100% { transform: translateY(-18px) scale(1.25); opacity: 0; } }
+@keyframes a-breathe { 0%, 100% { transform: scale(.93); } 50% { transform: scale(1.07); } }
+@keyframes a-ripple { 0% { transform: scale(.45); opacity: .75; } 100% { transform: scale(1.7); opacity: 0; } }
+@keyframes a-tick { 0%, 8% { stroke-dashoffset: 1; } 26%, 84% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: 1; } }
+@keyframes a-flip { 0%, 18% { transform: scaleX(1); } 50% { transform: scaleX(-1); opacity: .5; } 82%, 100% { transform: scaleX(1); } }
+
+/* Stopped Crew rest; hovering (or opening) wakes the picture. */
+.crew-card[data-running=false] .crew-art-svg { opacity: .55; filter: saturate(.35); }
+.crew-card[data-running=false] .crew-art-svg *, .crew-card[data-running=false] .crew-art::before, .crew-card[data-running=false] .crew-art::after { animation-play-state: paused; }
+.crew-card[data-running=false]:hover .crew-art-svg { opacity: .9; filter: none; }
+.crew-card[data-running=false]:hover .crew-art-svg * { animation-play-state: running; }
+
+.crew-chip { position: absolute; left: 14px; top: 14px; display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px 4px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 580; color: var(--text); background: color-mix(in srgb, var(--surface) 72%, transparent); backdrop-filter: blur(10px); box-shadow: inset 0 0 0 1px var(--border); }
+.crew-chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+.crew-card[data-tone=run] .crew-chip i { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 25%, transparent); animation: orb-pulse 2.4s ease-in-out infinite; }
+.crew-card[data-tone=work] .crew-chip i { background: var(--accent); animation: orb-pulse 1.1s ease-in-out infinite; }
+.crew-card[data-tone=warn] .crew-chip i { background: var(--warn); animation: orb-pulse 1.6s ease-in-out infinite; }
+
+.crew-body { display: flex; flex: 1; flex-direction: column; padding: 16px 20px 16px; }
+.crew-body h3 { margin: 0; font-size: 16px; font-weight: 640; letter-spacing: -0.016em; line-height: 22px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crew-body p { margin: 3px 0 0; font-size: 13px; color: var(--muted); }
+.crew-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; padding-top: 16px; font-size: 12px; color: var(--faint); }
+.crew-toggle { position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 6px; padding: 5px 14px; border-radius: 999px; font-size: 12.5px; font-weight: 620; color: var(--on-accent); background: var(--accent-solid); transition: transform .15s var(--ease), background .15s, filter .15s; }
+.crew-toggle:hover:not(:disabled) { filter: brightness(1.1); }
+.crew-toggle:active { transform: scale(.95); }
+.crew-toggle[data-on=true] { color: var(--muted); background: var(--fill-hover); }
+.crew-toggle[data-on=true]:hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); filter: none; }
+.crew-card.is-draft { box-shadow: inset 0 0 0 1.5px rgb(var(--ink-rgb) / .16); background: transparent; }
+.crew-new { align-items: center; justify-content: center; gap: 10px; min-height: 250px; color: var(--muted); background: transparent; box-shadow: inset 0 0 0 1.5px rgb(var(--ink-rgb) / .14); font-size: 14px; font-weight: 560; }
+.crew-new:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.crew-discard { position: relative; z-index: 2; padding: 4px 8px; border-radius: 999px; font-size: 12px; color: var(--faint); background: transparent; transition: color .15s, background .15s; }
+.crew-discard:hover { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }

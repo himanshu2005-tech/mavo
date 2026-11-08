@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mavo-backend"
+version = "0.1.0"
+description = "Local backend for the Mavo personal AI desktop application"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "pydantic-settings>=2.7,<3",
+  "psutil>=6.1,<8",
+  "playwright>=1.50,<2",
+  "PyJWT[crypto]>=2.10,<3",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+  "websockets>=13"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyinstaller>=6.11,<7",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mavo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pytest discovers imported fixtures; test arguments intentionally use their registered names.
+"tests/*.py" = ["F811"]

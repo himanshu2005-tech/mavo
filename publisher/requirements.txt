@@ -1,0 +1,7 @@
+# The gateway does not need the desktop, Playwright, Ollama, or Google OAuth tokens.
+fastapi>=0.115,<1
+httpx>=0.28,<1
+pydantic-settings>=2.7,<3
+PyJWT[crypto]>=2.10,<3
+SQLAlchemy>=2.0,<3
+uvicorn>=0.34,<1
