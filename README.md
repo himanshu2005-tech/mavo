@@ -30,6 +30,12 @@ The goal is not simply to answer messages. It is to make agent-based automation 
 
 *The running application with sample workspace data. This preview does not represent live account connections or completed user tasks.*
 
+### Desktop workspace
+
+![Mavo desktop showing the Connections panel, color-coded Crew graph, and desktop status menu](docs/assets/desktop-workspace.png)
+
+*An example desktop workspace with model routes, resources, actions, and the status menu. Running, stopped, and attention-required states are visible together; a running status does not imply a successful task outcome.*
+
 ## What makes Mavo different
 
 - **Responsibilities, not disposable prompts.** Multiple Crew instances can share a specialty while keeping separate instructions, permissions, schedules, checkpoints, and model budgets.
