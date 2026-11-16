@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
+from mavo.configuration import ConfigurationProposal
 from mavo.connectors.catalog import (
     ConnectorAccess,
     action_grant,
     provider_for,
     validate_capabilities,
 )
+from mavo.crew_composition import CrewComposition
 from mavo.daily_triggers import DailyTrigger, unique_daily_triggers
-from mavo.google_permissions import GoogleCapability
+from mavo.google_permissions import GOOGLE_CAPABILITY_LIMIT, GoogleCapability
 from mavo.resources.device_config import (
     DeviceMonitor,
     clean_threshold,
@@ -57,6 +60,8 @@ class AppStatus(BaseModel):
 
 
 class MessageView(BaseModel):
+    mentioned_crew_ids: list[str] = Field(default_factory=list)
+    mentioned_agent_ids: list[str] = Field(default_factory=list)
     id: str
     role: Literal["user", "assistant"]
     content: str
@@ -199,14 +204,16 @@ class CrewCreateRequest(ConnectorAccess):
     schedule_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     reminder_text: str | None = Field(default=None, max_length=1_000)
     review_interval_minutes: int = Field(default=30, ge=5, le=10080)
-    daily_call_limit: int = Field(default=12, ge=1, le=100)
+    daily_call_limit: int = Field(default=12, ge=1, le=2000)
     allow_device_metrics: bool = False
     allow_notifications: bool = False
     device_monitor: DeviceMonitor | None = None
     allow_weather: bool = False
     trigger_type: TriggerType | None = None
     google_resources: list[GoogleResource] = Field(default_factory=list, max_length=6)
-    google_capabilities: list[GoogleCapability] = Field(default_factory=list, max_length=10)
+    google_capabilities: list[GoogleCapability] = Field(
+        default_factory=list, max_length=GOOGLE_CAPABILITY_LIMIT
+    )
     mail_sender: str | None = Field(default=None, max_length=160)
     mail_subject: str | None = Field(default=None, max_length=160)
 
@@ -246,7 +253,7 @@ class CrewUpdateRequest(BaseModel):
     schedule_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     reminder_text: str | None = Field(default=None, max_length=1_000)
     review_interval_minutes: int | None = Field(default=None, ge=5, le=10080)
-    daily_call_limit: int | None = Field(default=None, ge=1, le=100)
+    daily_call_limit: int | None = Field(default=None, ge=1, le=2000)
     allow_device_metrics: bool | None = None
     allow_temp_cleanup: bool | None = None  # free space: old temp files (and the Recycle Bin)
     allow_notifications: bool | None = None
@@ -254,7 +261,9 @@ class CrewUpdateRequest(BaseModel):
     allow_weather: bool | None = None
     trigger_type: TriggerType | None = None
     google_resources: list[GoogleResource] | None = Field(default=None, max_length=6)
-    google_capabilities: list[GoogleCapability] | None = Field(default=None, max_length=10)
+    google_capabilities: list[GoogleCapability] | None = Field(
+        default=None, max_length=GOOGLE_CAPABILITY_LIMIT
+    )
     mail_sender: str | None = Field(default=None, max_length=160)
     mail_subject: str | None = Field(default=None, max_length=160)
     # Its place in a line of agents (pipelines.py).
@@ -313,10 +322,32 @@ class HandoverDecision(BaseModel):
     note: str = Field(default="", max_length=1000)
 
 
+class CrewAgentView(BaseModel):
+    model_config = {"from_attributes": True}
+    id: str
+    crew_id: str
+    key: str
+    name: str
+    role: str
+    instructions: str
+    route_id: str | None
+    definition: dict
+    execution: dict
+    status: str
+    runtime_state: str
+    checkpoint: str | None
+
+
 class CrewView(BaseModel):
+    agents: list[CrewAgentView] = Field(default_factory=list)
     fallback_route_id: str | None = None
     daily_triggers: list[DailyTrigger] = Field(default_factory=list)
     question: str | None = None
+    # Its agent's questions waiting for the person, each with the answers it offers.
+    asks: list[dict] = Field(default_factory=list)
+    # A keyboard shortcut that runs it at once, and why it could not be taken, if so.
+    hotkey: str | None = None
+    hotkey_problem: str | None = None
     # Work handed over that waits for the person's OK: approve it, or send it back.
     held: dict | None = None
     # An AI-call limit that stopped its last run, with a limit that would let it finish.
@@ -325,6 +356,9 @@ class CrewView(BaseModel):
     skipped_run: dict | None = None
     # The last run its local model could not do, done instead on a cloud route.
     fallback: dict | None = None
+    # The cycle it is working on now, step by step, so the map and its panel show what is
+    # happening ("Working…" alone left the person unsure whether it was stuck).
+    cycle: dict | None = None
     configuration_plan: dict = Field(default_factory=dict)
     id: str
     template_id: str
@@ -370,8 +404,14 @@ class ReminderView(BaseModel):
     status: str
     task_run_id: str | None = None
     task_step_id: str | None = None
+    # An agent's question: the answers it offers as buttons (a box for the person's own too).
+    choices: list[str] = []
 
     model_config = {"from_attributes": True}
+
+
+class ReminderAnswer(BaseModel):
+    answer: str = Field(min_length=1, max_length=1000)
 
 
 class CrewRunRequest(BaseModel):
@@ -466,7 +506,9 @@ class GoogleSignInRequest(BaseModel):
     model_config = {"extra": "forbid"}
     resources: list[GoogleResource] = Field(default_factory=list, max_length=6)
     all_services: bool = False
-    capabilities: list[GoogleCapability] = Field(default_factory=list, max_length=10)
+    capabilities: list[GoogleCapability] = Field(
+        default_factory=list, max_length=GOOGLE_CAPABILITY_LIMIT
+    )
 
 
 class SuggestedAction(BaseModel):
@@ -489,7 +531,40 @@ class SuggestedAction(BaseModel):
         return value
 
 
+SEARCH_ENGINES = re.compile(
+    # DuckDuckGo is not here: it is the engine Mavo's own browser.search uses.
+    r"(?:^|\.)(?:google\.[a-z.]{2,8}|bing\.com|yahoo\.com)$",
+    re.I,
+)
+
+
+def searched_not_opened(actions: list[SuggestedAction]) -> list[SuggestedAction]:
+    """A search engine is not a site to work on: "Signal Scout" listed www.google.com, and its
+    card asked the person to sign in to Google, which blocks automated browsers anyway. Its
+    searches go through Mavo's own web search (browser.search) instead."""
+    kept, searches = [], False
+    for action in actions:
+        engines = [d for d in action.domains if SEARCH_ENGINES.search(d.strip().lower())]
+        if (
+            not engines
+            or not action.operation.startswith("browser.")
+            or action.operation == "browser.search"
+        ):
+            kept.append(action)
+            continue
+        searches = True
+        others = [d for d in action.domains if d not in engines]
+        if others:
+            kept.append(action.model_copy(update={"domains": others}))
+    if searches and not any(a.operation == "browser.search" for a in kept):
+        kept.append(
+            SuggestedAction(operation="browser.search", reason="Search the web for what it needs")
+        )
+    return kept[:10]
+
+
 class CrewDraft(BaseModel):
+    composition: CrewComposition | None = None
     daily_triggers: list[DailyTrigger] = Field(default_factory=list, max_length=24)
     _daily_unique = field_validator("daily_triggers")(unique_daily_triggers)
     setup_questions: list[str] = Field(default_factory=list, max_length=3)
@@ -542,11 +617,21 @@ class CrewDraft(BaseModel):
     )
     model_config = {"extra": "forbid", "str_strip_whitespace": True}
     template_id: str = Field(min_length=1, max_length=64)
-    name: str = Field(min_length=1, max_length=80)
+    name: str = Field(
+        min_length=1,
+        max_length=80,
+        description="Distinctive, task-relevant Crew display name, normally 2-4 short words "
+        "(e.g. Meridian Brief). Preserve explicitly chosen and existing names.",
+    )
     responsibilities: str = Field(min_length=1, max_length=4000)
     route_id: str | None = Field(default=None, max_length=80)
     requested_actions: list[SuggestedAction] = Field(default_factory=list, max_length=10)
+    _no_search_engine_sites = field_validator("requested_actions")(
+        lambda cls, value: searched_not_opened(value)
+    )
     requested_notifications: bool = False
+    # Its alerts also go to the person's own Telegram bot (Resources > Telegram).
+    requested_telegram: bool = False
     requested_device_metrics: bool = False
     device_monitor: DeviceMonitor | None = None
     requested_weather: bool = False
@@ -556,26 +641,139 @@ class CrewDraft(BaseModel):
     review_interval_minutes: int = Field(default=30, ge=5, le=10080)
     daily_call_limit: int = Field(default=12, ge=1, le=100)
     requested_google_resources: list[GoogleResource] = []
-    requested_google_capabilities: list[GoogleCapability] = []
+    requested_google_capabilities: list[GoogleCapability] = Field(
+        default_factory=list, max_length=GOOGLE_CAPABILITY_LIMIT
+    )
     requested_connector_capabilities: list[str] = Field(default_factory=list, max_length=16)
     _known_connector_capabilities = field_validator("requested_connector_capabilities")(
         validate_capabilities
     )
     mail_sender: str | None = Field(default=None, max_length=160)
     mail_subject: str | None = Field(default=None, max_length=160)
+    hotkey: str | None = Field(
+        default=None,
+        max_length=40,
+        description="A keyboard shortcut that runs this Crew at once, only when the person asks "
+        "for one ('when I press Win+F9, ...'): keys joined by '+', such as 'Win+F9' or "
+        "'Ctrl+Alt+R'. It runs in addition to any schedule; use trigger_type manual when the "
+        "shortcut is the only way it should run. Null otherwise.",
+    )
+
+    @field_validator("hotkey", mode="before")
+    @classmethod
+    def usable_hotkey(cls, value):
+        """A shortcut Mavo can register, written one way ("win+f9" is Win+F9); anything else is
+        dropped, never a reason to refuse the draft."""
+        from mavo.hotkeys import normalize
+
+        return normalize(value) if value else None
+
+    @field_validator("max_model_calls", "daily_call_limit", mode="before")
+    @classmethod
+    def any_call_count(cls, value, info):
+        """A model's call count is a guess (limits.py caps the real work), never a reason to
+        refuse a draft."""
+        top = 20 if info.field_name == "max_model_calls" else 100
+        try:
+            return max(1, min(top, int(value)))
+        except (TypeError, ValueError):
+            return 5 if info.field_name == "max_model_calls" else 12
 
     @model_validator(mode="after")
     def supported_resource_requirements(self):
+        if (
+            self.composition
+            and len(self.composition.agents) == 1
+            and not self.leads_team
+            and not self.review
+        ):
+            member = self.composition.agents[0]
+            if not member.capabilities and not member.actions and not member.reviews:
+                # Proposal defaults only: the user still chooses account consent and Crew
+                # grants. Never retrofit active agents or override explicit restrictions.
+                reads = {
+                    "google:" + c
+                    for c in self.requested_google_capabilities
+                    if c.endswith((":read", ":body"))
+                }
+                reads |= {"google:" + r + ":read" for r in self.requested_google_resources}
+                if reads:
+                    if self.requested_notifications:
+                        reads.add("notifications:show")
+                    self.composition.agents[0] = type(member).model_validate(
+                        {
+                            **member.model_dump(),
+                            "capabilities": sorted(reads),
+                        }
+                    )
+        if self.composition and not self.leads_team and self.template_id != "computer":
+            from mavo.crew_composition import separate_access
+
+            # Reading content others can write (mail, invites, pages) and changing things are
+            # two agents, whatever the model proposed. Daily drafts too: "every evening at 9,
+            # read my calendar and add prep tasks" arrives as a daily trigger and only becomes
+            # a once-a-day review further down, so it stayed one agent. A plain text reminder
+            # reads nothing, so it is never split.
+            self.composition = separate_access(self.composition)
+        if self.composition:
+            # Compose requests only, never grants. The existing setup screen still obtains consent.
+            capabilities = {c for a in self.composition.agents for c in a.capabilities}
+            operations = {a.operation for a in self.requested_actions}
+            self.requested_actions += [
+                SuggestedAction(operation=op, reason="Required by a Crew role")
+                for op in sorted({op for a in self.composition.agents for op in a.actions})
+                if op not in operations
+            ]
+            self.requested_google_capabilities = sorted(
+                set(self.requested_google_capabilities)
+                | {c[7:] for c in capabilities if c.startswith("google:")}
+            )
+            self.requested_notifications |= "notifications:show" in capabilities
+            self.requested_weather |= "weather:read" in capabilities
+            self.requested_connector_capabilities = sorted(
+                set(self.requested_connector_capabilities)
+                | {c for c in capabilities if c.startswith(("github:", "feeds:"))}
+            )
+            if len(self.requested_actions) > 10:
+                raise ValueError("Crew requests more than the supported action count")
         if self.daily_triggers:
-            if self.trigger_type not in {"manual", "daily"}:
+            if self.trigger_type == "interval" and len(self.daily_triggers) == 1:
+                # Work at a time on some days only ("every Friday at 5 pm", "weekdays at 9"):
+                # its one trigger carries the days.
+                self.schedule_time = self.daily_triggers[0].time
+            elif self.trigger_type not in {"manual", "daily"}:
                 raise ValueError("Daily reminder triggers cannot mix with other trigger types")
-            self.trigger_type = "daily"
-            self.schedule_time = self.daily_triggers[0].time
-        if self.trigger_type == "daily" and self.template_id != "schedule" and self.schedule_time:
+            else:
+                self.trigger_type = "daily"
+                self.schedule_time = self.daily_triggers[0].time
+        needs_ai_review = bool(
+            self.requested_actions
+            or self.requested_google_resources
+            or self.requested_google_capabilities
+            or self.requested_connector_capabilities
+            or self.requested_weather
+            or self.requested_device_metrics
+        )
+        if (
+            self.trigger_type == "daily"
+            and self.schedule_time
+            and (self.template_id != "schedule" or needs_ai_review)
+        ):
+            if len(self.daily_triggers) > 1:
+                raise ValueError(
+                    "Multiple daily AI review times are not supported; use one review time"
+                )
             # Work at a time of day ("every morning at 8, the top AI news"): a Crew that reviews
             # once a day at that time. A daily trigger is otherwise a plain reminder, and this
-            # request was refused outright.
-            self.trigger_type, self.daily_triggers = "interval", []
+            # request was refused outright. Schedule Crew can also do AI planning;
+            # its calendar-reading workflow is not a deterministic text reminder.
+            # Its days are kept: "every Friday at 5 pm" ran every day at 5 pm, and a weekly
+            # calendar clean-up every evening.
+            self.trigger_type = "interval"
+            self.daily_triggers = [t for t in self.daily_triggers[:1] if len(t.weekdays) < 7]
+            self.review_interval_minutes = 1440
+        elif self.trigger_type == "interval" and self.daily_triggers:
+            self.daily_triggers = [t for t in self.daily_triggers[:1] if len(t.weekdays) < 7]
             self.review_interval_minutes = 1440
         if self.trigger_type == "daily":
             if self.template_id != "schedule":
@@ -682,6 +880,7 @@ class CrewLink(BaseModel):
 
 
 class CoordinatorDecision(BaseModel):
+    configuration_change: ConfigurationProposal | None = None
     crew_proposals: list[CrewDraft] = Field(default_factory=list, max_length=8)
     model_config = {"extra": "forbid"}
     reply: str = Field(min_length=1, max_length=8000)
@@ -696,6 +895,9 @@ class CoordinatorDecision(BaseModel):
     connect: list[CrewLink] = Field(default_factory=list, max_length=4)
     # Lasting facts the person just told about themselves: kept in Mavo's shared memory.
     remember: list[str] = Field(default_factory=list, max_length=5)
+    # Facts in memory that are now wrong or that the person asked to erase, exactly as they
+    # appear in context.memory: removed, so a changed fact is never kept twice as current.
+    forget: list[str] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="before")
     @classmethod
@@ -722,6 +924,14 @@ class CoordinatorDecision(BaseModel):
 
     @model_validator(mode="after")
     def single_operation(self):
+        if self.configuration_change and (
+            self.task
+            or self.crew_proposal
+            or self.crew_proposals
+            or self.delegate_to
+            or self.connect
+        ):
+            raise ValueError("Review a configuration change separately from executing work")
         # A job now AND the Crew that carry it on ("suggest guests now, and tell me when one
         # replies") is one request: a task may come with new Crew. Not with a question (the task
         # would start before the answer), a delegation, or a change to an existing Crew.
@@ -743,12 +953,16 @@ class CoordinatorDecision(BaseModel):
 
 
 class CoordinatorRequest(BaseModel):
+    mentioned_agent_ids: list[str] = Field(default_factory=list, max_length=12)
     model_config = {"extra": "forbid"}
     message: str = Field(min_length=1, max_length=8000)
+    # Saved files (knowledge_files) attached to this message: the model reads their text.
+    attachments: list[str] = Field(default_factory=list, max_length=5)
     request_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
     session_id: str = Field(default="main", pattern=r"^(?:main|[0-9a-fA-F-]{36})$")
     conversation_id: str | None = Field(default=None, pattern=r"^[0-9a-fA-F-]{36}$")
     crew_id: str | None = Field(default=None, max_length=80)
+    mentioned_crew_ids: list[str] = Field(default_factory=list, max_length=12)
 
     @field_validator("message")
     @classmethod
@@ -762,5 +976,7 @@ class AcceptCrewProposal(BaseModel):
     model_config = {"extra": "forbid", "str_strip_whitespace": True}
     name: str | None = Field(default=None, min_length=1, max_length=80)
     approved_google_resources: list[GoogleResource] = []
-    approved_google_capabilities: list[GoogleCapability] = []
+    approved_google_capabilities: list[GoogleCapability] = Field(
+        default_factory=list, max_length=GOOGLE_CAPABILITY_LIMIT
+    )
     allow_device_metrics: bool = False

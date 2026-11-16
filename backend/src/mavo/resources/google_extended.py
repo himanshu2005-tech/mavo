@@ -44,7 +44,10 @@ async def fetch_metadata(pool, resource):
         }
         data = await pool.get("drive", "/files", params)
         rows = data.get("files", [])
-        if not isinstance(rows, list):
+        if not isinstance(rows, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]
+            for item in rows
+        ):
             raise GoogleConnectionError("Google returned invalid Drive metadata")
         return [
             {
@@ -72,7 +75,11 @@ async def fetch_metadata(pool, resource):
     if not isinstance(rows, list):
         raise GoogleConnectionError("Google returned invalid Contacts data")
     for item in rows[:100]:
-        if not isinstance(item, dict):
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("resourceName"), str)
+            or not item["resourceName"]
+        ):
             raise GoogleConnectionError("Google returned invalid Contacts data")
         for key in ("names", "emailAddresses", "phoneNumbers"):
             values = item.get(key, [])

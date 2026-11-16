@@ -409,7 +409,8 @@ def test_disabled_access_can_be_saved_after_folder_was_deleted(client, auth, tmp
     assert response.status_code == 200
 
 
-def test_bounded_automatic_followups(client, auth, tmp_path):
+def test_bounded_automatic_followups(client, auth, tmp_path, monkeypatch):
+    monkeypatch.setattr("mavo.limits.RUN_MAX", 2)  # Mavo's run ceiling, small for the test
     route = client.post(
         "/api/v1/routes",
         headers=auth,

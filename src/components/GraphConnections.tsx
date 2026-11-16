@@ -14,13 +14,14 @@ interface Props {
   hoverable: (selection: Selection) => HTMLAttributes<HTMLButtonElement>;
   onAnchors: (anchors: Record<string, Point>) => void;
   providerActivity?:Record<string,ProviderExecution>;
+  loading?:boolean;error?:string|null;
 }
 
 /** One grouped graph object, with individual, permission-aware connection endpoints. */
-export function GraphConnections({ models, nodes, width, selection, lit, onSelect, hoverable, onAnchors,providerActivity={} }: Props) {
+export function GraphConnections({ models, nodes, width, selection, lit, onSelect, hoverable, onAnchors,providerActivity={},loading=false,error=null }: Props) {
   const root = useRef<HTMLElement>(null);
   const signature = JSON.stringify([models.map(m => [m.key,m.route.name,m.route.model,m.route.connected]),
-    nodes.map(n => [n.key,n.label,n.allowed])]);
+    nodes.map(n => [n.key,n.label,n.allowed,n.pendingUsers?.length])]);
   useLayoutEffect(() => {
     const panel = root.current;
     if (!panel) return;
@@ -65,8 +66,8 @@ export function GraphConnections({ models, nodes, width, selection, lit, onSelec
     <header className="connections-title"><Network size={15} aria-hidden="true"/><b>Connections</b><span>{models.length+nodes.length}</span></header>
     <div className="connections-body">
       <section className="connection-group" data-group="route" aria-label="Model routes">
-        <header className="connection-group-title"><Cpu size={13} aria-hidden="true"/><h3>Model routes</h3><span>{models.length}</span></header>
-        {!models.length && <p className="connections-empty">No model routes in use.</p>}
+        <header className="connection-group-title"><Cpu size={13} aria-hidden="true"/><h3>Model routes</h3><i className="connection-line-key" aria-hidden="true"/><span>{models.length}</span></header>
+        {!models.length && <p className="connections-empty">{loading?'Loading model routes…':'No saved model routes.'}</p>}
         {models.map(b => {
           const live=providerActivity[b.route.id];
           const sel: Selection = {kind:'route',key:b.key}, local=(live?.provider??b.route.provider)==='ollama', down=b.route.connected===false;
@@ -76,28 +77,38 @@ export function GraphConnections({ models, nodes, width, selection, lit, onSelec
             {...hoverable(sel)} onClick={() => onSelect(sel)}
             title={`${b.route.name} (${b.route.model}, ${local?'on this PC':'cloud'}): ${b.users.length} agent${b.users.length===1?'':'s'} think with it${down?'. Not reachable now':''}`}>
             <span className="graph-route-icon">{local?<Cpu size={14} aria-hidden="true"/>:<Cloud size={14} aria-hidden="true"/>}</span>
-            <span className="graph-route-text"><b>{b.route.name}</b><span>{live?.model??b.route.model}</span></span>
+            <span className="graph-route-text"><b>{b.route.name}</b><span>{live?.model??b.route.model}{!b.users.length?' · Not assigned':''}</span></span>
             <span className="connection-route-type">{live?.stage==='requesting'?<><LoaderCircle size={10} className="provider-request-spinner" aria-hidden="true"/>{live.count>1?`${live.count} requests`:'Requesting'}</>:live?.stage==='responded'?<><Check size={10} aria-hidden="true"/>Responded</>:live?.stage==='failed'?'Request failed':live?.stage==='cancelled'?'Cancelled':down?'Unavailable':local?'Local':'Cloud'}</span>
+            <ConnectionPort kind="route" count={b.users.length}/>
           </button>;
         })}
       </section>
       {groups.map(({kind,label,icon:Icon}) => {
         const rows=nodes.filter(n => n.kind===kind);
         return <section key={kind} className="connection-group" data-group={kind} aria-label={label}>
-          <header className="connection-group-title"><Icon size={13} aria-hidden="true"/><h3>{label}</h3><span>{rows.length}</span></header>
-          {!rows.length && <p className="connections-empty">No {label.toLowerCase()} in use.</p>}
+          <header className="connection-group-title"><Icon size={13} aria-hidden="true"/><h3>{label}</h3><i className="connection-line-key" aria-hidden="true"/><span>{rows.length}</span></header>
+          {!rows.length && <p className="connections-empty">{loading?`Loading ${label.toLowerCase()}…`:kind==='resource'?'No connected resources.':'No enabled actions.'}</p>}
           {rows.map(n => {
             const sel: Selection={kind:n.kind,key:n.key};
+            const pending=n.pendingUsers?.length??(n.allowed?0:n.users.length);
             return <button key={n.key} className="graph-node connection-row" data-kind={n.kind} data-connection-key={n.key}
               data-dim={!!lit&&!lit.keys.has(n.key)} data-identity={`${n.kind}:${n.key}`} style={identityStyle(identityColor(`${n.kind}:${n.key}`))} data-allowed={n.allowed} aria-pressed={picked(sel)}
-              {...hoverable(sel)} onClick={() => onSelect(sel)} title={`${n.label}: ${n.users.length} agent${n.users.length===1?'':'s'}${n.allowed?'':' (not allowed yet)'}`}>
+              {...hoverable(sel)} onClick={() => onSelect(sel)} title={`${n.label}: ${n.connectionState??'Crew access'} · ${n.users.length} agent${n.users.length===1?'':'s'} use or request this connection${pending?`; ${pending} need access`:''}`}>
               <span className="map-icon"><WireIcon name={n.icon}/></span><span className="map-label">{n.label}</span>
-              {!n.allowed&&<span className="connection-unavailable">Not allowed</span>}
+              {!!pending&&<span className="connection-unavailable">{n.allowed?`${pending} pending`:'Needs access'}</span>}
+              {!pending&&n.connectionState&&<span className="connection-route-type">{n.connectionState}</span>}
+              <ConnectionPort kind={n.kind} count={n.users.length}/>
             </button>;
           })}
         </section>;
       })}
     </div>
-    <footer className="connections-footer">Select a connection to see its agents.</footer>
+    <footer className="connections-footer">{error?<span role="status">{error}</span>:<>Select a connection or Crew to trace its links. Numbers show linked Crew. Unassigned connections have no lines. Availability does not grant access.</>}</footer>
   </section>;
+}
+
+function ConnectionPort({kind,count}:{kind:'route'|'resource'|'action';count:number}) {
+  return <span className="connection-port" data-kind={kind} data-linked={count>0} title={`${count} linked Crew`}>
+    <span className="connection-user-count" aria-label={`${count} linked Crew`}>{count}</span><i aria-hidden="true"/>
+  </span>;
 }

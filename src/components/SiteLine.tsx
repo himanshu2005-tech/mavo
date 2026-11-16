@@ -28,3 +28,14 @@ export function SiteLine({ sites }: { sites: string[] }) {
     {error && <p role="alert" className="notice error-notice">{error}</p>}
   </div>;
 }
+
+/** One quiet link beside the test: sign in to the crew's site ahead of time, if you like. */
+export function SignInLink({ host }: { host: string }) {
+  const [opened, setOpened] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (opened) return <span className="text-[12px] text-zinc-500">Sign in there, then close the window.</span>;
+  return <>
+    <button type="button" className="btn-quiet" onClick={() => { setError(null); api.browserSignIn("https://" + host).then(() => setOpened(true)).catch(e => setError(e instanceof Error ? e.message : "Could not open the browser.")); }}>{`Sign in to ${host}`}</button>
+    {error && <span role="alert" className="text-[12px] text-rose-300">{error}</span>}
+  </>;
+}

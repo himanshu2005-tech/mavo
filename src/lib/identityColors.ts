@@ -2,7 +2,7 @@ import type { CSSProperties } from "react";
 
 export interface IdentityColor { hue: number; dark: string; light: string }
 export type IdentityPalette = Record<string, IdentityColor>;
-const STORAGE = "mavo-identity-colors-v1";
+const STORAGE = "mavo-identity-colors-v2";  // v2: softer tones; the old vivid ones are not reused
 const hexPattern = /^#[0-9a-f]{6}$/;
 
 function hash(key: string): number {
@@ -65,7 +65,7 @@ export function allocateIdentityColors(keys: string[], previous: IdentityPalette
     let best:IdentityColor|undefined,bestScore=-1;
     for (let i=0;i<256;i++) {
       const value=mix(seed+Math.imul(i+1,0x9e3779b9));
-      const hue=(value%3600)/10,sat=52+(value>>>12)%34;
+      const hue=(value%3600)/10,sat=20+(value>>>12)%34;
       const candidate={hue,dark:hsl(hue,sat,60+(value>>>18)%18),light:hsl(hue,sat,33+(value>>>24)%15)};
       if (darkUsed.has(candidate.dark)||lightUsed.has(candidate.light)
         ||contrast(candidate.dark,"#181818")<3||contrast(candidate.light,"#f5f5f5")<3) continue;

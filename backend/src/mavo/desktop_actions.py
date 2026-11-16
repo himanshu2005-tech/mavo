@@ -27,21 +27,94 @@ from mavo.projects import Projects
 from mavo.session_keeper import free_port, keep_session_cookies
 
 
+def kill_tree(pid: int) -> None:
+    """Stops a command and everything it started (npm, a dev server, a build's children)."""
+    try:
+        parent = psutil.Process(pid)
+        family = [*parent.children(recursive=True), parent]
+    except psutil.Error:
+        return
+    for process in family:
+        try:
+            process.kill()
+        except psutil.Error:
+            pass
+
+
 class ToolArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+def sequence_script(steps: list[str]) -> str:
+    """One PowerShell script running `steps` in order: each announced, each checked, stopping at
+    the first that fails (an error, or a program's non-zero exit) and saying which."""
+    lines = ["$ErrorActionPreference = 'Stop'"]
+    for n, step in enumerate(steps, 1):
+        label = step.splitlines()[0][:80].replace("'", "''")
+        lines += [
+            f"Write-Output '--- step {n} of {len(steps)}: {label}'",
+            "$global:LASTEXITCODE = 0",
+            "try {",
+            step,
+            '} catch { Write-Output "step '
+            + str(n)
+            + ' failed: $($_.Exception.Message)"; exit 1 }',
+            f'if ($LASTEXITCODE -ne 0) {{ Write-Output "step {n} failed (exit $LASTEXITCODE)"; '
+            "exit $LASTEXITCODE }",
+        ]
+    lines.append(f"Write-Output '--- all {len(steps)} steps done'")
+    return "\n".join(lines)
+
+
 class TerminalArgs(ToolArgs):
-    command: Literal[
-        "git.status",
-        "git.diff",
-        "git.log",
-        "git.branches",
-        "python.version",
-        "node.version",
-        "system.info",
-    ]
+    # A ready-made read-only check, or any command line (`shell`). A shell command is checked by
+    # a separate safety reviewer first; anything risky waits for the person (terminal_safety).
+    command: (
+        Literal[
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.branches",
+            "python.version",
+            "node.version",
+            "system.info",
+        ]
+        | None
+    ) = None
+    shell: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4000,
+        description="Any PowerShell command line, run in `folder`. Non-interactive: no prompts, "
+        "no editors, no servers that never exit. Checked by a safety reviewer before it runs.",
+    )
+    steps: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=25,
+        description="Several PowerShell commands to run one after another in `folder` (instead "
+        "of `shell`), each its own step: it stops at the first that fails, and the output says "
+        "which step said what. The whole sequence is checked by the safety reviewer first.",
+    )
     folder: str = Field(min_length=1, max_length=1024)
+    timeout_seconds: int = Field(default=120, ge=5, le=900)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sequence(cls, data):
+        """Steps become one script, run in order and stopped at the first failure, so it is
+        reviewed, approved and run as the whole it is."""
+        if isinstance(data, dict) and data.get("steps") and not data.get("shell"):
+            steps = [str(s).strip() for s in data["steps"] if str(s).strip()]
+            if steps:
+                data = {**data, "shell": sequence_script(steps)}
+        return data
+
+    @model_validator(mode="after")
+    def one_command(self):
+        if (self.command is None) == (self.shell is None):
+            raise ValueError("Give either a ready-made command or a shell command line")
+        return self
 
 
 class BrowserOpen(ToolArgs):
@@ -105,6 +178,8 @@ class BrowserSearch(ToolArgs):
     """A web search through one fixed engine. The model supplies words, never a URL."""
 
     query: str = Field(min_length=1, max_length=300)
+    # Only results from the last day, week, month or year: "latest", "today", prices, news.
+    recent: Literal["day", "week", "month", "year"] | None = None
 
     @field_validator("query")
     @classmethod
@@ -114,10 +189,11 @@ class BrowserSearch(ToolArgs):
         return " ".join(value.split())
 
 
-def search_url(query):
+def search_url(query, recent=None):
     from urllib.parse import quote_plus
 
-    return f"https://{SEARCH_HOST}/html/?q={quote_plus(query)}"
+    since = {"day": "d", "week": "w", "month": "m", "year": "y"}.get(recent or "")
+    return f"https://{SEARCH_HOST}/html/?q={quote_plus(query)}" + (f"&df={since}" if since else "")
 
 
 class BrowserNavigate(ToolArgs):
@@ -136,6 +212,9 @@ class BrowserNavigate(ToolArgs):
 
 class BrowserRead(ToolArgs):
     scroll: bool = False  # scroll down first so lazily loaded rows and cards appear
+    # Find text on the page instead of reading all of it: each match with the words around it
+    # and the ref of what to click there (Ctrl+F, for an agent).
+    find: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class BrowserElement(ToolArgs):
@@ -154,6 +233,13 @@ class BrowserElement(ToolArgs):
 
 class BrowserFill(BrowserElement):
     text: str = Field(max_length=4000)
+
+
+class BrowserUpload(BrowserElement):
+    """Attach one of the person's saved files (by its name, as listed in their saved files) to
+    a file field: a résumé on a job application. Never any other file on the PC."""
+
+    file: str = Field(min_length=1, max_length=160)
 
 
 class BrowserSelect(BrowserElement):
@@ -216,6 +302,7 @@ DESKTOP_MODELS = {
     "browser.hover": BrowserElement,
     "browser.drag": BrowserDrag,
     "browser.fill": BrowserFill,
+    "browser.upload": BrowserUpload,
     "browser.select": BrowserSelect,
     "browser.press": BrowserPress,
     "browser.scroll": BrowserScroll,
@@ -466,6 +553,13 @@ CAPTCHA = re.compile(
     r"|security check",
     re.I,
 )
+# A site turning requests away for a while ("Sorry, we're not able to serve your requests this
+# quickly"): retrying at once only makes it worse. Checked on short pages only.
+RATE_LIMITED = re.compile(
+    r"too many requests|rate[- ]limit|not able to serve your requests this quickly"
+    r"|requests? (?:too|so) (?:quickly|fast)|slow down|\b429\b",
+    re.I,
+)
 TRACKING_COOKIE = re.compile(
     r"_ga|_gid|_gat|_gcl|_fb|_hj|__utm|_cl[ik]|_uet|_dd_|ajs_|amp_|mp_|NID$|IDE$|__cf|cf_|"
     r"optanon|cookieconsent|cookie_?(?:consent|notice|policy)|_GRECAPTCHA|visitor|tracking",
@@ -500,6 +594,7 @@ class DesktopActions:
 
     def __init__(self, root):
         self.root = Path(root)
+        self.files_dir = None  # Mavo's data folder: its saved files are the only uploads
         self.new_tabs = []
         self.browser_lock = asyncio.Lock()
         self.context = self.playwright = self.page = None
@@ -510,6 +605,11 @@ class DesktopActions:
         self.children = set()
         self.projects = Projects(children=self.children)
         self.pinned_domains = []
+        # A recording of each agent's turn in the browser (Playwright tracing): screenshots and
+        # the page at every step, to replay what it did. One open part at a time.
+        self.tracing = False
+        self.trace_open = False
+        self.loose_traces: list[Path] = []
         self.scope_guard = None
         self.proxy = None
         self.active_unrestricted = False
@@ -608,6 +708,20 @@ class DesktopActions:
               snippet: s ? (s.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 260) : ''};
     }).filter(x => x && /^https?:/.test(x.url) && !/duckduckgo\\.com/.test(x.url)).slice(0, 8)"""
 
+    async def found(self, query: str) -> list[dict]:
+        """The search's results. With none, what the search page showed instead is kept
+        (search_page), so the model reading it says what happened (a bot check, an error, or
+        truly nothing) rather than "found nothing". Mavo never tries to get around a check."""
+        results = await self.search_results()
+        self.search_page = ""
+        if not results and query:
+            try:
+                text = await self.page.locator("body").inner_text(timeout=4000)
+            except Exception:  # noqa: BLE001
+                text = ""
+            self.search_page = " ".join(text.split())[:600]
+        return results
+
     async def search_results(self) -> list[dict]:
         """Each search hands back its own results, so a search that is followed by another one
         before a read is not lost (an agent ran five in a row and only ever saw the last)."""
@@ -615,6 +729,81 @@ class DesktopActions:
             return await self.page.evaluate(self.SEARCH_RESULTS)
         except Exception:
             return []
+
+    # The close control of a pop-up, only: never sign-up, login, "continue with" or accept.
+    CLEAR_OVERLAYS = """() => {
+      const vis = el => { const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const W = innerWidth, H = innerHeight;
+      const boxes = [...document.querySelectorAll('[role=dialog], [aria-modal=true], .modal, [class*=modal], [class*=popup], [class*=overlay], [id*=modal], [id*=popup]')]
+        .filter(vis);
+      for (const el of document.querySelectorAll('body *')) {
+        const s = getComputedStyle(el);
+        if ((s.position === 'fixed' || s.position === 'sticky') && Number(s.zIndex) >= 100 && vis(el)) {
+          const r = el.getBoundingClientRect();
+          if (r.width * r.height > 0.2 * W * H) boxes.push(el);
+        }
+      }
+      const word = /^\\s*(?:[×✕✖xX]|close|no,? thanks|not now|maybe later|skip|later|dismiss)\\s*$/i;
+      const never = /sign|log ?in|register|continue with|accept|agree|allow|subscribe|apply|buy|pay/i;
+      for (const box of boxes) {
+        const controls = [...box.querySelectorAll('button, a, [role=button], span, i, div')].filter(vis);
+        const close = controls.find(el => {
+          const text = (el.innerText || '').trim(), label = el.getAttribute('aria-label') || '';
+          const cls = (el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '';
+          if (never.test(text) || never.test(label)) return false;
+          return word.test(text) || /^close|dismiss/i.test(label)
+            || (/(^|[\\s_-])close([\\s_-]|$)|btn-close|modal-close|close-?btn|icon-close/i.test(String(cls)) && text.length < 3);
+        });
+        if (close) { close.click(); return (close.getAttribute('aria-label') || close.innerText || 'close').trim().slice(0, 40); }
+      }
+      return null;
+    }"""
+
+    # Text on the page, Ctrl+F style: visible matches only, each with the block around it and the
+    # ref of the nearest thing to act on. The first match is scrolled into view.
+    FIND = """(needle) => {
+      const n = needle.toLowerCase(), out = [], seen = new Set();
+      const shown = el => { const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none' && (r.width > 0 || r.height > 0); };
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node, count = 0;
+      while ((node = walker.nextNode())) {
+        if (!node.nodeValue || node.nodeValue.toLowerCase().indexOf(n) < 0) continue;
+        const el = node.parentElement;
+        if (!el || !shown(el) || el.closest('script,style,noscript')) continue;
+        count++;
+        let block = el;
+        while (block.parentElement && block !== document.body
+               && (block.innerText || '').length < 80
+               && (block.parentElement.innerText || '').length < 700) block = block.parentElement;
+        if (seen.has(block) || out.length >= 12) continue;
+        seen.add(block);
+        const target = el.closest('[data-mavo-ref]') || block.querySelector('[data-mavo-ref]');
+        const text = (block.innerText || '').replace(/\\s+/g, ' ').trim();
+        const at = Math.max(0, text.toLowerCase().indexOf(n) - 100);
+        out.push({
+          snippet: (at > 0 ? '…' : '') + text.slice(at, at + 260) + (text.length > at + 260 ? '…' : ''),
+          ref: target ? target.getAttribute('data-mavo-ref') : null,
+        });
+        if (out.length === 1) el.scrollIntoView({block: 'center'});
+      }
+      return {count, matches: out};
+    }"""
+
+    async def clear_overlays(self) -> str | None:
+        """Closes a pop-up over the page (Esc, then its close control), as a person would.
+        Returns what it clicked, or None. Never anything but a close control."""
+        with contextlib.suppress(Exception):
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        try:
+            closed = await self.page.evaluate(self.CLEAR_OVERLAYS)
+        except Exception:
+            return None
+        if closed:
+            await asyncio.sleep(0.5)
+        return closed
 
     async def press_on(self, element, double=False):
         """Click as a person would. Something in the way (a banner, a tip, a dialog) is first
@@ -627,8 +816,7 @@ class DesktopActions:
         except Exception as exc:
             if "Timeout" not in type(exc).__name__:
                 raise
-        await self.page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
+        await self.clear_overlays()
         try:
             await click(timeout=4000)
             return
@@ -1106,7 +1294,9 @@ class DesktopActions:
                     const r = el.getBoundingClientRect();
                     return r.width > 0 && r.height > 0
                       && /^\\s*(?:sign|log)\\s?in\\s*$/i.test(el.innerText || ''); }) || {}).href || '',
-                  text: (document.body ? document.body.innerText : '').slice(0, 2000)
+                  text: (document.body ? document.body.innerText : '').slice(0, 2000),
+                  size: document.body ? document.body.innerText.length : 0,
+                  links: document.querySelectorAll('a[href]').length
                 })"""
             )
         except Exception:
@@ -1130,8 +1320,15 @@ class DesktopActions:
             else "unknown"
         )
         self.login_link = info["link"] if urlsplit(info["link"]).hostname == host else ""
+        if len(info["text"]) < 3000 and RATE_LIMITED.search(info["text"]):
+            return wall("rate_limited")
         if CAPTCHA.search(info["text"] + " " + self.page.url):
             return wall("captcha")
+        # A full page with a sign-up pop-up over it (Internshala's results behind "Register")
+        # is not a wall: the listings are right there. A real sign-in page is a form and little
+        # else.
+        if info.get("size", 0) > 4000 and info.get("links", 0) > 60:
+            return None
         if info["password"]:
             return wall("login", here)
         sso = re.search(
@@ -1415,9 +1612,15 @@ class DesktopActions:
                 # The browser's own debug channel, on this computer only, for as long as the window
                 # is open: it lets Mavo keep session-only sign-ins (see session_keeper.py).
                 f"--remote-debugging-port={port}",
+                # Its own console notes stay out of Mavo's: closing the window printed Chromium's
+                # harmless "Failed to unregister class Chrome_WidgetWin_0. Error = 1412".
+                "--log-level=3",
                 url,
             ],
             close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         self.interactive_until = time.monotonic() + 1800
         self.user_window_flag = True
@@ -1540,10 +1743,57 @@ class DesktopActions:
         if self.guard and not self.guard():
             raise ValueError("Desktop actions are paused or Mavo is signed out")
 
+    async def trace_part(self):
+        """Start recording this turn, if not already (the browser is open and recording)."""
+        if self.tracing and not self.trace_open and self.context:
+            try:
+                await self.context.tracing.start_chunk()
+                self.trace_open = True
+            except Exception:  # noqa: BLE001 - a recording never stops the work
+                self.tracing = False
+
+    async def end_trace_part(self, path: Path) -> bool:
+        """Save the open recording to `path`. Caller holds the browser lock or is closing it."""
+        if not (self.tracing and self.trace_open and self.context):
+            return False
+        self.trace_open = False
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            async with asyncio.timeout(20):
+                await self.context.tracing.stop_chunk(path=str(path))
+            return path.exists()
+        except Exception:  # noqa: BLE001 - no recording, nothing else lost
+            return False
+
+    async def keep_trace(self, path: Path, after: float = 0.0) -> bool:
+        """Keep the recording of the turn that just ended at `path` (a run's step): the open one,
+        or the one saved when the browser closed at the end of that turn, if made after `after`
+        (seconds): never another run's."""
+        async with self.browser_lock:
+            if await self.end_trace_part(path):
+                return True
+            fresh = [p for p in self.loose_traces if int(p.stem) / 1e9 >= after]
+            if fresh:
+                loose = fresh[-1]
+                self.loose_traces = [p for p in self.loose_traces if p not in fresh]
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    loose.replace(path)
+                    return True
+                except OSError:
+                    return False
+        return False
+
     async def teardown(self, force=False):
         """Close Mavo's automated browser whatever state it is in. Each step is bounded: a frozen
         page cannot stop it from closing, and a browser that will not close is ended outright
         (its profile is Mavo's own) so the next launch is not blocked by a leftover process."""
+        if self.trace_open and self.context and not force:
+            # Closing at the end of a turn: its recording is kept for the run to claim.
+            loose = self.root / "traces" / "loose" / f"{time.time_ns()}.zip"
+            if await self.end_trace_part(loose):
+                self.loose_traces = [*self.loose_traces[-2:], loose]
+        self.trace_open = self.tracing = False
         context, playwright, proxy = self.context, self.playwright, self.proxy
         self.context = self.playwright = self.page = self.proxy = None
         self.browser_owner = self.scope_guard = self.interactive_owner = None
@@ -1593,7 +1843,70 @@ class DesktopActions:
             if process.returncode is None:
                 process.kill()
 
+    async def shell(self, args):
+        """Any command line, already passed by the safety review (or approved by the person)."""
+        from mavo.terminal_safety import clean_environment
+
+        folder = Path(args["folder"]).resolve(strict=True)
+        if not folder.is_dir():
+            raise ValueError("Choose an existing folder for the command")
+        if os.name == "nt":
+            executable = shutil.which("powershell") or "powershell.exe"
+            argv = [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                # UTF-8 output, so text in any language or script is read back correctly.
+                "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + args["shell"],
+            ]
+        else:
+            executable, argv = "/bin/sh", ["-c", args["shell"]]
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            *argv,
+            cwd=folder,
+            env=clean_environment(),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            **({"creationflags": 0x08000000} if os.name == "nt" else {}),
+        )
+        self.children.add(process)
+        chunks, size, timed_out = [], 0, False
+        try:
+            try:
+                async with asyncio.timeout(args.get("timeout_seconds", 120)):
+                    while chunk := await process.stdout.read(8192):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > 400_000:  # keep reading so it never blocks, keep only the end
+                            joined = b"".join(chunks)[-200_000:]
+                            chunks, size = [joined], len(joined)
+                    await process.wait()
+            except TimeoutError:
+                timed_out = True
+            output = b"".join(chunks).decode(errors="replace")
+            return {
+                "stdout": ("…\n" + output[-12000:]) if len(output) > 12000 else output,
+                "exit_code": process.returncode if not timed_out else None,
+                "timed_out": timed_out,
+                "truncated": len(output) > 12000,
+            }
+        finally:
+            if process.returncode is None:
+                kill_tree(process.pid)
+                try:
+                    await asyncio.wait_for(process.wait(), 10)
+                except TimeoutError:
+                    pass
+            self.children.discard(process)
+
     async def terminal(self, args):
+        if args.get("shell"):
+            return await self.shell(args)
         folder = Path(args["folder"]).resolve(strict=True)
         command = args["command"]
         if command == "python.version":
@@ -1716,6 +2029,8 @@ class DesktopActions:
                     if self.browser_owner == "core"
                     else "Another Crew owns the browser. Close its session first."
                 )
+            if self.context and operation != "browser.close":
+                await self.trace_part()
             if operation == "browser.close":
                 if self.context:
                     await self.context.close()
@@ -1729,10 +2044,14 @@ class DesktopActions:
                     self.proxy = None
                 return {"closed": True}
             searched = operation == "browser.search"
+            asked_for = args.get("query", "") if searched else ""
             if searched:
                 # A search is an ordinary page load of the fixed engine, with the same scope,
                 # proxy and public-address checks as browser.open.
-                operation, args = "browser.open", {"url": search_url(args["query"])}
+                operation, args = (
+                    "browser.open",
+                    {"url": search_url(args["query"], args.get("recent"))},
+                )
             self.active_domains = with_companions(rule["domains"])
             self.active_unrestricted = rule["mode"] == "unrestricted"
             if self.proxy:
@@ -1867,6 +2186,11 @@ class DesktopActions:
                         self.track_tabs()
                         self.browser_owner = owner
                         self.pinned_domains = list(self.active_domains)
+                        try:
+                            await self.context.tracing.start(screenshots=True, snapshots=True)
+                            self.tracing = True
+                        except Exception:  # noqa: BLE001 - a recording never stops the browser
+                            self.tracing = False
                     except Exception:
                         if self.context:
                             await self.context.close()
@@ -1884,6 +2208,10 @@ class DesktopActions:
                 used_saved_login = await self.autofill()
                 if used_saved_login:
                     await self.settle(12)
+                else:
+                    # A sign-up nag or newsletter box over the page: closed before the agent
+                    # looks, so it reads the page, not the pop-up.
+                    await self.clear_overlays()
             else:
                 if not self.page or self.page.is_closed():
                     raise ValueError("Open a page in Mavo's browser first")
@@ -1949,7 +2277,43 @@ class DesktopActions:
                             text, delay=15, timeout=max(8000, len(text) * 60)
                         )
                     else:
-                        await element.fill(args["text"], timeout=8000)
+                        try:
+                            await element.fill(args["text"], timeout=8000)
+                        except Exception as exc:
+                            if "Timeout" not in type(exc).__name__:
+                                raise
+                            # A pop-up over the box (a sign-up nag, a newsletter box): close it
+                            # as a person would, then type.
+                            await self.clear_overlays()
+                            await element.fill(args["text"], timeout=5000)
+                elif operation == "browser.upload":
+                    from mavo.knowledge_files import find
+
+                    found = find(self.files_dir, args["file"]) if self.files_dir else None
+                    if not found:
+                        raise ValueError(
+                            f'"{args["file"]}" is not one of the person\'s saved files. Only '
+                            "files saved in Mavo (Knowledge, or attached in the chat) can be "
+                            "attached."
+                        )
+                    element = self.target(args)
+                    if await element.count() == 0:
+                        raise ValueError("That field is gone. Read the page again for fresh refs.")
+                    if (await element.get_attribute("type") or "").lower() != "file":
+                        # Job sites hide the real file field behind an "Upload résumé" button:
+                        # the field inside what was pointed at, or the page's only one.
+                        inner = element.locator("input[type=file]")
+                        page_fields = self.page.locator("input[type=file]")
+                        if await inner.count() == 1:
+                            element = inner
+                        elif await page_fields.count() == 1:
+                            element = page_fields
+                        else:
+                            raise ValueError(
+                                "That is not a file field. Use the ref of the file input."
+                            )
+                    await element.set_input_files(str(found[1]), timeout=15000)
+                    await self.settle(4, quiet=0.7, empty_hold=2.5)
                 elif operation == "browser.select":
                     element = self.target(args)
                     if await element.count() == 0:
@@ -1996,7 +2360,12 @@ class DesktopActions:
                     ),
                     **({"signed_in_with_saved_login": True} if used_saved_login else {}),
                     **({"navigation": navigation} if navigation else {}),
-                    **({"results": await self.search_results()} if searched else {}),
+                    **({"results": await self.found(asked_for)} if searched else {}),
+                    **(
+                        {"search_page": self.search_page}
+                        if searched and getattr(self, "search_page", "")
+                        else {}
+                    ),
                     **self.take_dialogs(),
                     **({"sign_in_required": wall} if (wall := await self.sign_in_wall()) else {}),
                     "session": self.session_hint,
@@ -2022,6 +2391,24 @@ class DesktopActions:
             if snapshot["shadow"]:
                 page_text += "\n" + snapshot["shadow"]
             url, title = self.page.url, await self.page.title()
+            if args.get("find"):
+                # Only the matches, each with its surroundings and what to click: a 2,000-item
+                # results page answered in a few lines instead of 12,000 characters.
+                found = await self.page.evaluate(self.FIND, args["find"])
+                return {
+                    "url": url,
+                    "title": title,
+                    "find": {"text": args["find"], **found},
+                    "untrusted": True,
+                    "note": (
+                        "Matches only, first one scrolled into view; act on a match's ref, or "
+                        "browser.read without find for the whole page."
+                        if found["matches"]
+                        else f'"{args["find"]}" is not on this page. Try other words, scroll, or '
+                        "read the whole page."
+                    ),
+                    **({"sign_in_required": wall} if (wall := await self.sign_in_wall()) else {}),
+                }
             return {
                 "url": url,
                 "title": title,

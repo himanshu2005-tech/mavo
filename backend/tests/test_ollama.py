@@ -13,6 +13,19 @@ from mavo.ollama import OllamaClient, OllamaUnavailable
 MESSAGES = [{"role": "user", "content": "Pick a quote."}]
 
 
+def test_worker_schema_is_sent_to_ollama_without_affecting_ordinary_chat():
+    from mavo.model_router import WORKER_SCHEMA
+
+    client = OllamaClient("http://127.0.0.1:11434")
+    schema = {"type": "object", "properties": {"summary": {"type": "string"}}}
+    token = WORKER_SCHEMA.set(schema)
+    try:
+        assert client.request("fixture", MESSAGES, False)["format"] == schema
+    finally:
+        WORKER_SCHEMA.reset(token)
+    assert "format" not in client.request("fixture", MESSAGES, False)
+
+
 def client_with(handler, **kw):
     return OllamaClient("http://127.0.0.1:11434", transport=httpx.MockTransport(handler), **kw)
 
@@ -28,7 +41,7 @@ async def test_every_request_sets_the_context_and_turns_thinking_off():
     assert await client_with(handler, context=8192).chat("qwen2.5:3b", MESSAGES) == "Stay curious."
     body = sent[0]
     assert (
-        body["options"] == {"num_ctx": 8192}
+        body["options"] == {"num_ctx": 8192, "num_predict": 4096}
         and body["think"] is False
         and body["keep_alive"] == "10m"
     )

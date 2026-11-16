@@ -1,5 +1,106 @@
 # Development
 
+## Core service lifecycle
+
+Use `.\scripts\start-mavo.ps1` (or `-Restart` to reload code and interrupt active work).
+Debug Tauri hosts set `MAVO_DEV_MANAGE_CORE=true` for their Python sidecar. For the
+explicit development URL `http://127.0.0.1:8741` only, the sidecar starts Core, checks
+readiness, and recovers exits with backoff and a four-attempt ceiling. Check connection
+allows another bounded recovery attempt. It never sends model requests while probing
+health. `dev.ps1` and direct Tauri development launches receive the same behavior.
+
+Healthy existing Core processes are reused, not stopped. Unknown port owners are
+never killed. App shutdown closes only a test/runtime-owned process tree; Windows
+job ownership also covers hard host exits. Logs are under ignored
+`.build/logs/core-managed-*.log`. Release hosts explicitly disable this convenience
+and still require a hosted HTTPS publisher; no shared provider key is bundled.
+
+Chat health refreshes automatically (every two seconds while disconnected, ten
+while connected). Explicit Check connection bypasses the health cache. Failed
+checks are not negatively cached; health recovery does not replay user messages.
+The green header badge describes the **local workspace**, not model availability.
+
+`scripts/check-core-runtime.py` probes the actual local service without inference.
+Adding `--live-model` makes exactly one small request with the configured publisher
+model/key and spends provider credits. It does not activate Crew or use account
+tools; test-owned processes are cleaned up and existing services are left alone.
+On 10 November 2026, the real health check and one AIRouter request passed (229
+reported tokens). This is connectivity verification, not a guarantee of plan quality.
+
+Deterministic coverage is in `backend/tests/test_dev_core.py`; browser startup,
+automatic recovery and forced refresh are checked by `scripts/check-startup.py`.
+Set `MAVO_UI_TEST_URL` to use an isolated fixture Vite port instead of 1420.
+
+## Test before adding a Crew
+
+Chat/builder drafts now run a bounded first-run check before activation, calibrating each
+specialist's future model-call limit to measured calls + 3 within approved ceilings. Failed
+tests remain drafts. See [coverage, budgets and safety limitations](docs/first-run-verification.md).
+Read-only tests use actual authorized data/models; automatic tests never send mail or perform
+other consequential writes merely to prove setup. Restart with `.\scripts\start-mavo.ps1 -Restart`.
+
+For event-bound inbox triage, confirmed Calendar/Tasks update delivery, supported resource
+windows and safe troubleshooting, see [Mail and resource reliability](docs/mail-and-resource-reliability.md).
+
+The same setup preview now covers all registered actions, including Gmail modifications,
+terminal/browser/Windows control, file/project changes and GitHub writes. Preview is never
+approval to run a script or evidence of a real write. [Coverage and limits](docs/first-run-verification.md).
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m pytest backend/tests/test_action_previews.py backend/tests/test_mail_setup_preview.py backend/tests/test_calendar_setup_preview.py backend/tests/test_first_run.py --basetemp=.build/test-action-previews
+```
+
+With an isolated Vite server on 1432, run
+`.\backend\.venv\Scripts\python.exe scripts/check-crew-setup-ui.py --mixed` for the actual
+mixed-action setup/review/enable UI with intercepted fixture APIs. No mail, commands or
+paid inference is used by these tests. Omit `--mixed` for the calendar fixture.
+
+## Crew V2
+
+Migration 0020 runs at backend startup. Existing Crew receive one stable logical member without
+new jobs or changed running leases. Do not reset the database. Restart with
+`.\scripts\dev.ps1 -Restart` when ready to interrupt active work and load the backend changes.
+The publisher gateway must also load the updated coordinator protocol when deployed separately.
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m pytest backend/tests/test_crew_v2.py backend/tests/test_orchestration.py backend/tests/test_migrations.py
+npm run check
+```
+
+For the isolated browser check, run Vite on 1432, then set `$env:PYTHONPATH='backend/src'` and run
+`.\backend\.venv\Scripts\python.exe scripts/check-orchestration.py`. It uses HTTP fixtures,
+never real model credits or accounts. [V2 behavior and release gaps](docs/crew-architecture-v2.md).
+
+## Unified orchestration checks
+
+Restart the desktop with ` .\scripts\dev.ps1 -Restart` after backend/schema changes; it retains
+saved data but interrupts active work. Migrations 0018/0019 run at backend startup. Update the
+publisher gateway too when deploying the extended coordinator protocol.
+
+Run the isolated regressions with:
+
+```powershell
+.\backend\.venv\Scripts\python.exe -m pytest backend/tests/test_orchestration.py backend/tests/test_tasks.py backend/tests/test_lines.py backend/tests/test_crew_workers.py backend/tests/test_migrations.py
+npm run check
+```
+
+For browser interaction checks, start `node .\node_modules\vite\bin\vite.js --host 127.0.0.1 --port 1432`
+in another terminal, then run:
+
+```powershell
+$env:PYTHONPATH = 'backend/src'
+.\backend\.venv\Scripts\python.exe scripts/check-orchestration.py
+.\backend\.venv\Scripts\python.exe scripts/check-connections.py
+```
+
+This uses fixture accounts/API responses only and writes its screenshot beneath ignored
+`.build/orchestration-check`. It tests keyboard multi-mentions, canonical routing IDs,
+concurrent correlated replies, a capability switch and a configuration diff. See
+[the implementation and limits](docs/orchestration.md) before testing real providers.
+
+The connection check verifies the zero-Crew case: saved routes and authorized resource
+inventory stay visible and inspectable without fabricating agent grants or graph edges.
+
 ## Model map regression checks
 
 Home uses radial agent nodes and one grouped Connections box; there is no workflow-board
@@ -8,6 +109,18 @@ and line alignment while the box scrolls or the map zooms. Identity-color unit t
 500 Crews plus resources, routes and actions without repeated RGB values in either theme.
 Camera tests cover framing 2 through 500 agents. These are not a promise that every color
 is perceptually distinguishable or that every label is readable in a dense overview.
+
+Connections use thick solid model-route lines, thin solid resource lines, dashed action
+lines, dotted missing-access lines and grey dashed stopped-Crew lines. Selecting a Crew or
+connection isolates its links, including routes assigned to active specialist members.
+Connection rows show linked-Crew counts; a saved but unassigned connection has no edge.
+These are configuration relationships, not claims that a tool or model is executing.
+
+With the isolated Vite server on 1432, run
+`backend\.venv\Scripts\python.exe scripts\check-map-links.py` to check actual browser stroke
+contrast/widths, keyboard tracing, clickable paths, compact layout, reduced motion and
+2/14/100/500-Crew fixtures. Screenshots go to `.build/map-links-check`. This never changes
+real accounts, calls models or creates persistent Crew.
 
 Startup regression: with Vite on 1420, run
 `backend\.venv\Scripts\python.exe scripts\check-startup.py`. It loads the real application
@@ -30,6 +143,14 @@ after testing. Real route tests from the model panel perform one inference on th
 The browser check also injects run snapshots into an isolated store: no provider lights up
 merely because a Crew is enabled, actual requests show progress, and fast completions stay
 visible. Startup, palette persistence and reduced motion have separate regression coverage.
+Execution feedback stays on the relevant agent node and model route, without a floating
+notification stack. Up to three recent execution labels remain readable when zoomed out;
+active work has priority, and the camera never follows work automatically.
+Dense maps retain faint connection paths and screen-readable countdown dots. Network and
+timer controls toggle the layers without changing permissions or schedules. Pending planner
+resources and practical-example suggestions use dashed links, not implicit grants; shared
+connections retain per-agent pending counts. Browser fixtures cover 100 scheduled agents,
+mixed granted/pending access, both toggles, and removing a clock when an agent needs input.
 
 With temporary native WebView debugging enabled, `node scripts/check-native-map.mjs` checks
 the real desktop map, loopback health and rejection of anonymous requests without changing
@@ -49,6 +170,17 @@ cargo --version
 ```
 
 ## Setup and launch
+
+After Google sign-in, a new local workspace opens Welcome → Providers → Resources. Providers
+can be added through the real route form or explicitly skipped; resources remain optional and
+denied by default. Progress is saved against the verified account binding, not a browser flag.
+Existing completed setup resumes the workspace directly. This is still one owner per local
+workspace; it does not allow another account to inherit the previous owner's data.
+
+With Vite on 1432, `backend\.venv\Scripts\python.exe scripts\check-onboarding.py` checks
+welcome, real route-form submission with isolated API fixtures, explicit skip, optional resources,
+restart/resume, account-specific progress, compact layout, and failure recovery. No actual
+accounts, provider credits, location permissions, or connector grants are used in the test.
 
 ```powershell
 .\scripts\setup.ps1
@@ -87,6 +219,16 @@ Backend tests use temporary SQLite databases and an HTTP-level Ollama mock. They
 `backend/tests/test_automation_matrix.py` creates disposable Crew through real API endpoints and exercises all three device-report modes with notifications on/off; enabling and revoke/regrant transitions; stop/delete/pause/revocation during a blocked OS read; repeated counters; restart baselines; network/timeout/malformed model output; and fair, bounded scheduler concurrency. It uses controlled fault fixtures rather than touching personal accounts, filling drives, or disabling real networking. Delivery baselines are distinct from physical alert hysteresis: an unauthorized read must not count as a delivered warning. Revocation immediately cancels queued Crew updates, even if no delivery poll occurs before reauthorization.
 
 ## Live AIRouter verification
+
+For a smaller everyday-Crew evaluation, see [Daily-agent behavior checks](docs/daily-agent-testing.md).
+`backend\.venv\Scripts\python.exe scripts\check-daily-agents.py --simulate` exercises news,
+agenda and inbox workflows without credentials or network. `--live-airouter --max-calls 6`
+opts into billed inference with one shared hard request ceiling and synthetic account data.
+The live and simulated reports are separate; passing fixture tests is not live-provider verification.
+
+For real Chromium controls, verified browser-to-agent handoffs, an eight-agent review/fix
+stress test and a shared live-call ceiling, see [Complex browser and Crew checks](docs/complex-agent-testing.md).
+The zero-cost entry point is `backend\.venv\Scripts\python.exe scripts\check-complex-crew.py --simulate`.
 
 Account providers are not model providers. See [docs/providers/README.md](docs/providers/README.md) and [one-time GitHub App registration](docs/github-app-setup.md). `backend/tests/test_github_auth.py` covers native device authorization, repository selection, token refresh, provider failures, cancellation, account mismatch and Crew use after connection. `backend/tests/test_connectors.py` covers connected-only filtering, exact grants, cached reads, repository limits and verified writes. With temporary WebView debugging enabled, `node scripts/check-github-ui.mjs` mounts the actual connection component in an isolated test root with intercepted HTTP and an injected browser opener: no account authorization or access change is submitted. `node scripts/check-connectors-ui.mjs` checks the actual Resources card/default browser path and optional masked-token fallback without pressing real Connect. Disable debugging afterwards. HTTP fixtures are not evidence of a live connection; real checks require publisher configuration and user consent. No Microsoft registration is needed or supported.
 
@@ -147,6 +289,11 @@ Google diagnostics: `backend\.venv\Scripts\python.exe scripts\check-google.py` c
 The backend log and database live under the Windows local application-data directory for `dev.mavo.desktop`. Logs must never contain tokens, prompts, credentials, or message bodies.
 
 ## Publisher-funded normal chat
+
+For specific failure codes, message retention, request references and safe recovery,
+see [Chat failures and recovery](docs/chat-reliability.md). After changing publisher
+or sidecar code, `scripts/start-mavo.ps1 -Restart` explicitly restarts both owned
+processes; it can interrupt active work. Publisher logs are timestamped in `.build/logs/`.
 
 For Google connection failures in a packaged sidecar, verify the publisher's `/health` has `google_oauth_configured: true`, not just the Core AI key configured. Root development Google aliases or publisher-prefixed server credentials are supported; none are included in installer metadata. See [Google setup](docs/google-setup.md#packaged-sign-in-configure-the-existing-publisher-service). With a temporary native WebView debug session, `node scripts/check-google-flow-ui.mjs --check-services` prints only safe configuration/grant/probe outcomes. `--open` starts browser consent but never approves it. Always disable temporary WebView debugging afterward. Broker tests are in `backend/tests/test_publisher_oauth.py`; the existing Google suite also tests native→publisher→Google exchange/refresh using signed fixture identities.
 

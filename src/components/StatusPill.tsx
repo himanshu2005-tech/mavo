@@ -1,13 +1,15 @@
 import { useAppStore } from "../store/app";
 
+/** Quiet when all is well: the bar says nothing. Only a problem, or the first connect, is shown,
+ *  as plain words. */
 export function StatusPill() {
   const status = useAppStore((state) => state.status);
   const error = useAppStore((state) => state.statusError);
-  const connected = Boolean(status && !error);
+  if (status && !error) return null;
   return (
-    <div role="status" className="flex items-center gap-2 whitespace-nowrap text-[12px] text-zinc-500">
-      <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-[var(--good)]" : "bg-[var(--warn)]"}`} />
-      {connected ? "Connected" : error ? "Unavailable" : "Connecting…"}
+    <div role="status" title="Local workspace status. Mavo Core has a separate service connection."
+      className={`whitespace-nowrap text-[12px] ${error ? "text-[var(--warn)]" : "text-zinc-500"}`}>
+      {error ? "Workspace unavailable" : "Connecting…"}
     </div>
   );
 }

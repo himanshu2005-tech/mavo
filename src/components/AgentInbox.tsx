@@ -5,13 +5,15 @@ import { initials } from "../lib/radialGraph";
 import { parseTime } from "../lib/time";
 import { useAppStore } from "../store/app";
 import type { CrewAsk, CrewInstance, Reminder } from "../types";
-import { agentState } from "./AgentGraph";
+import { agentState, botState } from "./AgentGraph";
+import { AgentBot } from "./AgentBot";
 import { agentStyle } from "./CrewFan";
 import { needsReason } from "./CrewQuickList";
 import { CrewReplyBox } from "./CrewReplyBox";
 import { HandoverCard } from "./LinePanel";
 import { LimitCard, limitOf } from "./LimitCard";
 import { Report } from "./Report";
+import { ConversationActivities } from './ConversationActivity';
 
 /** One message in the thread: an agent telling you something, you asking an agent, its answer. */
 export interface ThreadItem { id: string; at: string; agentId: string; agent: string; from: "agent" | "you"; text: string; pending?: boolean }
@@ -57,7 +59,7 @@ export function dayLabel(value: string, now = new Date()): string {
 
 function Face({ crew, name, task }: { crew?: CrewInstance; name: string; task?: boolean }) {
   if (task) return <span className="map-face sm inbox-task-face" aria-hidden="true"><ListChecks size={12} /></span>;
-  return <span className="map-face sm" style={crew?agentStyle(crew):undefined} aria-hidden="true">{initials(name)}</span>;
+  return <span className="map-face sm has-bot" style={crew?agentStyle(crew):undefined} aria-hidden="true"><AgentBot seed={crew?.id ?? name} state={crew ? botState(crew) : "idle"} /></span>;
 }
 
 /** The two answers to work held for you, in the words its card uses. */
@@ -189,6 +191,8 @@ export function AgentInbox({ initial }: { initial?: { updates: Reminder[]; asks:
       const ask = await api.askCrew(target.id, text.trim());
       setAsks(prev => ({ ...prev, [target.id]: { name: target.name, items: [...(prev[target.id]?.items ?? []), ask] } }));
       setText("");
+      // A note for now or a preference shows on the agent's panel at once.
+      if (ask.kind && ask.kind !== "question") void api.crew().then(all => useAppStore.getState().setCrew(all)).catch(() => undefined);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not send it."); }
     finally { setSending(false); }
   }
@@ -196,6 +200,7 @@ export function AgentInbox({ initial }: { initial?: { updates: Reminder[]; asks:
 
   return <div className="inbox">
     <div className="inbox-scroll">
+      <ConversationActivities workspace />
       {offline && <p className="inbox-offline" role="status">Mavo isn't reachable right now. Messages appear once it is back.</p>}
       {!loaded && !offline && <p className="inbox-loading" role="status"><LoaderCircle size={14} className="animate-spin" />Loading…</p>}
       {loaded && !thread.length && !waiting.length && <div className="inbox-empty"><MessageCircle size={20} aria-hidden="true" />

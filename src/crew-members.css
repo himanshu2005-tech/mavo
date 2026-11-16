@@ -1,0 +1,120 @@
+.crew-members{margin:16px 0;padding:12px;border:1px solid var(--border);border-radius: 6px;background:var(--surface);color:var(--text);min-width:0}
+
+
+
+
+
+
+
+
+
+
+.member-detail{padding:20px}.member-detail>small{display:block;color:var(--faint);font-size:11px;margin:10px 0}.member-detail h3{font-size:18px;font-weight:600}.member-detail h4{margin-top:20px;font-size:12px;font-weight:600}.member-detail p{font-size:12px;line-height:1.65;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere}
+.map-crew-members{position:absolute;z-index:5}.crew-expand{font-size:10px;white-space:nowrap;padding:3px 7px;border:1px solid var(--border);background:var(--surface);color:var(--muted);border-radius: 4px}.map-crew-cluster{width:380px;max-height:440px;overflow:auto;margin:6px 0;background:var(--surface);border:1px solid var(--border);border-radius: 6px;box-shadow:0 16px 44px rgb(6 12 26 / .5)}.map-crew-cluster .crew-members{border:0;margin:0}
+.member-edge-live{stroke:var(--good);animation:member-handoff 1s ease-in-out 2}
+@keyframes member-handoff{50%{stroke-width:4;opacity:1}}
+@media(prefers-reduced-motion:reduce){.member-edge-live{animation:none;stroke-width:3}}
+
+/* A Crew's agents as a team of bots: who works first, who waits for whom, and what each is doing. */
+.crew-members-toggle{display:flex;align-items:center;gap:10px;width:100%;font-size:13px;color:var(--text)}
+.crew-members-count{flex:1;text-align:left;font-weight:550}
+.crew-members-more,.crew-flow-note{font-size:11px;color:var(--faint)}
+.crew-bots-stack{display:flex}
+.crew-bots-stack>.crew-bot-face{margin-left:-3px;box-shadow:0 0 0 2px var(--surface)}
+.crew-bots-stack>.crew-bot-face:first-child{margin-left:0}
+.crew-bot-face{display:grid;place-items:center;flex:none;width:38px;height:38px;padding:5px;border-radius:6px;color:var(--identity,var(--accent));background:color-mix(in srgb,var(--identity,var(--accent)) 13%,var(--surface))}
+.crew-bot-face.sm{width:24px;height:24px;padding:3px;border-radius:5px}
+.crew-flow{list-style:none;margin:14px 0 10px;padding:0}
+.crew-flow-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
+.crew-flow-link{display:block;position:relative;width:2px;height:18px;margin:2px auto;background:linear-gradient(var(--border),rgb(var(--ink-rgb) / .22));overflow:visible}
+.crew-flow-link>i{position:absolute;left:-2px;top:0;width:6px;height:6px;border-radius:2px;background:var(--accent);opacity:0}
+.crew-flow-link[data-live=true]>i{animation:crew-handoff 1.2s ease-in-out infinite}
+@keyframes crew-handoff{0%{top:-2px;opacity:0}20%{opacity:1}80%{opacity:1}100%{top:16px;opacity:0}}
+.crew-bot-card{display:flex;align-items:center;gap:11px;min-width:0;padding:9px 10px;border-radius:6px;background:var(--fill);border:1px solid transparent;text-align:left;transition:border-color .2s,background .2s}
+.crew-bot-card[role=button]{cursor:pointer}
+.crew-bot-card[role=button]:hover,.crew-bot-card:focus-visible{border-color:color-mix(in srgb,var(--identity,var(--accent)) 45%,transparent);outline:none}
+.crew-bot-card[data-state=working]{border-color:color-mix(in srgb,var(--identity,var(--accent)) 55%,transparent);background:color-mix(in srgb,var(--identity,var(--accent)) 6%,var(--fill))}
+.crew-bot-card[data-state=needs]{border-color:color-mix(in srgb,var(--c-amber) 50%,transparent)}
+.crew-bot-text{flex:1;min-width:0}
+.crew-bot-text strong{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.crew-bot-text small{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:11px;line-height:1.45;color:var(--faint)}
+.crew-bot-lead{font-style:normal;font-size:9.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;padding:1px 5px;border-radius:3px;color:var(--identity,var(--accent));background:color-mix(in srgb,var(--identity,var(--accent)) 14%,transparent)}
+.crew-bot-from{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.crew-bot-from button{font-size:10px;padding:1px 6px;border-radius:3px;color:var(--muted);background:rgb(var(--ink-rgb) / .06)}
+.crew-bot-meta{display:grid;justify-items:end;gap:3px;flex:none}
+.crew-bot-state{font-size:10.5px;font-weight:550;color:var(--faint)}
+.crew-bot-card[data-state=working] .crew-bot-state{color:var(--identity,var(--accent))}
+.crew-bot-card[data-state=needs] .crew-bot-state{color:var(--c-amber)}
+.crew-bot-card[data-state=done] .crew-bot-state{color:var(--good)}
+.crew-bot-model{font-size:10px;padding:1px 6px;border-radius:3px;color:var(--muted);background:rgb(var(--ink-rgb) / .06);white-space:nowrap}
+@media(prefers-reduced-motion:reduce){.crew-flow-link[data-live=true]>i{animation:none;opacity:1;top:6px}}
+.crew-bot-model-pick{font-size:10px;padding:1px 4px;border-radius:3px;color:var(--muted);background:rgb(var(--ink-rgb) / .06);border:1px solid transparent;max-width:9rem}
+.crew-bot-model-pick:hover,.crew-bot-model-pick:focus{border-color:rgb(var(--ink-rgb) / .15);outline:none}
+
+/* A workflow's path (WorkflowFlow): reads, agents, code and actions; lines join each step to what
+   it reads, and each branch is labelled with its case. */
+.wf{position:relative;display:grid;gap:26px;margin:14px 0 8px;padding:4px 0}
+.wf-lines{position:absolute;inset:0;pointer-events:none;overflow:visible}
+.wf-lines path{fill:none;stroke:rgb(var(--ink-rgb) / .2);stroke-width:1.5}
+/* Steps at the same point share one line (up to 3 across), shrinking to fit a narrow panel. */
+.wf{container-type:inline-size}
+.wf-row{position:relative;display:grid;grid-template-columns:repeat(var(--n,1),minmax(0,236px));justify-content:center;gap:12px 10px}
+.wf-cell{display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}
+.wf-gate{display:inline-flex;align-items:flex-start;gap:5px;max-width:100%;padding:3px 9px;border-radius:999px;background:var(--surface);
+  border:1px solid rgb(var(--ink-rgb) / .12);color:var(--muted);font-size:11px;line-height:1.35;overflow-wrap:anywhere}
+.wf-gate svg{flex:none;margin-top:2px;color:var(--c-violet)}
+.wf-node{--wf:var(--accent);width:100%;border-radius:10px;border:1px solid color-mix(in srgb,var(--wf) 30%,transparent);
+  background:color-mix(in srgb,var(--wf) 7%,var(--surface));transition:border-color .15s}
+.wf-node[data-kind=helper],.wf-node[data-kind=agent]{--wf:var(--c-violet)}
+.wf-node[data-kind=automation]{--wf:var(--c-teal)}
+.wf-node[data-kind=act]{--wf:var(--c-orange)}
+.wf-node:hover{border-color:color-mix(in srgb,var(--wf) 55%,transparent)}
+.wf-node[data-active]{box-shadow:0 0 0 2px color-mix(in srgb,var(--wf) 45%,transparent)}
+.wf-head{display:flex;align-items:center;gap:10px;width:100%;padding:9px 11px;border:0;background:none;color:inherit;text-align:left;cursor:pointer;border-radius:10px}
+div.wf-head{cursor:default}
+.wf-head:focus-visible{outline:2px solid var(--wf);outline-offset:2px}
+.wf-ico{display:grid;place-items:center;flex:none;width:28px;height:28px;border-radius:8px;color:var(--wf);background:color-mix(in srgb,var(--wf) 16%,transparent)}
+.wf-text{display:grid;min-width:0}
+.wf-kind{font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--wf)}
+.wf-title{font-size:13px;font-weight:550;color:var(--text);line-height:1.3;overflow-wrap:anywhere}
+.wf-detail{padding:0 11px 10px 49px;font-size:12px;color:var(--muted);display:grid;gap:5px;white-space:pre-wrap;overflow-wrap:anywhere}
+@media (prefers-reduced-motion:reduce){.wf-node{transition:none}}
+@container (max-width:420px){
+  .wf-head{gap:7px;padding:7px 8px}
+  .wf-ico{width:22px;height:22px;border-radius:6px}
+  .wf-ico svg{width:12px;height:12px}
+  .wf-title{font-size:12px}
+  .wf-kind{font-size:9.5px}
+  .wf-gate{font-size:10.5px;padding:2px 7px}
+  .wf-detail{padding:0 8px 8px 8px}
+}
+
+/* The diagram, live: the step it is on breathes, the work moves into it along its line, steps it
+   went through are ticked, and a refused action shows amber. Motion only where something moves. */
+.wf-node{position:relative;transition:box-shadow .3s,border-color .3s,opacity .3s}
+.wf-node[data-active]{border-color:color-mix(in srgb,var(--wf) 70%,transparent);animation:wf-breathe 1.8s ease-in-out infinite}
+@keyframes wf-breathe{0%,100%{box-shadow:0 0 0 2px color-mix(in srgb,var(--wf) 35%,transparent)}50%{box-shadow:0 0 0 5px color-mix(in srgb,var(--wf) 12%,transparent)}}
+.wf-node[data-done]{border-color:color-mix(in srgb,var(--good) 45%,transparent)}
+.wf-tick{position:absolute;top:-6px;right:-6px;display:grid;place-items:center;width:16px;height:16px;border-radius:999px;background:var(--good);color:var(--surface);box-shadow:0 0 0 2px var(--surface)}
+.wf-node[data-refused]{--wf:var(--c-amber);border-color:var(--c-amber);animation:wf-refused .9s ease-out 2}
+@keyframes wf-refused{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c-amber) 55%,transparent)}100%{box-shadow:0 0 0 8px transparent}}
+.wf-lines path[data-live]{stroke:color-mix(in srgb,var(--accent) 60%,transparent);stroke-width:2}
+.wf-dot{fill:var(--accent);filter:drop-shadow(0 0 4px var(--accent))}
+@media (prefers-reduced-motion:reduce){.wf-node[data-active],.wf-node[data-refused]{animation:none}.wf-dot{display:none}}
+
+/* An action as it happened, in "What it's thinking". */
+.task-thought li.thought-card{padding-bottom:8px}
+.task-thought li.thought-card::after{display:none}
+.act-card{--act:var(--c-teal);display:flex;gap:9px;width:100%;padding:8px 10px;border-radius:10px;border:1px solid color-mix(in srgb,var(--act) 28%,transparent);
+  background:color-mix(in srgb,var(--act) 6%,transparent);animation:act-in .25s ease-out}
+.act-card[data-outcome=done]{--act:var(--good)}
+.act-card[data-outcome=waiting],.act-card[data-outcome=asked]{--act:var(--c-violet)}
+.act-card[data-outcome=refused],.act-card[data-outcome=failed]{--act:var(--c-amber)}
+.act-ico{display:grid;place-items:center;flex:none;width:24px;height:24px;border-radius:7px;color:var(--act);background:color-mix(in srgb,var(--act) 16%,transparent)}
+.act-body{display:grid;gap:2px;min-width:0}
+.act-head{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text)}
+.act-state{font-size:10.5px;padding:1px 7px;border-radius:999px;color:var(--act);background:color-mix(in srgb,var(--act) 14%,transparent)}
+.act-about{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.act-why{font-size:11.5px;color:var(--faint);overflow-wrap:anywhere}
+@keyframes act-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.act-card{animation:none}}

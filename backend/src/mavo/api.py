@@ -6,7 +6,7 @@ from time import perf_counter
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -19,6 +19,7 @@ from mavo.crew_templates import CREW_TEMPLATES, CREW_TEMPLATES_BY_ID
 from mavo.crew_workers import CrewWorkerRuntime, first_run_at, stop_crew
 from mavo.database import (
     Conversation,
+    ConversationEvent,
     CoordinatorSession,
     CrewInstance,
     CrewProposal,
@@ -27,6 +28,7 @@ from mavo.database import (
     ProviderConfig,
     ReminderEvent,
     ResourceEvent,
+    TaskRun,
     WorkspaceSetting,
     utcnow,
 )
@@ -52,6 +54,7 @@ from mavo.schemas import (
     ProviderConfigurationRequest,
     ProviderConfigurationView,
     ProviderId,
+    ReminderAnswer,
     ReminderView,
     RouteTestView,
     WeatherLocation,
@@ -361,11 +364,64 @@ def build_api(  # type: ignore[no-untyped-def]
     @router.delete("/routes/{route_id}", status_code=204)
     def delete_route(route_id: str, session: Session = Depends(get_session)) -> Response:
         route = get_route_or_404(route_id, session)
-        if session.scalar(select(CrewInstance.id).where(CrewInstance.route_id == route.id)):
-            raise HTTPException(
-                status_code=409, detail="This route is assigned to a Crew; change the Crew first"
+        from mavo.database import CrewAgent, TaskRun
+        from mavo.tasks import OWNER_NAME
+
+        # Only the person's own agents hold a model. Mavo's hidden helpers do not: "Mavo tasks"
+        # only carries one-time task alerts, never runs, and is always marked running, so it
+        # blocked deleting a model nothing used ("nothing is using Ollama").
+        user = session.scalar(
+            select(CrewInstance.name).where(
+                CrewInstance.route_id == route.id, CrewInstance.hidden.is_(False)
             )
+        ) or session.scalar(
+            select(CrewInstance.name)
+            .join(CrewAgent, CrewAgent.crew_id == CrewInstance.id)
+            .where(
+                CrewAgent.route_id == route.id,
+                CrewAgent.status == "active",
+                CrewInstance.hidden.is_(False),
+            )
+        )
+        if user:
+            raise HTTPException(
+                status_code=409, detail=f"{user} uses this model. Move it to another model first."
+            )
+        working = session.scalar(
+            select(TaskRun.id).where(TaskRun.status.in_(("running", "needs_you"))).limit(1)
+        ) and session.scalar(
+            select(CrewInstance.id).where(
+                CrewInstance.route_id == route.id,
+                CrewInstance.hidden.is_(True),
+                CrewInstance.is_running.is_(True),
+                CrewInstance.name != OWNER_NAME,
+            )
+        )
+        if working:
+            raise HTTPException(
+                status_code=409,
+                detail="A one-time task is using this model right now. Stop it or let it "
+                "finish, then delete the model.",
+            )
+        hidden = select(CrewInstance.id).where(CrewInstance.hidden.is_(True))
+        session.execute(
+            update(CrewAgent)
+            .where(CrewAgent.route_id == route.id, CrewAgent.crew_id.in_(hidden))
+            .values(route_id=None)
+        )
         credential_id = route.credential_id
+        # Idle adapters are not public route assignments. They resolve inherited routes again
+        # at the next claim; retired membership retains route metadata in its version history.
+        session.execute(
+            update(CrewInstance)
+            .where(CrewInstance.hidden.is_(True), CrewInstance.route_id == route.id)
+            .values(route_id=None)
+        )
+        session.execute(
+            update(CrewAgent)
+            .where(CrewAgent.status == "retired", CrewAgent.route_id == route.id)
+            .values(route_id=None)
+        )
         if credential_id == route.provider:
             legacy_config = session.get(ProviderConfig, route.provider)
             if legacy_config is not None:
@@ -378,12 +434,16 @@ def build_api(  # type: ignore[no-untyped-def]
 
     @router.get("/conversations", response_model=list[ConversationView])
     def list_conversations(session: Session = Depends(get_session)) -> list[Conversation]:
+        from mavo.crew_ask import ask_conversations
+
+        rooms = ask_conversations(session)
         statement = (
             select(Conversation)
             .options(selectinload(Conversation.messages))
             .order_by(Conversation.updated_at.desc())
         )
-        return list(session.scalars(statement).all())
+        # A question asked in an agent's room stays in that room: never in Mavo's history.
+        return [c for c in session.scalars(statement).all() if c.id not in rooms]
 
     @router.get("/conversations/{conversation_id}", response_model=ConversationView)
     def get_conversation(
@@ -441,23 +501,123 @@ def build_api(  # type: ignore[no-untyped-def]
         return CREW_TEMPLATES
 
     @router.get("/crew", response_model=list[CrewView])
-    def list_crew(session: Session = Depends(get_session)) -> list[CrewInstance]:
+    def list_crew(session: Session = Depends(get_session)) -> list[CrewView]:
         statement = (
             select(CrewInstance)
             .where(CrewInstance.status != "draft", CrewInstance.hidden.is_(False))
             .order_by(CrewInstance.created_at.desc())
         )
-        return list(session.scalars(statement).all())
+        crews = list(session.scalars(statement).all())
+        from mavo.crew_composition import default_agent
+
+        for crew in crews:
+            default_agent(session, crew)
+        session.commit()
+        views = []
+        for crew in crews:
+            view = CrewView.model_validate(crew)
+            if not crew.checkpoint and crew.last_runtime_error:
+                # Older failed cycles cleared the saved report. Project the last
+                # committed success without changing user data or retrying work.
+                previous = session.scalar(
+                    select(TaskRun.result)
+                    .where(
+                        TaskRun.crew_id == crew.id,
+                        TaskRun.status == "done",
+                        TaskRun.result.is_not(None),
+                        TaskRun.result != "",
+                    )
+                    .order_by(TaskRun.created_at.desc())
+                    .limit(1)
+                )
+                if previous:
+                    view = view.model_copy(update={"checkpoint": previous})
+            if cycle := live_cycle(session, crew.id):
+                view = view.model_copy(update={"cycle": cycle})
+            views.append(view)
+        return views
+
+    def live_cycle(session, crew_id: str) -> dict | None:
+        """The cycle a Crew is working on now: its steps in order, which one runs, and a
+        question it waits on. None when it is between runs."""
+        run = session.scalar(
+            select(TaskRun)
+            .where(TaskRun.crew_id == crew_id, TaskRun.status.in_(["running", "needs_you"]))
+            .order_by(TaskRun.created_at.desc())
+            .limit(1)
+        )
+        asked = None
+        if run is None:
+            # Nothing of its own running: a question asked in its room may be, as a one-time
+            # task ("Give me inbox summary"); its steps show live there too.
+            saved = session.get(WorkspaceSetting, f"asks:{crew_id}")
+            pending = (
+                [
+                    i
+                    for i in (saved.value or {}).get("items", [])
+                    if i.get("pending") and i.get("task_id")
+                ]
+                if saved
+                else []
+            )
+            for item in reversed(pending):
+                found = session.get(TaskRun, item["task_id"])
+                if found is not None and found.status in {"running", "needs_you"}:
+                    run, asked = found, str(item.get("question") or "")[:300]
+                    break
+        if run is None:
+            return None
+        from mavo.task_plan import run_text_of
+
+        # Each step as the person reads it: what it is doing, never its internal name.
+        titles = {s.get("id"): run_text_of(s) for s in (run.plan or {}).get("steps", [])}
+        steps = [
+            {
+                "title": titles.get(s.get("id")) or s.get("id"),
+                "status": "asking" if s.get("ask") else s.get("status") or "waiting",
+            }
+            for s in (run.steps or [])
+        ]
+        current = next(
+            (i for i, s in enumerate(steps) if s["status"] in {"running", "asking"}), None
+        )
+        asking = next((s for s in (run.steps or []) if s.get("ask")), None)
+        ask = asking.get("ask") if asking else None
+        # What it is thinking now: the latest step that says so (the agent records each move).
+        thinking = next(
+            (s.get("thinking") for s in reversed(run.steps or []) if s.get("thinking")), None
+        )
+        return {
+            "thoughts": list(thinking or [])[-15:],
+            "run_id": run.id,
+            "status": run.status,
+            "started_at": run.created_at.isoformat(),
+            "steps": steps[:24],
+            "current": current,
+            "done": sum(s["status"] == "done" for s in steps),
+            "total": len(steps),
+            "question": str(ask)[:300] if ask else None,
+            "question_step": asking.get("id") if asking else None,
+            "asked": asked,
+        }
 
     @router.get("/crew-drafts", response_model=list[CrewView])
     def list_crew_drafts(session: Session = Depends(get_session)):
-        return list(
-            session.scalars(
-                select(CrewInstance)
-                .where(CrewInstance.status == "draft")
-                .order_by(CrewInstance.updated_at.desc())
-            ).all()
-        )
+        views = []
+        for crew in session.scalars(
+            select(CrewInstance)
+            .where(CrewInstance.status == "draft")
+            .order_by(CrewInstance.updated_at.desc())
+        ).all():
+            view = CrewView.model_validate(crew)
+            # A setup test runs on a private copy: its steps show on the draft while it runs
+            # ("Testing it once…" sat there for three minutes with nothing to see).
+            test = (crew.configuration_plan or {}).get("first_run") or {}
+            if test.get("status") == "running" and test.get("adapter_id"):
+                if cycle := live_cycle(session, test["adapter_id"]):
+                    view = view.model_copy(update={"cycle": cycle})
+            views.append(view)
+        return views
 
     def require_unique_crew_name(
         session: Session, name: str, excluding_id: str | None = None
@@ -610,6 +770,9 @@ def build_api(  # type: ignore[no-untyped-def]
         session: Session = Depends(get_session),
     ) -> CrewInstance:
         crew = get_crew_or_404(crew_id, session)
+        from mavo.configuration import record_direct_edit, snapshot
+
+        before_configuration = snapshot(crew)
         changes = payload.model_dump(exclude_unset=True)
         if "fallback_route_id" in changes:
             fallback_id = changes.pop("fallback_route_id")
@@ -728,6 +891,7 @@ def build_api(  # type: ignore[no-untyped-def]
                 crew.checkpoint = None
             crew_runtime.cancel(crew.id)
         crew.updated_at = utcnow()
+        record_direct_edit(session, crew, before_configuration)
         if not crew.is_running and changes.get("status") != "paused":
             crew.runtime_generation += 1
         try:
@@ -764,6 +928,30 @@ def build_api(  # type: ignore[no-untyped-def]
         from mavo.pipelines import unlink_removed
 
         unlink_removed(session, crew)  # no member or downstream agent is left waiting on it
+        removed_ids = [crew.id, *[a.worker_id for a in crew.agents if a.worker_id]]
+        session.execute(
+            update(ConversationEvent)
+            .where(
+                or_(
+                    ConversationEvent.crew_id.in_(removed_ids),
+                    ConversationEvent.task_id.in_(
+                        select(TaskRun.id).where(TaskRun.crew_id.in_(removed_ids))
+                    ),
+                ),
+                ConversationEvent.status == "pending",
+            )
+            .values(
+                status="cancelled",
+                revision=ConversationEvent.revision + 1,
+                resolved_at=utcnow(),
+            )
+        )
+        for agent in crew.agents:
+            if agent.worker_id and agent.worker_id != crew.id and agent.worker:
+                worker = agent.worker
+                agent.worker_id = None
+                session.flush()
+                session.delete(worker)
         for policy in session.scalars(
             select(WorkspaceSetting).where(
                 WorkspaceSetting.key.startswith("action:" + crew_id + ":")
@@ -824,6 +1012,7 @@ def build_api(  # type: ignore[no-untyped-def]
         crew.observation = {
             **crew.observation,
             "failures": 0,
+            "run_failures": 0,
             "automation_steps": 0,
             "question": None,
         }
@@ -839,7 +1028,7 @@ def build_api(  # type: ignore[no-untyped-def]
     @router.post("/crew/{crew_id}/stop", response_model=CrewView)
     def stop_worker(crew_id: str, session: Session = Depends(get_session)) -> CrewInstance:
         crew = get_crew_or_404(crew_id, session)
-        if crew.is_running:
+        if crew.is_running or any(a.worker and a.worker.is_running for a in crew.agents):
             stop_crew(session, crew)
             session.execute(
                 update(ReminderEvent)
@@ -865,7 +1054,43 @@ def build_api(  # type: ignore[no-untyped-def]
         crew.runtime_state = "waiting"
         crew.last_runtime_error = None
         crew.next_run_at = utcnow()
-        crew.observation = {**crew.observation, "failures": 0, "automation_steps": 0}
+        crew.observation = {
+            **crew.observation,
+            "failures": 0,
+            "run_failures": 0,
+            "automation_steps": 0,
+        }
+        session.commit()
+        session.refresh(crew)
+        return crew
+
+    @router.post("/crew/{crew_id}/hotkey", response_model=CrewView)
+    def set_hotkey(crew_id: str, payload: dict, session: Session = Depends(get_session)):
+        """The person sets the shortcut that runs this agent at once ("Win+F9"), or clears it."""
+        from mavo.hotkeys import hotkey_of, normalize
+
+        crew = get_crew_or_404(crew_id, session)
+        given = str(payload.get("hotkey") or "").strip()
+        hotkey = normalize(given) if given else None
+        if given and not hotkey:
+            raise HTTPException(
+                422, "Use a key with Ctrl, Alt, Shift or Win, like Win+F9 or Ctrl+Alt+R."
+            )
+        if hotkey:
+            other = next(
+                (
+                    c
+                    for c in session.scalars(select(CrewInstance).where(CrewInstance.id != crew.id))
+                    if not c.hidden and hotkey_of(c) == hotkey
+                ),
+                None,
+            )
+            if other:
+                raise HTTPException(409, f"{hotkey} already runs {other.name}.")
+        observation = dict(crew.observation or {})
+        observation.pop("hotkey_problem", None)  # checked again with Windows in a moment
+        crew.observation = observation
+        crew.configuration_plan = {**(crew.configuration_plan or {}), "hotkey": hotkey}
         session.commit()
         session.refresh(crew)
         return crew
@@ -874,11 +1099,69 @@ def build_api(  # type: ignore[no-untyped-def]
     def list_runs(
         crew_id: str | None = None,
         session: Session = Depends(get_session),
-    ) -> list[CrewRun]:
+    ) -> list:
         query = select(CrewRun).order_by(CrewRun.created_at.desc()).limit(100)
         if crew_id:
             query = query.where(CrewRun.crew_id == crew_id)
-        return list(session.scalars(query).all())
+        runs = list(session.scalars(query).all())
+        if not crew_id:
+            return runs
+        # A Crew of several agents, or one replaying its recipe, works as task runs: those are
+        # its history too. "Run now" on one came back with nothing to show, though it had run.
+        from mavo.database import TaskRun
+
+        crew = session.get(CrewInstance, crew_id)
+        tasks = session.scalars(
+            select(TaskRun)
+            .where(TaskRun.crew_id == crew_id)
+            .order_by(TaskRun.created_at.desc())
+            .limit(100)
+        ).all()
+        status = {
+            "done": "completed",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "running": "running",
+            "needs_you": "running",  # still open: it waits for the person
+        }
+
+        def progress(task) -> str | None:
+            """Where a running cycle is, in words: "Working: step 4 of 9, Decide". A bare
+            "Working…" left the person unsure whether it was stuck."""
+            if task.status not in {"running", "needs_you"}:
+                return task.result
+            steps = list(task.steps or [])
+            titles = {s.get("id"): s.get("title") for s in (task.plan or {}).get("steps", [])}
+            for index, step in enumerate(steps, 1):
+                if step.get("ask"):
+                    return f"Waiting for your answer: {str(step['ask'])[:200]}"
+                if step.get("status") == "running":
+                    name = titles.get(step.get("id")) or step.get("id")
+                    return f"Working: step {index} of {len(steps)}, {name}"
+            done = sum(s.get("status") == "done" for s in steps)
+            return f"Working: {done} of {len(steps)} steps done"
+
+        for task in tasks:
+            runs.append(
+                CrewRunView(
+                    id=task.id,
+                    crew_id=crew_id,
+                    crew_name=crew.name if crew else "",
+                    route_name="",
+                    provider="",
+                    model="",
+                    prompt=task.request or "",
+                    status=status.get(task.status, "interrupted"),
+                    result=progress(task),
+                    error=task.error,
+                    model_calls=task.used_calls or 0,
+                    created_at=task.created_at,
+                    finished_at=task.finished_at,
+                    kind="task",
+                )
+            )
+        runs.sort(key=lambda r: r.created_at, reverse=True)
+        return runs[:100]
 
     @router.post("/crew/{crew_id}/run", response_model=CrewRunView)
     async def run_crew(
@@ -946,17 +1229,43 @@ def build_api(  # type: ignore[no-untyped-def]
             crew_runtime.activity.finish_run(run.id, run.status)
             return run
 
+    def with_choices(session, events) -> list[ReminderView]:
+        """Each alert as the desktop shows it; an agent's question with the answers it offers."""
+        views = []
+        for event in events:
+            view = ReminderView.model_validate(event)
+            if event.kind == "question":
+                crew = session.get(CrewInstance, event.crew_id)
+                asks = ((crew.observation or {}).get("desk_asks") or {}) if crew else {}
+                view.choices = list((asks.get(event.id) or {}).get("choices") or [])
+            views.append(view)
+        return views
+
     @router.get("/reminders/due", response_model=list[ReminderView])
-    def due_reminders(session: Session = Depends(get_session)) -> list[ReminderEvent]:
-        return create_due_reminders(session)
+    def due_reminders(session: Session = Depends(get_session)) -> list[ReminderView]:
+        return with_choices(session, create_due_reminders(session))
 
     @router.get("/reminders", response_model=list[ReminderView])
-    def reminder_history(session: Session = Depends(get_session)) -> list[ReminderEvent]:
-        return list(
+    def reminder_history(session: Session = Depends(get_session)) -> list[ReminderView]:
+        return with_choices(
+            session,
             session.scalars(
                 select(ReminderEvent).order_by(ReminderEvent.created_at.desc()).limit(100)
-            ).all()
+            ).all(),
         )
+
+    @router.post("/reminders/{reminder_id}/answer", status_code=204)
+    def answer_reminder(
+        reminder_id: str, payload: ReminderAnswer, session: Session = Depends(get_session)
+    ) -> Response:
+        """The person answers an agent's question from its alert: the crew carries that item on
+        with their answer, through the same checked actions."""
+        from mavo.reminders import answer_question
+
+        problem = answer_question(session, reminder_id, payload.answer)
+        if problem:
+            raise HTTPException(status_code=problem[0], detail=problem[1])
+        return Response(status_code=204)
 
     @router.post("/reminders/{reminder_id}/dismiss", status_code=204)
     def dismiss_reminder(reminder_id: str, session: Session = Depends(get_session)) -> Response:

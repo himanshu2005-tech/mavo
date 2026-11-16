@@ -1,5 +1,21 @@
 # Mavo architecture
 
+Crew V2 introduces `Core → Crew → logical agents → TaskRun assignments / CrewRun executions`
+without replacing either execution authority. Internal worker adapters isolate member context
+and inherit parent policy ceilings. See [Crew V2](docs/crew-architecture-v2.md) and
+[ADR 0033](docs/decisions/0033-crew-owned-logical-agents.md) for the migration, lifecycle,
+configuration boundaries, verified outcomes and remaining limits.
+
+Google event inputs bind to the parent's committed batch rather than prompt text. Typed
+mail decisions, account/capability fences and the existing durable outbox govern triage
+and verified Calendar/Tasks change delivery. See [ADR 0038](docs/decisions/0038-event-bound-mail-reviews.md)
+and [resource coverage/troubleshooting](docs/mail-and-resource-reliability.md).
+
+The unified chat/orchestration extension reuses TaskRun, CrewRun, persistent pipelines and
+BuildTeam rather than adding a competing executor. Durable messages, correlated conversation
+events and versioned configuration are described in [docs/orchestration.md](docs/orchestration.md)
+and [ADR 0032](docs/decisions/0032-durable-orchestration-adapters.md), including current limits.
+
 Mavo begins as a modular monolith: one desktop application, one local backend, and one durable database. Domain modules can evolve independently without introducing operationally expensive local microservices.
 
 ## Milestone 1 runtime
@@ -22,6 +38,13 @@ Tauri host
 The Tauri host selects an available loopback port, creates a cryptographically random token, starts the backend without a console window, and owns its process handle. Only a Tauri command exposes the base URL and token to the main webview. The token is not persisted. Production builds package the Python backend with PyInstaller.
 
 ## Frontend
+
+The verified-session gate is followed by an account-bound first-use gate: Welcome, model
+providers, optional resources, then the workspace. Progress lives in SQLite under a hash of
+the verified Firebase project/UID binding and uses revision-fenced updates. It is not a
+global browser flag. Existing routes/forms and resource controls perform the actual setup;
+advancing a step does not grant access, create agents, or perform model inference. The
+single-owner workspace boundary is unchanged; multi-account profile switching is not implied.
 
 The Home access map visualizes selected model routes, permission-scoped resources/actions and
 Crew handoffs. Selection traces are configuration previews, not execution telemetry. See

@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { expect, it } from "vitest";
-import { AgentGraph,agentActivity } from "./AgentGraph";
+import { expect, it, vi } from "vitest";
+import { AgentGraph,agentActivity,gatherNodes } from "./AgentGraph";
 import {mergeExecution,type RuntimeEvent,type RuntimeSnapshot} from '../lib/executionSignals';
 import { flowOrder, wiring } from "./crewWiring";
 import { detailAt, fitView, initials, isHub, myInitials, radialLayout, ringCounts, spread, zoomAt } from "../lib/radialGraph";
@@ -16,6 +16,33 @@ const crew = (over: Partial<CrewInstance>): CrewInstance => ({
 
 const inbox = crew({ id: "inbox", name: "Inbox Watch", permissions: ["google:gmail:read", "notifications:show"] });
 
+it('explains real route/resource/action links and distinguishes missing access and stopped Crew',()=>{
+  const stopped=crew({...inbox,id:'paused',name:'Paused inbox',is_running:false,
+    configuration_plan:{draft:{requested_actions:[{operation:'gmail.send'}]}}} as Partial<CrewInstance>);
+  const html=renderToStaticMarkup(<AgentGraph crews={[stopped]} drafts={[]} me="H" memory={[]}
+    selection={null} onSelect={()=>{}} onNew={()=>{}} routes={[{id:'r',name:'Main',model:'m',provider:'airouter'}]}/>);
+  expect(html).toContain('Paused inbox reads Gmail · Access granted · Crew stopped. Select to inspect.');
+  expect(html).toContain('Paused inbox uses model route Main · Crew stopped. Select to inspect.');
+  expect(html).toMatch(/data-link-kind="action"[^>]*data-target="gmail.send"[^>]*data-allowed="false"/);
+  expect(html).toContain('lg-route-link');
+  expect(html).toContain('lg-resource-link');
+  expect(html).toContain('lg-action-link');
+  expect(html).not.toContain('provider-request-pulse');
+});
+
+it('traces every active specialist route when selecting its parent Crew',()=>{
+  const row=crew({agents:[{id:'specialist',crew_id:'c',key:'reader',name:'Reader',role:'Read',
+    instructions:'Read',route_id:'special',status:'active',runtime_state:'waiting',
+    checkpoint:null,execution:{},definition:{}}]});
+  const html=renderToStaticMarkup(<AgentGraph crews={[row]} drafts={[]} me="H" memory={[]}
+    selection={{kind:'agent',id:'c'}} onSelect={()=>{}} onNew={()=>{}}
+    routes={['r','special','unassigned'].map(id=>({id,name:id,model:'m',provider:'airouter'}))}/>);
+  for(const id of ['r','special']) {
+    expect(html).toMatch(new RegExp(`data-link-kind="route" data-target="route:${id}"[^>]*data-on="true"`));
+  }
+  expect(html).not.toMatch(/data-link-kind="route" data-target="route:unassigned"/);
+});
+
 it('highlights a provider only for observed model requests and keeps fast completions visible',()=>{
   const run:RuntimeEvent={seq:1,kind:'run_started',at:'2026-11-08T06:00:00Z',crew_id:inbox.id,run_id:'observed-run',route_id:'r'};
   const call:RuntimeEvent={...run,seq:2,kind:'model_started',call_id:'request',provider:'airouter',model:'m'};
@@ -25,11 +52,31 @@ it('highlights a provider only for observed model requests and keeps fast comple
   expect(render(null)).not.toContain('class="provider-request-pulse"');
   expect(render(live)).toContain('data-provider-active="true"');
   expect(render(live)).toContain('Model request in progress');
+  expect(render(live)).toContain('data-live-detail="true"');
+  expect(render(live)).toContain('Model request in progress · Real route');
+  expect(render(live)).not.toContain('graph-run-notice');
   const finished=mergeExecution(live,{...snapshot,cursor:4,events:[{...call,seq:3,kind:'model_finished',status:'responded'},{...run,seq:4,kind:'run_finished',status:'completed'}],active_runs:[],active_calls:[]});
   expect(render(finished)).toContain('Run completed');
   expect(render(finished)).toContain('Responded');
   expect(render(finished)).not.toContain('class="provider-request-pulse"');
 });
+
+it('keeps a dense graph compact and gives active work priority over recent outcomes',()=>{
+  // A feed is "fresh" for 8 s; 500 agents drawn twice can take longer on a busy machine.
+  const clock=vi.spyOn(Date,'now').mockReturnValue(Date.parse('2026-11-08T06:00:01Z'));
+  try {
+  const rows=Array.from({length:500},(_,i)=>crew({id:`crew-${i}`}));
+  const events:RuntimeEvent[]=rows.slice(0,8).map((row,i)=>({seq:i+1,kind:'run_finished',at:'2026-11-08T06:00:00Z',crew_id:row.id,run_id:`run-${i}`,route_id:'r',status:'completed'}));
+  const active:RuntimeEvent={seq:9,kind:'run_started',at:'2026-11-08T05:00:00Z',crew_id:'crew-499',run_id:'active',route_id:'r'};
+  const execution=mergeExecution(null,{stream_id:'dense',cursor:9,reset:false,events,active_runs:[active],active_calls:[]});
+  const render=(selection:{kind:'agent';id:string}|null)=>renderToStaticMarkup(<AgentGraph crews={rows} drafts={[]} me="You" memory={[]} selection={selection} onSelect={()=>undefined} onNew={()=>undefined} execution={execution}/>);
+  const html=render(null);
+  expect(html.match(/data-live-detail="true"/g)).toHaveLength(3);
+  expect(html).toMatch(/data-identity="crew:crew-499"[^>]*data-live-detail="true"/);
+  expect(html).not.toContain('graph-run-notice');
+  expect(render({kind:'agent',id:'crew-499'}).match(/data-live-detail="true"/g)).toHaveLength(1);
+  } finally { clock.mockRestore(); }
+},15000); // 500 agents drawn twice: it checks what is shown, not how fast
 
 it("distinguishes enabled responsibilities, actual work and blocked or stopped agents", () => {
   expect(agentActivity(crew({runtime_state:'waiting'}))).toBe('ready');
@@ -70,6 +117,42 @@ it("splits what an agent reads from what it can do, and marks what it asked for 
   expect(does.find(d => d.key === "gmail.send")?.allowed).toBe(false);
 });
 
+it('shows proposed Google, device, weather and notification access without granting it',()=>{
+  const row=crew({template_id:'computer',configuration_plan:{phase:'needs_access',questions:[],draft:{
+    name:'Pending setup',responsibilities:'Review authorized data.',template_id:'computer',trigger_type:'interval',
+    requested_google_resources:['gmail'],requested_google_capabilities:['calendar:read'],
+    requested_connector_capabilities:['github:repo:read'],requested_device_metrics:true,
+    requested_weather:true,requested_notifications:true,requested_actions:[],daily_call_limit:8,max_model_calls:4,
+  }}});
+  const result=wiring(row);
+  expect(result.reads.map(w=>w.key)).toEqual(['google.gmail','google.calendar','github','device','weather']);
+  expect(result.does.map(w=>w.key)).toEqual(['notify']);
+  expect([...result.reads,...result.does].every(w=>!w.allowed)).toBe(true);
+  expect(row.permissions).toEqual([]);
+});
+
+it('retains pending per-agent access when another agent already has the shared connection',()=>{
+  const [node]=gatherNodes([
+    {crew:inbox,list:[{key:'google.gmail',label:'Gmail',icon:'mail',allowed:true,kind:'resource'}]},
+    {crew:lunch,list:[{key:'google.gmail',label:'Gmail',icon:'mail',allowed:false,kind:'resource'}]},
+  ]);
+  expect(node.allowed).toBe(true);
+  expect(node.users).toEqual([inbox.id,lunch.id]);
+  expect(node.pendingUsers).toEqual([lunch.id]);
+});
+
+it('keeps real scheduled countdowns in a large graph without inventing clocks for manual or blocked agents',()=>{
+  const next=new Date(Date.now()+30*60000).toISOString();
+  const rows=Array.from({length:100},(_,i)=>crew({id:`scheduled-${i}`,next_run_at:next,
+    trigger_type:i<10?'manual':'interval',runtime_state:i>=90?'needs_input':'waiting'}));
+  const html=renderToStaticMarkup(<AgentGraph crews={rows} drafts={[]} me="You" memory={[]} selection={null} onSelect={()=>undefined} onNew={()=>undefined}/>);
+  expect(html.match(/class="run-clock"/g)).toHaveLength(80);
+  expect(html).toContain('data-many="true"');
+  expect(html).toContain('data-links="true"');
+  expect(html).toContain('data-clocks="true"');
+  expect(html).toContain('aria-label="Show connections"');
+});
+
 it("reading notes or a folder is something an agent reads; writing and organising is something it does", () => {
   const journal = crew({ permissions: ["action:notes.find", "action:notes.read", "action:notes.write", "action:files.move", "action:windows.media"] });
   const { reads, does } = wiring(journal);
@@ -90,8 +173,8 @@ it("keeps a chain together: an agent sits after the one it hears from", () => {
 
 it("draws you in the middle, your agents and drafts around you, and what they use outside", () => {
   const memory = [{ id: "m1", text: "My mom is Sita", source: "Lunch Reminder", at: "2026-11-06T10:00:00" }];
-  const html = renderToStaticMarkup(<AgentGraph crews={[inbox, lunch, wind]} drafts={[draft]} me="Himanshu M" memory={memory} selection={null} onSelect={() => undefined} onNew={() => undefined} />);
-  for (const text of ["Himanshu M", ">HM<", "1 thing remembered", "My mom is Sita", "Inbox Watch", "Wind Down", "Trip Planner", "Draft · finish setting it up", "New agent", "Gmail", "Calendar", "Desktop alerts", "Sleep the PC", "Send mail", "Zoom in", "Fit to screen"]) expect(html).toContain(text);
+  const html = renderToStaticMarkup(<AgentGraph crews={[inbox, lunch, wind]} drafts={[draft]} me="Asha R" memory={memory} selection={null} onSelect={() => undefined} onNew={() => undefined} />);
+  for (const text of ["Asha R", ">AR<", "1 thing remembered", "My mom is Sita", "Inbox Watch", "Wind Down", "Trip Planner", "Draft · finish setting it up", "New agent", "Gmail", "Calendar", "Desktop alerts", "Sleep the PC", "Send mail", "Zoom in", "Fit to screen"]) expect(html).toContain(text);
   expect(html).toContain('data-allowed="false"'); // Send mail: asked for, not given
   expect(html.match(/class="wire wire-talk"/g)).toHaveLength(1); // Lunch Reminder hands over to Wind Down
 });
@@ -112,7 +195,7 @@ it("shows a scheduled agent's clock, makes a working agent's lines flow, and let
   const html = renderToStaticMarkup(<AgentGraph crews={[news, busy, mail]} drafts={[]} me="H" memory={[]} selection={null} onSelect={() => undefined} onNew={() => undefined} onRun={async () => undefined} />);
   expect(html).toMatch(/class="run-clock"[^>]*aria-label="News Watch runs in 1[12] min, every 30 min. Press to run it now."/);
   expect(html.match(/class="run-clock"/g)).toHaveLength(1); // only the one counting down
-  expect(html).toContain('data-flow="in"'); // Busy is reading Gmail right now
+  expect(html).not.toContain('data-flow="in"'); // Working does not prove it is reading Gmail.
   expect(html).toMatch(/data-listen="true"[^>]*title="Mail Watch/);
 });
 
@@ -136,7 +219,7 @@ it("fits the drawing in the window and zooms about the cursor", () => {
 });
 
 it("writes initials the way people read them", () => {
-  expect([initials("The Inbox Summary"), initials("Battery"), myInitials("Himanshu"), myInitials("Himanshu Madhunala")]).toEqual(["IS", "BA", "H", "HM"]);
+  expect([initials("The Inbox Summary"), initials("Battery"), myInitials("Asha"), myInitials("Asha Rao")]).toEqual(["IS", "BA", "A", "AR"]);
 });
 
 it("puts what most agents share in the middle with you, and what a few use at the edge, near them", () => {
@@ -200,17 +283,19 @@ const routes = [
 it("shows the models agents think with, near you, and says when one can't be reached", () => {
   const poem = crew({ id: "poem", name: "Poem", route_id: "local", provider: "ollama", model: "qwen2.5:3b" });
   const html = renderToStaticMarkup(<AgentGraph crews={[inbox, lunch, poem]} drafts={[]} me="H" memory={[]} selection={null} onSelect={() => undefined} onNew={() => undefined} routes={routes} />);
-  expect(html.match(/class="graph-route connection-row"/g)).toHaveLength(2); // a model no agent uses is not drawn
+  expect(html.match(/class="graph-route connection-row"/g)).toHaveLength(3); // saved routes remain visible even before assignment
+  expect(html).toContain('Spare');
+  expect(html).toContain('Not assigned');
   expect(html).toContain("AIRouter default");
   expect(html).toMatch(/data-local="true" data-down="true"[^>]*title="Ollama \(qwen2.5:3b, on this PC\): 1 agent think with it. Not reachable now"/);
-  expect(html.match(/class="wire wire-route"/g)).toHaveLength(3); // one line per agent to its model
+  expect(html.match(/data-link-kind="route"/g)).toHaveLength(3); // one line per agent to its model
   expect(html).not.toContain("trace-dot"); // nothing picked: no path traced
 });
 
-it("traces a picked agent's path in order: you, its model, what it reads, what it does", () => {
+it("selecting an agent does not fabricate model or tool activity", () => {
   const html = renderToStaticMarkup(<AgentGraph crews={[inbox, lunch]} drafts={[]} me="H" memory={[]} selection={{ kind: "agent", id: "inbox" }} onSelect={() => undefined} onNew={() => undefined} routes={routes} />);
   const kinds = [...html.matchAll(/class="trace-dot" data-kind="(\w+)"/g)].map(m => m[1]);
-  expect(kinds).toEqual(["you", "think", "read", "act"]); // Gmail is read, Desktop alerts is done
+  expect(kinds).toEqual([]); // Structural access is not evidence of a live operation.
   const delays = [...html.matchAll(/animation-delay:([\d.]+)s/g)].map(m => Number(m[1]));
   expect(delays).toEqual([...delays].sort((a, b) => a - b));
 });
@@ -220,7 +305,7 @@ it("picking a model lights the agents that think with it and fades the rest", ()
   const html = renderToStaticMarkup(<AgentGraph crews={[inbox, poem]} drafts={[]} me="H" memory={[]} selection={{ kind: "route", key: "route:local" }} onSelect={() => undefined} onNew={() => undefined} routes={routes} />);
   expect(/data-dim="true"[^>]*title="Inbox Watch/.test(html)).toBe(true);
   expect(/data-dim="false"[^>]*title="Poem/.test(html)).toBe(true);
-  expect([...html.matchAll(/class="trace-dot" data-kind="(\w+)"/g)].map(m => m[1])).toEqual(["think"]);
+  expect([...html.matchAll(/class="trace-dot" data-kind="(\w+)"/g)].map(m => m[1])).toEqual([]);
 });
 
 it("puts every model on the inner ring, even one only a single agent uses", () => {
@@ -236,7 +321,7 @@ it("keeps the handoff map structure without board or screen-space packing", () =
   const html = renderToStaticMarkup(<AgentGraph crews={[inbox, lunch]} drafts={[]} me="H" memory={[]} selection={null} onSelect={() => undefined} onNew={() => undefined} routes={routes} />);
   expect(html).toContain('class="graph-world"');
   expect(html).toContain('class="graph-wires"');
-  expect(html).toContain('class="wire wire-route"');
+  expect(html).toContain('data-link-kind="route"');
   expect(html).not.toContain('data-readable');
   expect(html).not.toContain('flow-board');
   expect(html).not.toContain('Back to workflow');

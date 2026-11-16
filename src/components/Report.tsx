@@ -1,15 +1,19 @@
 import katex from "katex";
 import "katex/dist/katex.min.css";
 import React, { type ReactNode } from "react";
+import { useMemo, useState } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { escapeLatex, jsonAsReadable, normalizeReportMarkup } from "../lib/reportFormat";
 
 /* An agent writes its result as plain text with light markdown. This turns it into a small,
    tidy report: headings, notes, lists, tables, and records ("**Job Title:** ..." lines) shown as
-   cards. Nothing is ever injected as HTML, and links are shown as text, not opened. */
+   cards. Source markup is never injected as HTML; links open only on a user click. */
 
 export type Block =
   | { kind: "heading"; level: number; text: string }
   | { kind: "paragraph"; text: string }
   | { kind: "callout"; label: string; text: string; items?: string[] }
+  | { kind: "stat"; label: string; value: string }
   | { kind: "list"; ordered: boolean; items: string[] }
   | { kind: "records"; records: ReportRecord[] }
   | { kind: "table"; head: string[]; rows: string[][] }
@@ -57,7 +61,7 @@ const INLINE_MATH = /\\\((.+?)\\\)|\$(?!\s)([^$\n]*?[\\^_{][^$\n]*?)(?<!\s)\$(?!
 export interface ReportRecord { title: string; fields: { label: string; value: string }[] }
 
 const CALLOUT = /^(?:\*\*)?(note|please note|warning|heads up|tip)(?:\*\*)?\s*[:\-–]\s*(.*)$/i;
-const FIELD = /^\s*(?:[-*•]\s+|\d+[.)]\s+)?(?:\*\*([^*:]{1,48}?):?\*\*:?|([A-Za-z][A-Za-z0-9 /&'’()-]{0,40}?):)\s+(.+?)\s*$/;
+const FIELD = /^\s*(?:[-*•]\s+|\d+[.)]\s+)?(?:\*{1,2}([^*:]{1,48}?):?\*{1,2}:?|([A-Za-z][A-Za-z0-9 /&'’()-]{0,40}?):)\s+(.+?)\s*$/;
 const ITEM = /^(\s*)([-*•]|\d+[.)])\s+(.*)$/;
 const TITLE_KEYS = /^(title|name|job title|role|subject|company|item|task|event|headline)$/i;
 
@@ -79,9 +83,15 @@ const NOTHING = /^\(?\s*(none|nothing|n\/a|-)\s*\)?\.?$/i;
 /** What a report says, without what only the worker needs: its "Next:" plan, groups with
  *  nothing in them ("Needs a reply: (None)"), and stray markdown ("**" on its own). A group name
  *  ("**Important:**") is a heading, not a warning. */
+/** A thinking model's reasoning, or a stray tag of it ("…Tonight (Nov 12):</think>]"), is never
+ *  part of a report: also for results saved before Mavo removed them. */
+export function withoutThinking(text: string): string {
+  return text.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>\s*/gi, "").replace(/[ \t]*<\/?think(?:ing)?>\]?/gi, "");
+}
+
 export function tidyReport(text: string): string {
   const out: string[] = [];
-  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+  for (const line of normalizeReportMarkup(jsonAsReadable(withoutThinking(text))).replace(/\r\n?/g, "\n").split("\n")) {
     if (/^\s*next\s*:/i.test(line)) continue;
     if (/^\s*\*{1,3}\s*$/.test(line)) continue;
     const group = GROUP.exec(line);
@@ -103,6 +113,23 @@ export function tidyReport(text: string): string {
   return out.filter((line, i) => !(line.startsWith("#### ") && empty(i))).join("\n").trim();
 }
 
+// The answer itself, when a report opens with it: "Credits left: $0.50", "Status: Operational".
+const STAT = /^\s*(?:\*\*)?([A-Za-z][^:*\n]{1,40}?)(?:\*\*)?\s*:\s*(?:\*\*)?([^*\n]{1,40}?)(?:\*\*)?\s*$/;
+const NOT_STAT = /^(note|please note|warning|heads up|tip|next|source|sources|link|url|from|to|subject|date)$/i;
+
+/** The report's opening "Label: value" line, as the answer to show big; null when it is not one
+ *  (a long sentence, a link, a note, or the first field of a record). */
+export function statOf(line: string): { label: string; value: string } | null {
+  // A link ("https://...") or maths ("$$a^2$$") is never an answer to show big.
+  if (line.includes("://") || /\$\$|\\\(|\\\[/.test(line)) return null;
+  const m = STAT.exec(line);
+  // "Aditya · Re: Roadmap" (who · subject) is a heading, not an answer.
+  if (!m || NOT_STAT.test(m[1].trim()) || m[1].includes("·")) return null;
+  const value = m[2].trim().replace(/\.$/, "");
+  if (/https?:\/\//.test(value) || !(/\d/.test(value) || value.split(/\s+/).length <= 3)) return null;
+  return { label: m[1].trim(), value };
+}
+
 export function parseReport(text: string): Block[] {
   const lines = tidyReport(text).split("\n");
   const blocks: Block[] = [];
@@ -112,6 +139,8 @@ export function parseReport(text: string): Block[] {
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     if (!line.trim()) { flush(); continue; }
+    // The answer first, big: only as the report's very first line, never inside a list.
+    if (!blocks.length && !paragraph.length && !ITEM.test(line) && statOf(line)) { blocks.push({ kind: "stat", ...statOf(line)! }); continue; }
     const math = mathBlock(lines, i);
     if (math) { flush(); blocks.push(math[0]); i = math[1]; continue; }
     const heading = /^(#{1,4})\s+(.*)$/.exec(line);
@@ -137,8 +166,10 @@ export function parseReport(text: string): Block[] {
         const m = ITEM.exec(current);
         if (m && (items.length === 0 || m[1].length < 2)) { items.push({ ordered: /\d/.test(m[2]), lines: [m[3]] }); }
         else if (!current.trim()) {
-          // A blank line ends the list unless the next line carries on with another item.
-          if (i + 1 < lines.length && ITEM.test(lines[i + 1]) && (ITEM.exec(lines[i + 1])?.[1].length ?? 0) < 2) { i += 1; continue; }
+          // Blank lines end the list unless the next real line carries on with another item.
+          let k = i + 1;
+          while (k < lines.length && !lines[k].trim()) k += 1;
+          if (k < lines.length && ITEM.test(lines[k]) && (ITEM.exec(lines[k])?.[1].length ?? 0) < 2) { i = k; continue; }
           break;
         } else if (items.length && /^\s+\S/.test(current)) { items[items.length - 1].lines.push(current.trim().replace(/^[-*•]\s+/, "")); }
         else break;
@@ -147,7 +178,7 @@ export function parseReport(text: string): Block[] {
       i -= 1;
       const records = items.map(item => recordOf(item.lines));
       if (records.length && records.every(Boolean)) blocks.push({ kind: "records", records: records as ReportRecord[] });
-      else blocks.push({ kind: "list", ordered: items[0].ordered, items: items.map(item => item.lines.join(" ")) });
+      else blocks.push({ kind: "list", ordered: items[0].ordered, items: items.map(item => item.lines.join("\n")) });
       continue;
     }
 
@@ -180,7 +211,7 @@ function recordOf(lines: string[]): ReportRecord | null {
   return { title: list[titleAt].value, fields: rest };
 }
 
-/** **bold**, *italic*, `code`, inline maths; links and addresses are shown as text. */
+/** **bold**, *italic*, `code`, inline maths and explicitly clicked source links. */
 export function inline(text: string): ReactNode[] {
   if (!/\\\(|\$/.test(text)) return markup(text);
   const out: ReactNode[] = [];
@@ -204,18 +235,88 @@ function markup(text: string): ReactNode[] {
     if (m[1] !== undefined) out.push(<strong key={n++}>{m[1]}</strong>);
     else if (m[2] !== undefined) out.push(<em key={n++}>{m[2]}</em>);
     else if (m[3] !== undefined) out.push(<code key={n++}>{m[3]}</code>);
-    else out.push(<span key={n++} className="report-link" title={m[5]}>{m[4]}</span>);
+    else out.push(<ReportLink key={n++} url={m[5]} label={m[4]} />);
     last = pattern.lastIndex;
   }
   if (last < text.length) out.push(text.slice(last));
   return out;
 }
 
+export function reportLinkUrl(value: string): string | null {
+  try {
+    if (value.length > 8192 || /[\u0000-\u0020\u007f\\]/.test(value)) return null;
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase().replace(/\.$/, '');
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password ||
+      !host.includes('.') || host === 'localhost' || /\.(?:localhost|local|internal|lan)$/.test(host) ||
+      /^127\.|^10\.|^192\.168\.|^169\.254\.|^172\.(?:1[6-9]|2\d|3[01])\.|^0\./.test(host) ||
+      host.startsWith('[') || (url.port && !['80','443'].includes(url.port))) return null;
+    return url.href;
+  } catch { return null; }
+}
+
+function ReportLink({url, label}: {url: string; label: string}) {
+  const [error, setError] = useState(false);
+  const safe = reportLinkUrl(url);
+  if (!safe) return <span className="report-link" title="This link cannot be opened safely">{label}</span>;
+  return <><a className="report-link" href={safe} target="_blank" rel="noopener noreferrer" title={safe}
+    onClick={async event => {
+      if (!isTauri()) return;
+      event.preventDefault();
+      try { await invoke('open_report_url', {url: safe}); setError(false); }
+      catch { setError(true); }
+    }}>{label}</a>{error && <small role="status"> Could not open the source. Copy its link and try your browser.</small>}</>;
+}
+
+/** A real, safe LaTeX document, generated from the same complete visible report. */
+export function reportLatex(text: string): string {
+  const body = parseReport(text).map(block => {
+    switch (block.kind) {
+      case 'heading': return `\\${block.level === 1 ? 'section' : block.level === 2 ? 'subsection' : 'subsubsection'}*{${latexInline(block.text)}}`;
+      case 'paragraph': return latexInline(block.text);
+      case 'list': return `\\begin{${block.ordered ? 'enumerate' : 'itemize'}}\n${block.items.map(item => '\\item ' + latexInline(item)).join('\n')}\n\\end{${block.ordered ? 'enumerate' : 'itemize'}}`;
+      case 'math': return exportMath(block.tex, true);
+      case 'rule': return '\\par\\noindent\\rule{\\linewidth}{0.4pt}';
+      case 'callout': return `\\textbf{${escapeLatex(block.label)}} ${latexInline(block.text)}\n${(block.items ?? []).map(item => '\\par ' + latexInline(item)).join('\n')}`;
+      case 'records': return block.records.map(record => `\\subsection*{${latexInline(record.title)}}\n${record.fields.map(field => `\\noindent\\textbf{${escapeLatex(field.label)}:} ${latexInline(field.value)}\\par`).join('\n')}`).join('\n\n');
+      case 'table': return `\\begin{tabular}{${'l'.repeat(Math.max(1, block.head.length))}}\n${[block.head, ...block.rows].map(row => row.map(latexInline).join(' & ') + ' \\\\').join('\n')}\n\\end{tabular}`;
+    }
+  }).join('\n\n');
+  return '\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\usepackage[hidelinks]{hyperref}\n\\begin{document}\n' + body + '\n\\end{document}\n';
+}
+
+function exportMath(value: string, display: boolean): string {
+  const allowed = new Set('frac dfrac tfrac sqrt pm mp neq ne leq geq lt gt times cdot div sum prod int infty partial nabla sin cos tan log ln exp left right text mathrm mathbf mathit operatorname alpha beta gamma delta epsilon theta lambda mu pi rho sigma tau phi omega Gamma Delta Theta Lambda Pi Sigma Phi Omega begin end'.split(' '));
+  const unsafe = /\^\^/.test(value) || [...value.matchAll(/\\([A-Za-z]+)/g)].some(m => !allowed.has(m[1])) ||
+    [...value.matchAll(/\\(?:begin|end)\{([^}]+)\}/g)].some(m => !/^(?:equation|align|gather|multline|array|matrix|pmatrix|bmatrix|cases)\*?$/.test(m[1]));
+  if (unsafe) return `\\texttt{${escapeLatex(value)}}`;
+  return /\\begin\{/.test(value) ? value : display ? `\\[${value}\\]` : `\\(${value}\\)`;
+}
+
+function latexInline(text: string): string {
+  const pattern = /\*\*([^*]+)\*\*|\*([^*\s][^*]*?)\*|`([^`]+)`|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)|\\\((.+?)\\\)|\$(?!\s)([^$\n]*?[\\^_{][^$\n]*?)(?<!\s)\$(?!\d)/g;
+  let result = '', at = 0;
+  for (const m of text.matchAll(pattern)) {
+    result += escapeLatex(text.slice(at, m.index));
+    if (m[1] !== undefined) result += `\\textbf{${escapeLatex(m[1])}}`;
+    else if (m[2] !== undefined) result += `\\emph{${escapeLatex(m[2])}}`;
+    else if (m[3] !== undefined) result += `\\texttt{${escapeLatex(m[3])}}`;
+    else if (m[4] !== undefined) {
+      const url = reportLinkUrl(m[5]);
+      result += url ? `\\href{${escapeLatex(url)}}{${escapeLatex(m[4])}}` : escapeLatex(m[4]);
+    } else result += exportMath(m[6] ?? m[7], false);
+    at = m.index! + m[0].length;
+  }
+  return result + escapeLatex(text.slice(at));
+}
+
+/** A list item as its own lines (a title, then what is under it), not run together. */
+const itemLines = (item: string) => item.split("\n").map((line, n) => <React.Fragment key={n}>{n > 0 && <br />}{inline(line)}</React.Fragment>);
 const CAP = { records: 2, items: 3, rows: 4 };
 const GIST = { records: 1, items: 2, rows: 3 };
 const more = (n: number) => n > 0 ? <p className="report-more">+{n} more</p> : null;
 
-function Blocks({ blocks, compact, gist }: { blocks: Block[]; compact: boolean; gist: boolean }) {
+function Blocks({ blocks, compact, gist, truncate }: { blocks: Block[]; compact: boolean; gist: boolean; truncate: boolean }) {
   const cap = gist ? GIST : CAP;
   return <>{blocks.map((block, index) => {
     switch (block.kind) {
@@ -223,23 +324,24 @@ function Blocks({ blocks, compact, gist }: { blocks: Block[]; compact: boolean; 
       case "paragraph": return <p key={index} className={index === 0 ? "report-lead" : undefined}>{inline(block.text)}</p>;
       case "callout": return <aside key={index} className="report-callout" role="note"><b>{block.label}</b><div>{block.text && <span>{inline(block.text)}</span>}{block.items && <ul className="report-list">{block.items.map((item, i) => <li key={i}>{inline(item)}</li>)}</ul>}</div></aside>;
       case "rule": return <hr key={index} />;
+      case "stat": return <div key={index} className="report-stat"><span>{block.label}</span><b>{inline(block.value)}</b></div>;
       case "math": return <div key={index} className="report-math" dangerouslySetInnerHTML={{ __html: tex(block.tex, true) }} />;
       case "list": {
-        const items = compact ? block.items.slice(0, cap.items) : block.items;
+        const items = compact && truncate ? block.items.slice(0, cap.items) : block.items;
         const rest = more(block.items.length - items.length);
         return <React.Fragment key={index}>{block.ordered
-          ? <ol className="report-list">{items.map((item, i) => <li key={i}>{inline(item)}</li>)}</ol>
-          : <ul className="report-list">{items.map((item, i) => <li key={i}>{inline(item)}</li>)}</ul>}{rest}</React.Fragment>;
+          ? <ol className="report-list">{items.map((item, i) => <li key={i}>{itemLines(item)}</li>)}</ol>
+          : <ul className="report-list">{items.map((item, i) => <li key={i}>{itemLines(item)}</li>)}</ul>}{rest}</React.Fragment>;
       }
       case "records": {
-        const records = compact ? block.records.slice(0, cap.records) : block.records;
+        const records = compact && truncate ? block.records.slice(0, cap.records) : block.records;
         return <React.Fragment key={index}><div className="report-records">{records.map((record, i) =>
           <article key={i} className="report-record"><span className="report-index">{i + 1}</span>
             <h5>{inline(record.title)}</h5>
             <dl>{record.fields.map(field => <div key={field.label}><dt>{field.label}</dt><dd>{inline(field.value)}</dd></div>)}</dl></article>)}</div>{more(block.records.length - records.length)}</React.Fragment>;
       }
       case "table": {
-        const rows = compact ? block.rows.slice(0, cap.rows) : block.rows;
+        const rows = compact && truncate ? block.rows.slice(0, cap.rows) : block.rows;
         return <React.Fragment key={index}><div className="report-table"><table><thead><tr>{block.head.map((h, i) => <th key={i}>{inline(h)}</th>)}</tr></thead>
           <tbody>{rows.map((row, r) => <tr key={r}>{row.map((cell, c) => <td key={c}>{inline(cell)}</td>)}</tr>)}</tbody></table></div>{more(block.rows.length - rows.length)}</React.Fragment>;
       }
@@ -247,11 +349,14 @@ function Blocks({ blocks, compact, gist }: { blocks: Block[]; compact: boolean; 
   })}</>;
 }
 
-/** A Crew's result, laid out to be read. `compact` is for the small desktop card. */
-export function Report({ text, compact, digest }: { text: string; compact?: boolean; digest?: boolean }) {
-  const all = parseReport(text);
+/** Compact typography is independent of truncation: scrollable readers retain all items. */
+export function Report({ text, compact, digest, truncate = true }: { text: string; compact?: boolean; digest?: boolean; truncate?: boolean }) {
+  const all = useMemo(() => parseReport(text), [text]);
   // A digest is the gist for a small window: the opening line and the first few items, no notes.
   const blocks = digest ? all.filter(b => b.kind !== "callout" && b.kind !== "heading" && b.kind !== "rule").filter((b, i, kept) => b.kind !== "paragraph" || kept.findIndex(k => k.kind === "paragraph") === i) : all;
   const small = !!compact || !!digest;
-  return <div className={"report" + (small ? " report-compact" : "")}><Blocks blocks={blocks} compact={small} gist={!!digest} /></div>;
+  // The maths font only where there is maths: a plain two-line summary was set in a large serif.
+  const maths = /\$[^$\n]+\$|\$\$/.test(text);
+  return <div className={"report" + (maths ? " report-latex" : "") + (small ? " report-compact" : "")}>
+    <Blocks blocks={blocks} compact={small} gist={!!digest} truncate={truncate} /></div>;
 }

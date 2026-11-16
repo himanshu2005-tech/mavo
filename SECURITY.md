@@ -1,5 +1,19 @@
 # Security and privacy
 
+Crew V2 agents can narrow, never widen, parent grants and exact action policies. Parent generations
+and task state are rechecked at execution boundaries. Internal workers are not independently
+scheduled; cancellation and permission revocation fence their remaining work. Missing access is a
+typed backend request. A cloud dollar ceiling fails closed until verified cost accounting exists.
+See [V2 boundaries](docs/crew-architecture-v2.md#access-and-private-state).
+
+Orchestration messages are data, not permission grants. Recipients must satisfy read-scope
+checks; private health/wellbeing Crew output is not implicitly shareable. Typed capability
+requests originate at deterministic policy checks, never from matching model error prose.
+Granting a capability does not approve a particular dangerous command or script. Configuration
+diffs cannot rewrite permissions, and temporary instructions do not change the real scheduler.
+Interrupted/uncertain tool work requires a user-verified checkpoint before resumption; Mavo
+does not promise universal exactly-once external side effects. See [orchestration boundaries](docs/orchestration.md).
+
 Cloud fallback is off by default for local agents. Selecting a fallback in a model route's
 panel explicitly permits sending that agent's task and permitted data to the chosen cloud
 provider using the user's credits. Merely saving a cloud connection grants no fallback access.
@@ -53,6 +67,13 @@ Mavo treats local access as a security boundary. A loopback address alone is not
 The unauthenticated `/health` route returns only `{ "status": "ok" }`, which exposes no configuration or data.
 
 ## Trust boundaries
+
+First-use onboarding runs only after verified login. Its progress key is derived on the
+server from the existing workspace-owner binding; a request cannot choose another UID.
+Versioned/revision-fenced progress is a UX gate, not authorization: resource and action checks
+remain mandatory regardless of setup completion. Provider setup may be explicitly skipped,
+and resource setup never implicitly connects accounts or enables access. Local sign-out or
+data deletion does not revoke remote provider grants or delete the Firebase account itself.
 
 Account connections are optional and provider-scoped. Firebase app login never grants Google Workspace or GitHub access. Actions and worker schemas omit disconnected providers and operations without matching scopes. GitHub tokens are encrypted and constrained to explicitly selected repositories, even when custom action limits are removed. A provider's 401/403 invalidates rejected access and fences affected work. Account consent and per-Crew grants remain separate. Microsoft OAuth, API dispatch, tool schemas and native authorization URL support have been removed. Upgrade cleanup deletes its exact stored token/metadata and saved policies, rejects pending actions and stops affected Crew without deleting those Crew, chat or other connections. Historical audit records are retained; local credential deletion does not revoke a grant at a remote provider.
 

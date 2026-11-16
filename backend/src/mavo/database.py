@@ -56,6 +56,8 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
+    mentioned_crew_ids: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]")
+    mentioned_agent_ids: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]")
     model: Mapped[str | None] = mapped_column(String(160), nullable=True)
     provider: Mapped[str] = mapped_column(String(32), default="ollama")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -86,15 +88,46 @@ class ModelRoute(Base):
 class CrewInstance(Base):
     __tablename__ = "crew_instances"
 
+    agents: Mapped[list[CrewAgent]] = relationship(
+        foreign_keys="CrewAgent.crew_id",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="CrewAgent.created_at",
+    )
+
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     template_id: Mapped[str] = mapped_column(String(64), index=True)
     name: Mapped[str] = mapped_column(String(80), unique=True)
     responsibilities: Mapped[str] = mapped_column(Text)
     configuration_plan: Mapped[dict] = mapped_column(JSON, default=dict)
+    config_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     @property
     def question(self):
         return (self.observation or {}).get("question")
+
+    @property
+    def hotkey(self):
+        """Its keyboard shortcut ("Win+F9"), set when it was made or in its settings."""
+        from mavo.hotkeys import hotkey_of
+
+        return hotkey_of(self)
+
+    @property
+    def hotkey_problem(self):
+        """Why its shortcut could not be registered (another app has it), if so."""
+        return (self.observation or {}).get("hotkey_problem")
+
+    @property
+    def asks(self):
+        """Its agent's questions still waiting for the person (desk.ask_person): each answered
+        from its alert or from the agent's own window, by the alert's id."""
+        asks = (self.observation or {}).get("desk_asks") or {}
+        return [
+            {"id": key, "question": a.get("question"), "choices": a.get("choices") or []}
+            for key, a in asks.items()
+            if isinstance(a, dict) and not a.get("answer")
+        ]
 
     @property
     def fallback(self):
@@ -231,12 +264,62 @@ class ActionRequest(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class CrewAgent(Base):
+    """Logical persistent member; its worker is an internal execution adapter, not a Crew."""
+
+    __tablename__ = "crew_agents"
+    __table_args__ = (UniqueConstraint("crew_id", "key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    crew_id: Mapped[str] = mapped_column(
+        ForeignKey("crew_instances.id", ondelete="CASCADE"), index=True
+    )
+    key: Mapped[str] = mapped_column(String(24))
+    name: Mapped[str] = mapped_column(String(80))
+    role: Mapped[str] = mapped_column(String(80))
+    instructions: Mapped[str] = mapped_column(Text, default="")
+    route_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_routes.id", ondelete="RESTRICT"), nullable=True
+    )
+    definition: Mapped[dict] = mapped_column(JSON, default=dict)
+    execution: Mapped[dict] = mapped_column(JSON, default=dict)
+    calls_used: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    budget_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    worker_id: Mapped[str | None] = mapped_column(
+        ForeignKey("crew_instances.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
+    worker: Mapped[CrewInstance | None] = relationship(foreign_keys=[worker_id], lazy="selectin")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    @property
+    def runtime_state(self):
+        if self.worker and self.worker.runtime_state == "working":
+            return "working"
+        if (
+            self.worker
+            and self.worker.is_running
+            and (self.worker.observation or {}).get("question")
+        ):
+            return "needs_input"
+        if self.worker and not self.worker.is_running and self.execution.get("status") == "running":
+            return "stopped"
+        return self.execution.get("status", self.worker.runtime_state if self.worker else "idle")
+
+    @property
+    def checkpoint(self):
+        return self.worker.checkpoint if self.worker else None
+
+
 class TaskRun(Base):
     """One run of a one-time task (see task_plan.py): the plan, each step's progress and answer,
     and the result that was reported."""
 
     __tablename__ = "task_runs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    crew_id: Mapped[str | None] = mapped_column(
+        ForeignKey("crew_instances.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    crew_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String(80))
     request: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="running", index=True)
@@ -246,6 +329,11 @@ class TaskRun(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     budget_calls: Mapped[int] = mapped_column(Integer, default=12)
     used_calls: Mapped[int] = mapped_column(Integer, default=0)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    reserved_calls: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     conversation_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
@@ -257,6 +345,78 @@ class WorkspaceSetting(Base):
     __tablename__ = "workspace_settings"
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[dict] = mapped_column(JSON)
+
+
+class AgentEnvelope(Base):
+    """Immutable, bounded work message; delivery state belongs to each recipient."""
+
+    __tablename__ = "agent_envelopes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    idempotency_key: Mapped[str] = mapped_column(String(180), unique=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    sender: Mapped[str] = mapped_column(String(160), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentDelivery(Base):
+    __tablename__ = "agent_deliveries"
+    __table_args__ = (UniqueConstraint("message_id", "recipient"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_envelopes.id", ondelete="CASCADE"), index=True
+    )
+    recipient: Mapped[str] = mapped_column(String(160), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConversationEvent(Base):
+    """Durable, correlated user-facing activity, separate from internal model chatter."""
+
+    __tablename__ = "conversation_events"
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(36), unique=True, default=lambda: str(uuid4()))
+    source_key: Mapped[str] = mapped_column(String(180), unique=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    crew_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    step_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    sender: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(24), default="recorded", index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    payload: Mapped[dict] = mapped_column(JSON)
+    private: Mapped[bool] = mapped_column(default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConfigurationEdit(Base):
+    __tablename__ = "configuration_edits"
+    __table_args__ = (UniqueConstraint("crew_id", "version"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    request_key: Mapped[str] = mapped_column(String(180), unique=True)
+    crew_id: Mapped[str | None] = mapped_column(
+        ForeignKey("crew_instances.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_version: Mapped[int] = mapped_column(Integer, default=0)
+    scope: Mapped[str] = mapped_column(String(24))
+    target_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="proposed", index=True)
+    before: Mapped[dict] = mapped_column(JSON)
+    changes: Mapped[dict] = mapped_column(JSON)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class CoordinatorSession(Base):

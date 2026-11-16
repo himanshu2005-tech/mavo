@@ -14,7 +14,9 @@ export default {
       fontFamily: {
         sans: ["-apple-system", "BlinkMacSystemFont", "Segoe UI Variable", "Segoe UI", "sans-serif"]
       },
-      boxShadow: { glow: "0 2px 8px rgba(0,0,0,.03)" }
+      boxShadow: { glow: "none" },
+      // Small corners everywhere: Mavo is neat and square-ish, never pill-shaped.
+      borderRadius: { sm: "2px", DEFAULT: "3px", md: "4px", lg: "4px", xl: "6px", "2xl": "6px", "3xl": "8px" }
     }
   },
   plugins: []

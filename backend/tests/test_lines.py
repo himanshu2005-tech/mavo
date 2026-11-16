@@ -347,3 +347,10 @@ def test_the_planner_builds_a_team_the_model_designed(planning):
         json={"message": "x", "request_id": "22222222-2222-2222-2222-222222222222"},
     )
     assert bad.status_code >= 400
+
+
+def test_a_decorated_verdict_on_its_own_line_is_read_and_its_reason_kept():
+    """A verifier's bold "pass" counted as no verdict, and the setup test failed."""
+    assert parse_verdict("All good.\n**VERDICT: pass**")[0] == "pass"
+    verdict, notes = parse_verdict("Checked.\nVERDICT: fix - the time is not free")
+    assert verdict == "fix" and "the time is not free" in notes

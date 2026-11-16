@@ -1,7 +1,8 @@
 import { ArrowDown, ArrowRight, Check, Crown, Users, FileText, LoaderCircle, Minus, Plus, Send, ShieldCheck, UserCheck, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "../lib/api";
-import { initials } from "../lib/radialGraph";
+import { AgentBot } from "./AgentBot";
+import { botState } from "./AgentGraph";
 import { useAppStore } from "../store/app";
 import type { CrewInstance } from "../types";
 import { agentStyle } from "./CrewFan";
@@ -16,7 +17,7 @@ export function lineOf(crew: CrewInstance, all: CrewInstance[]) {
 function Face({ crew, onClick, onRemove }: { crew: CrewInstance; onClick: () => void; onRemove?: () => void }) {
   return <span className="line-chip">
     <button className="line-chip-main" onClick={onClick} title={`Open ${crew.name}`}>
-      <span className="map-face sm" style={agentStyle(crew)}>{initials(crew.name)}</span>{crew.name}
+      <span className="map-face sm has-bot" style={agentStyle(crew)}><AgentBot seed={crew.id} state={botState(crew)} /></span>{crew.name}
     </button>
     {onRemove && <button className="line-chip-x" aria-label={`Stop taking work from ${crew.name}`} onClick={onRemove}><X size={12} /></button>}
   </span>;

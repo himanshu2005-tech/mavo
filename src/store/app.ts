@@ -4,6 +4,7 @@ import type { CrewProposal } from "../types";
 import type { AppStatus, Conversation, CrewInstance, CrewTemplate, ModelRoute, NavId } from "../types";
 
 interface AppState {
+  chatMentions:Record<string,import('../lib/orchestration').MentionRef[]>;
   execution:ExecutionFeed|null;
   executionError:string|null;
   setExecution:(snapshot:RuntimeSnapshot)=>void;
@@ -11,7 +12,10 @@ interface AppState {
   workspaceEpoch: number;
   chatInputs: Record<string,string>;
   pendingChatMessages: Record<string,string>;
+  /** The reply so far, while Mavo is still writing it (per chat). */
+  streamingReplies: Record<string,string>;
   chatErrors: Record<string,string>;
+  chatFailures: Record<string,{message:string;error:string;requestId:string;problem?:import('../lib/api').CoreProblem}>;
   chatRefinements: Record<string,string>;
   crewProposals: CrewProposal[];
   setCrewProposals: (proposals: CrewProposal[]) => void;
@@ -33,8 +37,8 @@ interface AppState {
   chatOpen: boolean;
   setChatOpen: (open: boolean) => void;
   /** Which side of the chat: your agents and Mavo talking with you, or building agents. */
-  chatTab: "chat" | "build";
-  setChatTab: (tab: "chat" | "build") => void;
+  chatTab: "chat" | "inbox";
+  setChatTab: (tab: "chat" | "inbox" | "build") => void;
   /** An agent the graph should select and show (from a desktop card, a chat card, ...). */
   focusAgent: string | null;
   openAgent: (id: string | null) => void;
@@ -61,31 +65,35 @@ interface AppState {
 }
 
 export function clearWorkspace() {
-  useAppStore.setState(state=>({execution:null,executionError:null,workspaceEpoch:state.workspaceEpoch+1,chatInputs:{},pendingChatMessages:{},chatErrors:{},chatRefinements:{},conversations: [], crew: [], setupDrafts: [], deletedCrewIds: [], crewProposals: [], routes: [], status: null, statusError: null, activeConversationId: null, selectedRouteId: "", page: "home", focusAgent: null, refineRequest: null}));
+  useAppStore.setState({chatMentions:{},chatFailures:{}});
+  useAppStore.setState(state=>({execution:null,executionError:null,workspaceEpoch:state.workspaceEpoch+1,chatInputs:{},pendingChatMessages:{},streamingReplies:{},chatErrors:{},chatRefinements:{},conversations: [], crew: [], setupDrafts: [], deletedCrewIds: [], crewProposals: [], routes: [], status: null, statusError: null, activeConversationId: null, selectedRouteId: "", page: "home", focusAgent: null, refineRequest: null}));
 }
 
 export const useAppStore = create<AppState>((set) => ({
+  chatMentions:{},
   execution:null,executionError:null,
   setExecution:snapshot=>set(state=>({execution:mergeExecution(state.execution,snapshot),executionError:null})),
   setExecutionError:executionError=>set({executionError}),
   workspaceEpoch: 0,
   chatInputs: {},
   pendingChatMessages: {},
+  streamingReplies: {},
   chatErrors: {},
+  chatFailures: {},
   chatRefinements: {},
   crewProposals: [],
   setCrewProposals: (crewProposals) => set({ crewProposals }),
   page: "home",
   chatOpen: (() => { try { return localStorage.getItem("mavo-chat-open") !== "0"; } catch { return true; } })(),
   setChatOpen: (chatOpen) => { try { localStorage.setItem("mavo-chat-open", chatOpen ? "1" : "0"); } catch { /* fine */ } set({ chatOpen }); },
-  chatTab: (() => { try { return localStorage.getItem("mavo-chat-tab") === "build" ? "build" : "chat"; } catch { return "chat"; } })(),
-  setChatTab: (chatTab) => { try { localStorage.setItem("mavo-chat-tab", chatTab); } catch { /* fine */ } set({ chatTab }); },
+  chatTab: (() => { try { return localStorage.getItem("mavo-chat-tab") === "inbox" ? "inbox" : "chat"; } catch { return "chat"; } })(),
+  setChatTab: (tab) => { const chatTab=tab==='build'?'chat':tab;try { localStorage.setItem("mavo-chat-tab", chatTab); } catch { /* fine */ } set({ chatTab }); },
   focusAgent: null,
   openAgent: (focusAgent) => set({ page: "home", focusAgent }),
   refineRequest: null,
-  refineInChat: (refineRequest) => { try { localStorage.setItem("mavo-chat-open", "1"); } catch { /* fine */ } set({ refineRequest, page: "home", chatOpen: true, chatTab: "build" }); },
+  refineInChat: (refineRequest) => { try { localStorage.setItem("mavo-chat-open", "1"); } catch { /* fine */ } set({ refineRequest, page: "home", chatOpen: true, chatTab: "chat" }); },
   chatFocus: 0,
-  startInChat: (text) => { try { localStorage.setItem("mavo-chat-open", "1"); } catch { /* fine */ } set(state => ({ page: "home", chatOpen: true, chatTab: "build", chatFocus: state.chatFocus + 1, activeConversationId: null, chatInputs: { ...state.chatInputs, new: text } })); },
+  startInChat: (text) => { try { localStorage.setItem("mavo-chat-open", "1"); } catch { /* fine */ } set(state => ({ page: "home", chatOpen: true, chatTab: "chat", chatFocus: state.chatFocus + 1, activeConversationId: null, chatInputs: { ...state.chatInputs, new: text } })); },
   status: null,
   statusError: null,
   conversations: [],
@@ -118,7 +126,7 @@ export const useAppStore = create<AppState>((set) => ({
   removeConversation: (id) => set(state=>{
     const conversations=state.conversations.filter(c=>c.id!==id);
     const without=(values:Record<string,string>)=>Object.fromEntries(Object.entries(values).filter(([key])=>key!==id));
-    return {conversations,activeConversationId:state.activeConversationId===id?conversations[0]?.id??null:state.activeConversationId,chatInputs:without(state.chatInputs),pendingChatMessages:without(state.pendingChatMessages),chatErrors:without(state.chatErrors),chatRefinements:without(state.chatRefinements)};
+    return {conversations,activeConversationId:state.activeConversationId===id?conversations[0]?.id??null:state.activeConversationId,chatInputs:without(state.chatInputs),pendingChatMessages:without(state.pendingChatMessages),chatErrors:without(state.chatErrors),chatRefinements:without(state.chatRefinements),chatFailures:Object.fromEntries(Object.entries(state.chatFailures).filter(([key])=>key!==id))};
   }),
   upsertConversation: (conversation, activate=true) =>
     set((state) => ({

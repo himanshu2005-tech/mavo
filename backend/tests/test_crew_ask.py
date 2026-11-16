@@ -204,3 +204,177 @@ def test_a_desktop_update_is_written_as_the_news_not_as_a_report_of_work():
     assert "lead with the news itself" in NOTIFICATION_STYLE
     assert "reviewed" in NOTIFICATION_STYLE  # named as what not to write
     assert ALERT_RULE.endswith("review.")  # the alert rule stays the last thing said
+
+
+def test_what_it_may_not_do_is_said_and_handed_to_mavo_as_a_request(planning):
+    """An inbox summariser asked to send an email cannot: it says so, and gives the request,
+    written out, for Mavo to make an agent that can."""
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime, name="Inbox Summary")
+    calls = len(coordinator.calls)
+    sorter(
+        runtime,
+        {
+            "kind": "beyond",
+            "ack": "I can only read, so I can't send that email.",
+            "prompt": "Make an agent that emails Ravi the weekly report every Friday.",
+        },
+    )
+    item = client.post(
+        f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "email Ravi the report"}
+    ).json()
+    assert item["kind"] == "beyond" and not item["pending"]
+    assert item["answer"] == "I can only read, so I can't send that email."
+    assert item["prompt"].startswith("Make an agent that")
+    assert len(coordinator.calls) == calls  # nothing was started
+    from mavo.crew_ask import SORT
+
+    assert "what this Crew may do is: {can}" in SORT  # the model is told its abilities
+    # Without a request written out, it is an ordinary question.
+    sorter(runtime, {"kind": "beyond", "ack": "I can't."})
+    decide(planning, reply="Here.")
+    plain = client.post(f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "x"}).json()
+    assert plain["kind"] == "question"
+
+
+def test_a_failed_answer_stays_in_the_conversation(planning):
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime)
+    sorter(runtime, {"kind": "question"})
+
+    async def broken(request):
+        raise RuntimeError("boom")
+
+    runtime.planner.turn = broken
+    item = client.post(f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "why?"}).json()
+    assert item["kind"] == "error" and "could not answer" in item["answer"]
+    listed = client.get(f"/api/v1/crew/{crew}/asks", headers=auth).json()
+    assert listed[-1]["kind"] == "error" and listed[-1]["question"] == "why?"
+
+
+def test_small_talk_and_nonsense_get_a_line_and_start_nothing(planning):
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime, name="Inbox Summary")
+    calls = len(coordinator.calls)
+    for typed, said in (
+        ("hi", "Hi! Ask me what's new in your inbox."),
+        ("asdfgh", "I didn't follow. Try: anything important today?"),
+    ):
+        sorter(runtime, {"kind": "chat", "ack": said})
+        item = client.post(f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": typed})
+        item = item.json()
+        assert item["kind"] == "chat" and item["answer"] == said and not item["pending"]
+    assert len(coordinator.calls) == calls  # no task, nothing sent to the assistant
+
+
+def test_a_question_off_its_job_is_passed_to_mavo_not_answered(planning):
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime, name="Inbox Summary")
+    calls = len(coordinator.calls)
+    sorter(
+        runtime,
+        {
+            "kind": "beyond",
+            "ack": "That's outside what I do: I summarise your inbox.",
+            "prompt": "Find conferences that fit my paper on graph neural networks.",
+        },
+    )
+    item = client.post(
+        f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "conferences for my paper?"}
+    ).json()
+    assert item["kind"] == "beyond" and "outside what I do" in item["answer"]
+    assert len(coordinator.calls) == calls
+    from mavo.crew_ask import SORT
+
+    assert "OFF ITS JOB" in SORT and "SMALL TALK" in SORT
+
+
+def test_core_searches_the_web_for_an_attached_paper_and_never_answers_from_memory():
+    from mavo.coordinator_contract import PlannerContext, coordinator_prompt
+
+    text = coordinator_prompt(PlannerContext(local_time="2026-11-15T22:00:00+05:30"))
+    assert "ABOUT AN ATTACHED FILE" in text and "never the file's name" in text
+    assert "SMALL TALK AND NONSENSE" in text
+
+
+def test_a_question_in_an_agents_room_stays_out_of_mavos_chat(planning):
+    """'Ask · Signal Inbox Brief' showed up in Mavo's chat history: a room's questions belong
+    to that room. Mavo's own chats are still listed."""
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime)
+    sorter(runtime, {"kind": "question"})
+    decide(planning, reply="Here is the answer.")
+    client.post(f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "what is new?"})
+    with runtime.factory() as session:
+        own = Conversation(title="Plan my week")
+        session.add(own)
+        session.commit()
+        own_id = own.id
+        from mavo.crew_ask import ask_conversations
+
+        hidden = ask_conversations(session)
+    assert hidden  # the room's conversation exists...
+    listed = {c["id"] for c in client.get("/api/v1/conversations", headers=auth).json()}
+    assert own_id in listed and not (listed & hidden)  # ...but only Mavo's own are listed
+    updates = client.get("/api/v1/orchestration/events", headers=auth).json()
+    rows = updates if isinstance(updates, list) else updates.get("events", [])
+    assert not [r for r in rows if r.get("conversation_id") in hidden]
+
+
+def test_run_now_runs_and_a_chat_reply_claims_nothing(planning):
+    """'run task' got an introduction; 'Just morning motivation for now' got "I've sent your
+    first reminder" and nothing was sent or kept."""
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime, name="Steady Resolve")
+    sorter(runtime, {"kind": "run", "ack": "On it: checking now."})
+    item = client.post(f"/api/v1/crew/{crew}/asks", headers=auth, json={"question": "run task"})
+    assert item.json()["kind"] == "run" and item.json()["answer"] == "On it: checking now."
+    with runtime.factory() as session:
+        stored = session.get(CrewInstance, crew)
+        assert stored.runtime_state == "waiting"
+        assert stored.next_run_at <= utcnow().replace(tzinfo=stored.next_run_at.tzinfo)
+    from mavo.crew_ask import SORT
+
+    assert "never says it did" in SORT and "is a PREFERENCE" in SORT
+
+
+def test_check_now_waits_in_the_room_for_its_result_and_says_where_it_went(planning):
+    """Check now ran quietly and the room showed nothing new: the request now stays in the
+    conversation, and the run's result comes under it with where it was sent."""
+    from mavo.database import ReminderEvent, TaskRun
+
+    client, auth, runtime, coordinator = planning
+    crew = news_crew(client, auth, runtime, name="Steady Resolve")
+    item = client.post(f"/api/v1/crew/{crew}/run-now", headers=auth).json()
+    assert item["kind"] == "run" and item["pending"] and item["question"] == "Check now"
+    assert client.get(f"/api/v1/crew/{crew}/asks", headers=auth).json()[-1]["pending"]
+    now = utcnow()
+    with runtime.factory() as session:
+        session.add(
+            TaskRun(
+                id="r",
+                crew_id=crew,
+                title="Steady Resolve",
+                request="x",
+                status="done",
+                plan={},
+                steps=[],
+                result="Start small today.",
+            )
+        )
+        session.add(
+            ReminderEvent(
+                crew_id=crew,
+                crew_name="Steady Resolve",
+                kind="crew_update",
+                message="Start small today.",
+                scheduled_for=now,
+                local_date=now.date().isoformat(),
+                status="pending",
+                deduplication_key="k",
+            )
+        )
+        session.commit()
+    done = client.get(f"/api/v1/crew/{crew}/asks", headers=auth).json()[-1]
+    assert not done["pending"] and done["answer"] == "Start small today."
+    assert done["delivered"] == ["desktop"]

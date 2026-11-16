@@ -16,11 +16,13 @@ class WeatherLookup(BaseModel):
     query: str | None = Field(default=None, min_length=2, max_length=160)
     country_code: str | None = Field(default=None, pattern=r"^[A-Za-z]{2}$")
     location: WeatherLocation | None = None
+    # The person's own place: the location saved in Mavo's Resources, never a guess.
+    here: bool = False
 
     @model_validator(mode="after")
     def destination(self):
-        if (self.query is None) == (self.location is None):
-            raise ValueError("Supply a city query or explicit destination coordinates, not both")
+        if sum([self.query is not None, self.location is not None, self.here]) != 1:
+            raise ValueError("Supply one of: a city query, destination coordinates, or here")
         if self.location and self.location.source != "manual":
             raise ValueError("Weather lookup cannot request device location")
         return self
@@ -41,11 +43,56 @@ def require_weather(factory, crew):
             )
 
 
+def _without_position(value):
+    if isinstance(value, dict):
+        return {
+            k: _without_position(v) for k, v in value.items() if k not in {"latitude", "longitude"}
+        }
+    if isinstance(value, list):
+        return [_without_position(v) for v in value]
+    return value
+
+
+async def saved_place_weather(factory, adapter):
+    """The forecast where the person is: the place saved in Resources, used only while location
+    is allowed there. Coordinates never reach the model."""
+    from mavo.database import WorkspaceSetting
+
+    with factory() as session:
+        access = read_access(session)
+        saved = session.get(WorkspaceSetting, "weather-location")
+        place = dict(saved.value) if saved else None
+    if not place:
+        return {
+            "here": True,
+            "status": "unavailable",
+            "error": "No location is saved in Mavo's Resources. "
+            "Say so in one line; do not guess a place.",
+        }
+    if place.get("source") == "device" and not access.location:
+        return {
+            "here": True,
+            "status": "unavailable",
+            "error": "Location is off in Mavo's Resources. "
+            "Say so in one line; do not guess a place.",
+        }
+    snapshot = await adapter.read_location(WeatherLocation.model_validate(place))
+    return {
+        "here": True,
+        "status": "ok",
+        "forecast": _without_position(snapshot.model_dump(mode="json")),
+        "source": "Open-Meteo",
+        "limitations": "Five-day daily forecast at the saved location.",
+    }
+
+
 async def lookup_weather(factory, crew, adapter, request):
     require_weather(factory, crew)
     if adapter is None:
         raise ActionPolicyError("Weather is unavailable in this runtime.")
     try:
+        if request.here:
+            return await saved_place_weather(factory, adapter)
         location = request.location
         if location is None:
             places = await adapter.search(request.query, request.country_code)

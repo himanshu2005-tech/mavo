@@ -288,7 +288,7 @@ class Projects:
 
     # ---- where things are -------------------------------------------------------------------
 
-    def root(self, rule: dict | None = None) -> Path:
+    def root(self, rule: dict | None = None, *, create: bool = True) -> Path:
         folders = (rule or {}).get("folders") or []
         if folders:
             base = Path(folders[0])
@@ -299,11 +299,13 @@ class Projects:
             self.default_root
             or Path(os.environ.get("USERPROFILE", Path.home())) / "Documents" / "Mavo Projects"
         )
-        base.mkdir(parents=True, exist_ok=True)
+        if create:
+            base.mkdir(parents=True, exist_ok=True)
         return base
 
     def project_dir(self, name: str, rule: dict | None = None, *, must_exist: bool = True) -> Path:
-        root = self.root(rule).resolve()
+        # Reading/binding a missing project must not create a workspace as a side effect.
+        root = self.root(rule, create=not must_exist).resolve()
         folder = root / slug_of(name)
         if must_exist and not (folder / MARKER).is_file():
             raise ValueError(f'There is no project "{name}". Create it first with project.create.')

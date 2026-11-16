@@ -54,6 +54,9 @@ CAPABILITIES = {
     ),
 }
 
+# Request bounds must grow with the server-owned catalog (now 11 capabilities).
+# Unknown capability IDs still fail the GoogleCapability literal validation.
+GOOGLE_CAPABILITY_LIMIT = len(CAPABILITIES)
 GOOGLE_SERVICES = ("gmail", "calendar", "tasks", "drive", "contacts", "youtube")
 
 

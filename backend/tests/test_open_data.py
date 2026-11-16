@@ -236,7 +236,7 @@ def test_a_look_up_asked_wrongly_can_be_corrected_once_and_then_it_must_finish(p
         why = (stored.last_runtime_error, stored.daily_call_limit, stored.daily_calls_used)
     assert len(calls) == 3, why  # asked, corrected once, finished: no third round
     assert "corrected lookups once" in calls[1].args[2][-1]["content"]
-    assert "with no lookups" in calls[2].args[2][-1]["content"]
+    assert "Do not repeat a lookup" in calls[2].args[2][-1]["content"]
     assert '"lat": 12.99' in calls[2].args[2][-1]["content"]
     from mavo.database import CrewInstance
 
@@ -266,8 +266,32 @@ def test_an_agent_still_looking_after_its_rounds_says_it_could_not_finish(planni
     asyncio.run(runtime.work(crew["id"]))
     with runtime.factory() as session:
         report = session.get(CrewInstance, crew["id"]).checkpoint
-    assert report.startswith("Could not finish the look-up: No place called 'Nowhere at all'")
+    assert "No place called 'Nowhere at all'" in report
+    assert "repeated lookups were stopped" in report
     assert "Retrying" not in report
+
+
+def test_repeated_successful_lookup_is_not_fetched_again_and_partial_data_is_retained(planning):
+    from unittest.mock import AsyncMock
+
+    from mavo.database import CrewInstance
+
+    crew, runtime = credit_crew(planning)
+    runtime.open_data = fetcher()
+    runtime.fetch_open_data = AsyncMock(wraps=runtime.fetch_open_data)
+    request = [{"source": "geocode", "query": "Chennai Airport"}]
+    runtime.router.chat = AsyncMock(
+        return_value=json.dumps(checkpoint("Still searching", state="continue", lookups=request))
+    )
+    asyncio.run(runtime.work(crew["id"]))
+    assert runtime.fetch_open_data.await_count == 1
+    assert runtime.router.chat.await_count == 3  # initial, result, final synthesis
+    with runtime.factory() as session:
+        stored = session.get(CrewInstance, crew["id"])
+        assert stored.observation["execution_failure"]["code"] == "lookup_loop"
+        assert stored.observation["lookup_progress"]["receipts"][0]["response"]["status"] == "ok"
+        assert "Partial source results" in stored.checkpoint
+        assert "12.99" in stored.checkpoint
 
 
 def test_a_state_said_another_way_is_read_as_meant():

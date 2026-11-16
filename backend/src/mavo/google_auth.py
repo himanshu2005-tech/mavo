@@ -37,6 +37,7 @@ SCOPES = {
     "youtube": "https://www.googleapis.com/auth/youtube.readonly",
 }
 IDENTITY_SCOPES = {"openid", "email", "profile"}
+EXPIRED = "Google access expired. Reconnect Google to carry on."
 
 
 class GoogleConnectionError(RuntimeError):
@@ -117,6 +118,8 @@ class GoogleAuth:
                 "client_id": config.get("client_id", ""),
                 "has_client_secret": bool(config.get("client_secret")),
                 "signed_in": signed_in,
+                # Google ended the sign-in: it needs connecting again before anything reads.
+                "expired": signed_in and bool(tokens.get("expired")),
                 "name": account.name if account else None,
                 "email": account.email if account else None,
                 "resources": [
@@ -461,6 +464,16 @@ class GoogleAuth:
                 self.credentials.set("google-tokens", json.dumps(tokens))
                 return tokens["access_token"]
             except GoogleSignInError as exc:
+                if exc.code == "invalid_grant":
+                    # Google ended this sign-in (a Google app still in testing keeps one for 7
+                    # days; a password change or a removed access ends it too). Noted, so Mavo
+                    # shows "Reconnect Google" instead of failing every run until then.
+                    current = json.loads(self.credentials.get("google-tokens") or "{}")
+                    if current.get("subject") == tokens.get("subject"):
+                        self.credentials.set(
+                            "google-tokens", json.dumps({**current, "expired": True})
+                        )
+                    raise GoogleConnectionError(EXPIRED) from exc
                 raise GoogleConnectionError(str(exc)) from exc
             except (httpx.HTTPError, KeyError, ValueError) as exc:
                 raise GoogleConnectionError(

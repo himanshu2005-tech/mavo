@@ -2,9 +2,15 @@ import { Brain, ChevronDown, Cloud, Cpu, LoaderCircle, Plus, Settings2, ShieldAl
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { ActionAccessEditor, type ActionRule } from "./ActionAccessEditor";
 import { CrewDetail } from "./CrewDetail";
+import { CrewMembers } from './CrewMembers';
+import { WorkflowFlow, crewActions, type FlowStep } from './WorkflowFlow';
+import { AgentTraffic, useAgentMessages } from './AgentTraffic';
 import { LineSettings } from "./LinePanel";
 import { agentStyle } from "./CrewFan";
-import { agentState, type GraphNode } from "./AgentGraph";
+import { agentState, botState, type GraphNode } from "./AgentGraph";
+import { AgentBot } from "./AgentBot";
+import { HotkeySetting } from "./HotkeySetting";
+import { triggerLine } from "./CrewCard";
 import { workerLabel } from "../lib/crewStatus";
 import { WireIcon } from "./WireIcon";
 import { wiring } from "./crewWiring";
@@ -14,7 +20,7 @@ import { accessOptions, changeAccess, isRisky, loadAccessContext, poolIdFor, sav
 import { initials, myInitials } from "../lib/radialGraph";
 import { useAppStore } from "../store/app";
 import { fallbackSummary, usesModel } from "../lib/modelMap";
-import type { AccessLevel, CrewInstance, MemoryFact, PoolResource } from "../types";
+import type { AccessLevel, CrewInstance, MemoryFact, PoolResource, RecipeView } from "../types";
 
 /** What Mavo has connected, loaded once and again when the window comes back. */
 export function useAccessContext() {
@@ -140,13 +146,57 @@ function ThinksWith({ crew }: { crew: CrewInstance }) {
   </div>;
 }
 
-export function AgentPanel({ crew, onClose }: { crew: CrewInstance; onClose: () => void }) {
+/** Where this agent's updates go: straight to the person, or into Mavo's summary. Mavo decides
+ *  by default (questions, alerts and timed plans now; routine reports in the summary). */
+function Delivery({ crew }: { crew: CrewInstance }) {
+  const [value, setValue] = useState<"auto" | "now" | "summary">(crew.configuration_plan?.delivery ?? "auto");
+  const [busy, setBusy] = useState(false);
+  async function choose(next: "auto" | "now" | "summary") {
+    const before = value;
+    setValue(next); setBusy(true);
+    try {
+      await api.setDelivery(crew.id, next);
+      const plan = { ...(crew.configuration_plan ?? {}) } as NonNullable<CrewInstance["configuration_plan"]>;
+      if (next === "auto") delete plan.delivery; else plan.delivery = next;
+      useAppStore.getState().upsertCrew({ ...crew, configuration_plan: plan });
+    } catch { setValue(before); } finally { setBusy(false); }
+  }
+  const options: [typeof value, string][] = [["auto", "Mavo decides"], ["now", "Right away"], ["summary", "In Mavo's summary"]];
+  return <section className="delivery">
+    <h4 className="graph-h">Its updates</h4>
+    <div className="delivery-options" role="radiogroup" aria-label="Where its updates go">
+      {options.map(([key, label]) => <button key={key} role="radio" aria-checked={value === key} disabled={busy} onClick={() => void choose(key)}>{label}</button>)}
+    </div>
+    <p className="delivery-hint">{value === "now" ? "Every update reaches you as soon as it comes." : value === "summary" ? "Updates wait for Mavo's next summary, except questions and failures." : "Questions, alerts and timed plans reach you at once; routine reports wait for Mavo's summary."}</p>
+  </section>;
+}
+
+/** How the agent works each run, as tags: planned once, replayed. "Plan again" after a change. */
+function Recipe({ crew }: { crew: CrewInstance }) {
+  const [view, setView] = useState<RecipeView | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { let on = true; if (crew.status !== "draft") api.recipe(crew.id).then(v => { if (on) setView(v); }).catch(() => undefined); return () => { on = false; }; }, [crew.id, crew.status, crew.updated_at]);
+  if (!view || !view.enabled) return null;
+  const steps = (view.recipe as { steps?: FlowStep[] } | null)?.steps;
+  // A path that passed its tests is changed by testing a new one, never re-planned untested.
+  const tested = Boolean((crew.configuration_plan as { recipe_tested?: boolean } | undefined)?.recipe_tested);
+  async function replan() { setBusy(true); try { setView(await api.replanRecipe(crew.id)); } finally { setBusy(false); } }
+  return <section className="recipe" aria-label="How it works each run">
+    <h4 className="graph-h">Each run</h4>
+    {steps?.length ? <WorkflowFlow steps={steps} final={(view.recipe as { final?: string } | null)?.final} actions={crewActions(crew.configuration_plan)} /> : <p className="recipe-line">{view.line || "Planned at its next run."}</p>}
+    {view.problem && !view.line && <p className="recipe-note">Not planned yet: {view.problem}</p>}
+    {view.line && !tested && <button className="btn-quiet !px-0" disabled={busy} onClick={() => void replan()}>Plan again</button>}
+  </section>;
+}
+
+export function AgentPanel({ crew, onClose, settingsOnly = false }: { crew: CrewInstance; onClose: () => void; settingsOnly?: boolean }) {
   const state = agentState(crew);
+  const messages=useAgentMessages(crew.id);
   return <>
-    <Head lead={<span className="map-face lg" style={agentStyle(crew)}>{initials(crew.name)}</span>} title={crew.name}
-      sub={<span className="map-state" data-state={state}><i />{state === "draft" ? "Draft" : state === "done" ? "Done" : workerLabel(crew)}</span>} onClose={onClose} />
-    <ThinksWith crew={crew} />
-    <CrewDetail key={crew.id} crew={crew} access={crew.status === "draft" ? undefined : <>{!crew.configuration_plan?.leads_team && <AgentAccess crew={crew} />}<LineSettings crew={crew} /></>} />
+    {settingsOnly ? <Head lead={<Settings2 size={16} className="text-zinc-400" />} title="Settings" sub={crew.name} onClose={onClose} />
+    : <Head lead={<span className="map-face lg has-bot" style={agentStyle(crew)}><AgentBot seed={crew.id} state={botState(crew)} /></span>} title={crew.name}
+      sub={<span className="map-state" data-state={state}><i />{state === "draft" ? "Draft" : state === "done" ? "Done" : workerLabel(crew)}{state !== "draft" && <span className="text-zinc-500"> · {triggerLine(crew)}</span>}</span>} onClose={onClose} />}
+    <CrewDetail key={crew.id} crew={crew} settingsOnly={settingsOnly} more={<><Recipe crew={crew} /><ThinksWith crew={crew} />{!(crew.configuration_plan as { recipe_tested?: boolean } | undefined)?.recipe_tested && <CrewMembers crew={crew}/>}<AgentTraffic messages={messages}/></>} access={crew.status === "draft" ? undefined : <><HotkeySetting crew={crew} />{!crew.configuration_plan?.leads_team && <AgentAccess crew={crew} />}<LineSettings crew={crew} /><Delivery crew={crew} /></>} />
   </>;
 }
 
@@ -176,7 +226,7 @@ export function NodePanel({ node, crews, onPick, onClose }: { node: GraphNode; c
       <h4 className="graph-h">For all of Mavo</h4>
       <p className="graph-sub">{pool.connected ? pool.description : (pool.kind === "google" || pool.kind === "github" || pool.kind === "feeds") ? "Not connected yet." : pool.description}</p>
       {pool.connected ? <div className="segmented mt-2" role="radiogroup" aria-label={pool.name + " access"}>
-        {LEVELS.filter(l => pool.reads.length || l.id !== "read").map(l => <button key={l.id} type="button" role="radio" aria-checked={pool.level === l.id} aria-pressed={pool.level === l.id} disabled={poolBusy || (l.id === "write" && !pool.can_act)} onClick={() => void level(l.id)}>{!pool.reads.length && l.id === "write" ? "On" : l.label}</button>)}
+        {LEVELS.filter(l => (pool.reads.length || !pool.can_act || l.id !== "read")&&(pool.can_act||l.id!=='write')).map(l => <button key={l.id} type="button" role="radio" aria-checked={pool.level === l.id} aria-pressed={pool.level === l.id} disabled={poolBusy} onClick={() => void level(l.id)}>{!pool.reads.length && l.id !== "off" ? "On" : l.label}</button>)}
       </div> : <button className="btn-secondary mt-2 !py-1.5" onClick={() => useAppStore.getState().setPage("resources")}>Connect in Accounts</button>}
       {poolError && <p role="alert" className="notice error-notice mt-2">{poolError}</p>}
     </div>}
@@ -185,7 +235,7 @@ export function NodePanel({ node, crews, onPick, onClose }: { node: GraphNode; c
       {!ctx ? <p className="access-loading"><LoaderCircle size={13} className="animate-spin" />Loading…</p> : !rows.length ? <p className="graph-empty">No agents yet.</p>
         : <div className="access-list">{rows.map(({ crew, option }) => <div key={crew.id}>
           <SwitchRow label={crew.name} icon={null} hint={option.blocked && !option.on ? option.blocked : undefined} on={option.on} disabled={!!option.blocked && !option.on} busy={sw.busy === crew.id + option.key} onFlip={() => sw.flip(crew, option)}
-            lead={<button className="map-face sm" style={agentStyle(crew)} title={"Open " + crew.name} onClick={() => onPick(crew.id)}>{initials(crew.name)}</button>} />
+            lead={<button className="map-face sm has-bot" style={agentStyle(crew)} title={"Open " + crew.name} onClick={() => onPick(crew.id)}><AgentBot seed={crew.id} state={botState(crew)} /></button>} />
           <Step sw={sw} crew={crew} option={option} />
         </div>)}</div>}
       {sw.error && <p role="alert" className="notice error-notice mt-2">{sw.error}</p>}

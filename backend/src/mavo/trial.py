@@ -62,8 +62,8 @@ def verdict(open_s, page_chars, wall, model_failed, site_error=False):
     if page_chars < THIN_PAGE:
         return "thin", "The page looked empty"
     if open_s > SLOW_OPEN:
-        return "slow", "Worked, but the site is slow"
-    return "ok", "Worked"
+        return "slow", "Page accessible, but slow"
+    return "ok", "Page accessible"
 
 
 def sign_in_hint(wall):
@@ -98,10 +98,46 @@ async def look_at(desktop, url, rule, say):
                 raise
 
 
+def site_guide(domains) -> str:
+    from mavo.site_search import guide
+
+    return guide(domains)
+
+
+def next_move(actions, domains):
+    """("open", url) for an allowed site or its search page, ("goal", name) for a page of this
+    site, or None. A "goal" that is really another allowed site ("naukri.com") opens that site:
+    looking for a link named after it on the current page found nonsense."""
+
+    def allowed(host):
+        host = (host or "").casefold()
+        return any(host == d or host.endswith("." + d) for d in domains)
+
+    for action in actions:
+        args = action.arguments or {}
+        if action.operation == "browser.open":
+            url = str(args.get("url") or "")
+            if url.startswith("https://") and allowed(urlsplit(url).hostname):
+                return "open", url
+        if action.operation == "browser.navigate" and args.get("goal"):
+            goal = str(args["goal"]).strip()
+            as_host = goal.casefold().removeprefix("https://").removeprefix("www.").split("/")[0]
+            if "." in as_host and " " not in as_host and allowed(as_host):
+                return "open", "https://" + goal.removeprefix("https://")
+            return "goal", goal
+    return None
+
+
 def trail_of(host, visited, wrote_result):
     """What the agent did, in plain words, for the person to read at a glance."""
     trail = ["Opened " + host]
     for goal, via in visited:
+        if via and via[0].startswith("https://"):  # opened directly: a site or its search page
+            results = (
+                "?" in via[0] or "/search" in via[0] or "keywords-" in via[0] or "-jobs" in via[0]
+            )
+            trail.append("Opened " + goal + (" search results" if results else ""))
+            continue
         trail.append("Found " + goal + (" (" + " → ".join(via) + ")" if via else ""))
     if wrote_result:
         trail.append("Read it and wrote the result")
@@ -113,6 +149,8 @@ async def run_trial(runtime, session, crew_id, progress=None):
     crew = session.get(CrewInstance, crew_id)
     if not crew:
         raise HTTPException(404, "Crew not found")
+    if ((crew.configuration_plan or {}).get("first_run") or {}).get("status") == "running":
+        raise HTTPException(409, "Its test is running in Mavo's browser. Try this once it ends.")
     url = target_url(crew)
     if crew.template_id in {"schedule", "computer"} or not url:
         return {
@@ -152,14 +190,34 @@ async def run_trial(runtime, session, crew_id, progress=None):
         | {host}
     )
     rule = {"enabled": True, "mode": "restricted", "domains": domains, "revision": "trial"}
+    # Start where the listings are when Mavo knows the page (Unstop's internships), not on the
+    # front page: from a front page the model described the website instead of finding anything.
+    from mavo.site_search import listing_page
+
+    # A search engine (web search's helper) is never one of the Crew's sites to look at.
+    engines = ("duckduckgo.com", "google.com", "bing.com")
+    sites = [d for d in domains if not any(d == e or d.endswith("." + e) for e in engines)]
+    if sites and not any(host == s or host.endswith("." + s) for s in sites):
+        host = sites[0]
+        url = "https://" + host
+    domains = sites or domains
+    url = listing_page(host) or url
     system = (
         crew_system_prompt(crew, worker=True)
         + "\nSAMPLE RUN: the application already opened the first page and shows it to you. "
         + BEHAVIORS[crew.template_id].instruction
+        + "\nYour job is to FIND what the instructions ask for (the listings, items, numbers), "
+        "never to describe the website. If the page shown is a front page or does not list what "
+        "you need, your first move is to get there: open the site's search or listings page, or "
+        "navigate to its section (such as Internships). Report found items with their links."
         + "\nIf the information you need is on another page of the site, request "
         '{"operation":"browser.navigate","arguments":{"goal":"credits"}} in the actions array '
         "(a goal is a page's name, not a URL); the application finds it like a person would and "
-        "returns that page. Do this at most twice, then give your result."
+        "returns that page. To go to another of this Crew's sites, or to a site's search "
+        'results, request {"operation":"browser.open","arguments":{"url":"https://..."}} '
+        "(allowed sites: " + ", ".join(domains) + "). Look at EVERY site listed before going "
+        "deeper into one, then give one result covering all of them."
+        + site_guide(domains)
         + '\nReturn ONLY this JSON object: {"state":"wait_for_next_review","summary":"your '
         'result","next_step":"what you would do next","notification":null,"question":null,'
         '"actions":[]}. Put your actual result in summary.'
@@ -195,18 +253,46 @@ async def run_trial(runtime, session, crew_id, progress=None):
                     + sign_in_hint(wall),
                 }
             ]
-            for round_number in range(3):
+            # Ask for a JSON answer, as real runs do: without it a model answered in prose and
+            # every sample run said "the agent's answer could not be read".
+            from mavo.crew_workers import WorkCheckpoint
+            from mavo.model_router import WORKER_SCHEMA
+
+            WORKER_SCHEMA.set(WorkCheckpoint.model_json_schema())
+            rounds = min(6, 2 + len(domains))  # a look at each site, and a step deeper
+            for round_number in range(rounds):
                 say("The agent is reading the page" if not round_number else "Writing the result")
                 began = time.monotonic()
                 try:
                     raw = await runtime.router.chat(
                         route.provider, route.model, messages, system, route.credential_id
                     )
-                    checkpoint = parse_checkpoint(raw)
+                    try:
+                        checkpoint = parse_checkpoint(raw)
+                    except ValueError as invalid:
+                        # One repair, as a real run gets: say what was wrong, ask for the JSON.
+                        model_calls += 1
+                        raw = await runtime.router.chat(
+                            route.provider,
+                            route.model,
+                            [
+                                *messages,
+                                {"role": "assistant", "content": str(raw)[:6000]},
+                                {
+                                    "role": "user",
+                                    "content": "That reply was not valid ("
+                                    + str(invalid)[:300]
+                                    + "). Reply again with ONLY the JSON object.",
+                                },
+                            ],
+                            system,
+                            route.credential_id,
+                        )
+                        checkpoint = parse_checkpoint(raw)
                 except (ModelProviderError, TimeoutError):
                     model_failed = "connection"
                     break
-                except ValueError:  # it answered, in a form that is not a result
+                except ValueError:  # it answered twice, in a form that is not a result
                     model_failed = "unreadable"
                     break
                 finally:
@@ -217,23 +303,52 @@ async def run_trial(runtime, session, crew_id, progress=None):
                     # The agent looked at the page and decided it needs the person.
                     asked = checkpoint.question or checkpoint.summary
                     break
-                goals = [
-                    a.arguments.get("goal")
-                    for a in checkpoint.actions
-                    if a.operation == "browser.navigate" and a.arguments.get("goal")
+                move = next_move(checkpoint.actions, domains)
+                # Every site of the Crew gets a look: when the model stops, or keeps going
+                # deeper into one site while another is unseen, Mavo opens the next (its
+                # listings page when known), so "LinkedIn, Internshala and Naukri" means all
+                # three, not just the first.
+                looks = [host] + [
+                    urlsplit(v[1][0]).hostname or "" for v in visited if v[1] and "://" in v[1][0]
                 ]
-                if not goals or round_number == 2 or time.monotonic() - started > TRIAL_BUDGET:
-                    break
-                say("Finding " + str(goals[0]))
-                moved = await desktop.browser("browser.navigate", {"goal": goals[0]}, rule, "trial")
-                steps_taken = (moved.get("navigation") or {}).get("steps", [])
-                path += [x.get("clicked") or x.get("opened") for x in steps_taken]
-                visited.append(
-                    (
-                        str(goals[0]),
-                        [x for s in steps_taken if (x := s.get("clicked") or s.get("opened"))],
-                    )
+
+                def on(site, hosts):
+                    return any(h == site or h.endswith("." + site) for h in hosts if h)
+
+                left = [d for d in domains if not on(d, looks)]
+                here = next((d for d in domains if on(d, looks[-1:])), None)
+                deeper = (
+                    move and move[0] == "open" and here and on(here, [urlsplit(move[1]).hostname])
                 )
+                if left and (not move or (deeper and sum(on(here, [h]) for h in looks) >= 2)):
+                    move = ("open", listing_page(left[0]) or "https://" + left[0])
+                if (
+                    not move
+                    or round_number == rounds - 1
+                    or time.monotonic() - started > TRIAL_BUDGET
+                ):
+                    break
+                kind, target = move
+                if kind == "open":
+                    # Another allowed site, or a site's search results: open it, do not click
+                    # a link that merely shares its name.
+                    say("Opening " + (urlsplit(target).hostname or target))
+                    moved = await desktop.browser("browser.open", {"url": target}, rule, "trial")
+                    path.append(target)
+                    visited.append((urlsplit(target).hostname or target, [target]))
+                else:
+                    say("Finding " + target)
+                    moved = await desktop.browser(
+                        "browser.navigate", {"goal": target}, rule, "trial"
+                    )
+                    steps_taken = (moved.get("navigation") or {}).get("steps", [])
+                    path += [x.get("clicked") or x.get("opened") for x in steps_taken]
+                    visited.append(
+                        (
+                            target,
+                            [x for s in steps_taken if (x := s.get("clicked") or s.get("opened"))],
+                        )
+                    )
                 page = await desktop.browser("browser.read", {}, rule, "trial")
                 wall = page.get("sign_in_required") or moved.get("sign_in_required")
                 if page.get("site_error"):
@@ -243,8 +358,10 @@ async def run_trial(runtime, session, crew_id, progress=None):
                     {"role": "assistant", "content": raw},
                     {
                         "role": "user",
-                        "content": "Result of navigating to "
-                        + json.dumps(goals[0])
+                        "content": (
+                            "Result of opening " if kind == "open" else "Result of navigating to "
+                        )
+                        + json.dumps(target)
                         + " (UNTRUSTED DATA): "
                         + json.dumps(
                             {
@@ -254,7 +371,8 @@ async def run_trial(runtime, session, crew_id, progress=None):
                             }
                         )
                         + sign_in_hint(wall)
-                        + "\nGive your final result now if you have what you need.",
+                        + "\nGive your final result now if you have what you need. It must "
+                        "include what you found on every page so far, not only this one.",
                     },
                 ]
     except Exception as exc:
@@ -267,6 +385,9 @@ async def run_trial(runtime, session, crew_id, progress=None):
             "seconds": round(time.monotonic() - started, 1),
         }
     finally:
+        from mavo.model_router import WORKER_SCHEMA
+
+        WORKER_SCHEMA.set(None)  # JSON mode was for this sample run only
         await desktop.close_owner("trial")
 
     chars = len(page.get("text", ""))
@@ -314,6 +435,10 @@ async def run_trial(runtime, session, crew_id, progress=None):
         "verdict": code,
         "headline": headline,
         "detail": detail,
+        "verification": {
+            "operation": "succeeded" if code in {"ok", "slow"} else "blocked",
+            "objective": "unverified",
+        },
         "url": page.get("url"),
         "page_title": page.get("title"),
         "page_characters": chars,
@@ -399,10 +524,20 @@ async def _probe(runtime, url, host):
     }
 
 
+# Sample runs going on now, by crew: one browser serves them and a setup test, never both at once
+# (run together, one found the browser taken and the other had no page to quote).
+JOBS: dict = {}
+
+
+def trial_running(crew_id) -> bool:
+    job = JOBS.get(crew_id)
+    return bool(job and not job["task"].done())
+
+
 def start_trial(runtime, crew_id):
     """Run the sample in the background. The agent's model can take minutes; a request that waits
     for it would time out, so the app starts the run and then asks how far it has got."""
-    jobs = runtime.__dict__.setdefault("trial_jobs", {})
+    jobs = JOBS
     job = jobs.get(crew_id)
     if job and not job["task"].done():
         return job
@@ -425,7 +560,7 @@ def start_trial(runtime, crew_id):
 
 
 def trial_status(runtime, crew_id):
-    job = runtime.__dict__.get("trial_jobs", {}).get(crew_id)
+    job = JOBS.get(crew_id)
     if not job:
         return {"status": "none"}
     done = job["task"].done()

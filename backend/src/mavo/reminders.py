@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mavo.daily_triggers import rules_for
-from mavo.database import CrewInstance, ReminderEvent
+from mavo.database import CrewInstance, ReminderEvent, utcnow
 
 
 def set_notification_access(session: Session, crew: CrewInstance, allowed: bool) -> None:
@@ -30,7 +30,7 @@ def set_notification_access(session: Session, crew: CrewInstance, allowed: bool)
             .where(
                 ReminderEvent.crew_id == crew.id,
                 ReminderEvent.kind == "crew_update",
-                ReminderEvent.status == "pending",
+                ReminderEvent.status.in_(["pending", "digest"]),
             )
             .values(status="cancelled")
         )
@@ -135,8 +135,16 @@ def create_due_reminders(session: Session, now: datetime | None = None) -> list[
                 ReminderEvent.status == "pending",
                 CrewInstance.status == "active",
                 CrewInstance.is_running.is_(True),
-                or_(CrewInstance.trigger_type == "daily", ReminderEvent.kind == "crew_update"),
-                ReminderEvent.local_date == local_now.date().isoformat(),
+                or_(
+                    CrewInstance.trigger_type == "daily",
+                    ReminderEvent.kind.in_(["crew_update", "approval", "question"]),
+                ),
+                # Crew results remain available after midnight/restart in Missed.
+                # Daily time reminders keep their same-day delivery semantics.
+                or_(
+                    ReminderEvent.kind.in_(["crew_update", "approval", "question"]),
+                    ReminderEvent.local_date == local_now.date().isoformat(),
+                ),
                 ReminderEvent.scheduled_for <= local_now.astimezone(UTC),
             )
             .order_by(ReminderEvent.scheduled_for)
@@ -145,9 +153,61 @@ def create_due_reminders(session: Session, now: datetime | None = None) -> list[
     result = []
     for event in pending:
         crew = session.get(CrewInstance, event.crew_id)
+        # A change waiting for the person's OK ("approval") always reaches them: without it,
+        # the crew waits and they never know. Routine updates follow their alert setting.
         if event.kind == "crew_update" and "notifications:show" not in crew.permissions:
             event.status = "cancelled"
         else:
             result.append(event)
     session.commit()
     return result
+
+
+def approval_alert(session: Session, crew: CrewInstance, action_id: str, message: str) -> bool:
+    """A desktop alert for one change waiting for the person's OK, carrying the change so the
+    alert's own buttons answer it (Run or Approve, and Deny). One per change; always delivered.
+    A held command once only said "Open Actions to review it", with no way to answer there."""
+    from mavo.database import utcnow
+
+    key = f"approval:{action_id}"
+    if session.scalar(select(ReminderEvent.id).where(ReminderEvent.deduplication_key == key)):
+        return False
+    now = utcnow()
+    now = now if now.tzinfo else now.replace(tzinfo=UTC)
+    session.add(
+        ReminderEvent(
+            crew_id=crew.id,
+            crew_name=crew.name[:80],
+            kind="approval",
+            message=message[:1500],
+            scheduled_for=now,
+            local_date=now.astimezone().date().isoformat(),
+            deduplication_key=key,
+            status="pending",
+            task_run_id=(crew.configuration_plan or {}).get("task_run_id"),
+            task_step_id=f"action:{action_id}",  # whole: the alert answers this exact change
+        )
+    )
+    return True
+
+
+def answer_question(session, reminder_id: str, answer: str) -> tuple[int, str] | None:
+    """The person answers an agent's question (from its desktop alert, or from Telegram): the
+    agent carries that item on with the answer. Returns (status, why) when it cannot."""
+    reminder = session.get(ReminderEvent, reminder_id)
+    if reminder is None or reminder.kind != "question":
+        return 404, "Question not found"
+    crew = session.get(CrewInstance, reminder.crew_id)
+    observation = dict((crew.observation if crew else None) or {})
+    asks = dict(observation.get("desk_asks") or {})
+    if reminder.id not in asks or asks[reminder.id].get("answer"):
+        return 409, "Already answered"
+    asks[reminder.id] = {**asks[reminder.id], "answer": answer.strip()}
+    crew.observation = {**observation, "desk_asks": asks, "question": None}
+    reminder.status = "dismissed"
+    reminder.dismissed_at = utcnow()
+    if crew.is_running:
+        crew.runtime_state = "waiting"
+        crew.next_run_at = utcnow()  # now, not at its next mail
+    session.commit()
+    return None

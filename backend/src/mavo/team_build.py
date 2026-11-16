@@ -956,13 +956,16 @@ class BuildTeam:
         return out
 
     def budget(self, calls: int) -> None:
-        """Room for the calls still to come (the team is only known once the lead has picked it)."""
+        """A lead can allocate work, never increase the user's approved spending ceiling."""
         from mavo.database import TaskRun
+        from mavo.tasks import OverBudget
 
         with self.runner.factory() as session:
             run = session.get(TaskRun, self.run_id)
-            run.budget_calls = min(BUILD_CEILING, max(run.budget_calls, run.used_calls + calls))
-            session.commit()
+            from mavo.limits import CYCLE_MAX
+
+            if run.used_calls + calls > CYCLE_MAX:
+                raise OverBudget()
 
     # -- the work ----------------------------------------------------------------------------
 

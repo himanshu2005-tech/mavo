@@ -65,7 +65,7 @@ const wait = (ms: number) => new Promise<void>(resolve => window.setTimeout(reso
 
 /** Do what the Crew would do, once, for real. Nothing is saved. Your agent looks at the site and
  * decides; the app only reports what it did. */
-export function SampleRun({ crewId }: { crewId: string }) {
+export function SampleRun({ crewId, busy = false, onRunning }: { crewId: string; busy?: boolean; onRunning?: (running: boolean) => void }) {
   const [state, setState] = useState<"idle" | "running" | "signin" | "done">("idle");
   const [stage, setStage] = useState("Opening the site");
   const [result, setResult] = useState<TrialResult | null>(null);
@@ -74,6 +74,8 @@ export function SampleRun({ crewId }: { crewId: string }) {
   const mounted = useRef(true);
 
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  // One browser: the card's test waits while this runs, and this waits while the test runs.
+  useEffect(() => { onRunning?.(state === "running" || state === "signin"); }, [state, onRunning]);
 
   // Follow a run that is already going (the person left this screen and came back).
   useEffect(() => {
@@ -112,10 +114,10 @@ export function SampleRun({ crewId }: { crewId: string }) {
   const wall = result?.sign_in_required;
   return <div className="space-y-4" aria-label="Sample run">
     <div className="flex flex-wrap items-center gap-3">
-      <button type="button" className="btn-secondary" disabled={state === "running" || state === "signin"} onClick={() => void run()}>
+      <button type="button" className="btn-secondary" disabled={busy || state === "running" || state === "signin"} onClick={() => void run()}>
         {state === "running" ? <LoaderCircle size={13} className="animate-spin" /> : <Play size={12} />}{state === "done" ? "Run again" : "Try it first"}
       </button>
-      {state === "idle" && <span className="text-[12px] text-zinc-500">Watch your agent do it once. Nothing is saved.</span>}
+      {state === "idle" && <span className="text-[12px] text-zinc-500">{busy ? "Its test is using the browser. Try this after." : "Watch your agent do it once. Nothing is saved."}</span>}
       {state === "running" && <span key={stage} role="status" className="stages-text text-[13px]">{stage}…</span>}
     </div>
     {error && <p role="alert" className="notice error-notice">{error}</p>}

@@ -12,7 +12,7 @@ export function initials(name: string): string {
   return (words.length > 1 ? words[0][0] + words[1][0] : (words[0] ?? "?").slice(0, 2)).toUpperCase();
 }
 
-/** A person's initials: "Himanshu" is H, "Himanshu Madhunala" is HM. */
+/** A person's initials: "Asha" is A, "Asha Rao" is AR. */
 export function myInitials(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
   return (words.length > 1 ? words[0][0] + words[words.length - 1][0] : (words[0] ?? "?")[0]).toUpperCase();

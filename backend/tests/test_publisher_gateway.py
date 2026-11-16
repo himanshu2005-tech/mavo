@@ -109,7 +109,7 @@ def test_all_authenticated_accounts_use_shared_minimax_key_and_cache_is_owner_bo
         == 200
     )
     sent = json.loads(seen[0].content)
-    assert sent["model"] == "minimax/minimax-m3.1-flash" and sent["max_tokens"] == 4096
+    assert sent["model"] == "minimax/minimax-m3.1-flash" and sent["max_tokens"] == 8192
     assert "publisher-test-key" not in json.dumps(sent)
     assert "account-a" not in json.dumps(sent)
     assert "publisher-test-key" not in first.text
@@ -309,10 +309,64 @@ def test_an_invalid_reply_gets_one_correction_and_the_person_sees_only_the_good_
     assert sent[1][1][-2]["role"] == "assistant"
 
 
-def test_a_reply_that_stays_invalid_is_refused_after_one_correction(tmp_path):
-    client, sent = serving(tmp_path, ["not json at all", "still not json"])
+def test_a_reply_that_stays_invalid_is_refused_after_two_corrections(tmp_path):
+    client, sent = serving(tmp_path, ["not json at all", "still not json", "nor this"])
     with client:
         answer = client.post(
             "/v1/core/turn", headers={"Authorization": "Bearer account-a"}, json=payload()
         )
-    assert answer.status_code == 502 and "valid response" in answer.text and len(sent) == 2
+    assert answer.status_code == 502 and len(sent) == 3
+    assert answer.json()["error"]["code"] == "core_invalid_response"
+
+
+def test_core_streams_its_reply_while_writing_and_keeps_the_same_checks(tmp_path):
+    """Words appear as they are written: /v1/core/turn/stream sends the reply text as the model
+    writes it, then the validated turn, exactly as /v1/core/turn returns it."""
+    streamed = []
+
+    def provider(request):
+        body = json.loads(request.content)
+        streamed.append(body.get("stream", False))
+        answer = json.dumps({"reply": "Hello there", "crew_proposal": None, "questions": []})
+        pieces = [answer[:14], answer[14:20], answer[20:]]
+        lines = "".join(
+            "data: " + json.dumps({"choices": [{"delta": {"content": p}}]}) + "\n\n" for p in pieces
+        )
+        return httpx.Response(200, text=lines + "data: [DONE]\n\n")
+
+    settings = GatewaySettings(
+        _env_file=None,
+        data_dir=tmp_path,
+        firebase_project_id="test-project",
+        api_key="publisher-test-key",
+    )
+    with TestClient(create_gateway(settings, httpx.MockTransport(provider), Identity())) as client:
+        with client.stream(
+            "POST",
+            "/v1/core/turn/stream",
+            headers={"Authorization": "Bearer account-a"},
+            json=payload(),
+        ) as response:
+            events = [
+                json.loads(line[5:]) for line in response.iter_lines() if line.startswith("data:")
+            ]
+        replies = [e["text"] for e in events if e["type"] == "reply"]
+        assert replies and replies[-1] == "Hello there" and len(replies) >= 2
+        assert events[-1]["type"] == "done"
+        assert events[-1]["result"]["decision"]["reply"] == "Hello there"
+        assert streamed == [True]
+        unsigned = client.post("/v1/core/turn/stream", json=payload())
+        assert unsigned.status_code == 200  # the error arrives as an event, like the reply
+        assert '"core_sign_in_required"' in unsigned.text
+
+
+def test_mavo_cores_key_is_read_under_the_name_in_publisher_env(monkeypatch):
+    """publisher/.env names it MAVO_CORE_API_KEY; read only as MAVO_PUBLISHER_API_KEY, it was
+    ignored and an older stored key was used instead."""
+    from mavo.publisher_gateway import GatewaySettings
+
+    monkeypatch.delenv("MAVO_PUBLISHER_API_KEY", raising=False)
+    monkeypatch.setenv("MAVO_CORE_API_KEY", "core-key-for-test")
+    settings = GatewaySettings(firebase_project_id="project-x", _env_file=None)
+    assert settings.api_key.get_secret_value() == "core-key-for-test"
+    assert "core-key-for-test" not in repr(settings)

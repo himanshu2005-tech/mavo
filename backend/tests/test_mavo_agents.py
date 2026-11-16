@@ -26,7 +26,12 @@ def test_a_message_to_an_agent_becomes_its_fixed_task_and_anything_else_is_left_
     kinds = [(s.kind, s.skill) for s in web.task.steps]
     assert kinds == [("skill", "web.read"), ("helper", None)]
     assert web.task.final == "answer" and web.task.steps[1].uses == ["fetch"]
-    assert web.task.steps[0].params == {"query": "best budget laptops in India", "pages": 3}
+    assert web.task.steps[0].params == {
+        "query": "best budget laptops in India",
+        "pages": 3,
+        "also": [],
+        "recent": None,
+    }
     news = decision_for("@news, Agniveer scheme")
     assert news.task.steps[0].params == {
         "query": "Agniveer scheme",
@@ -132,7 +137,8 @@ def test_the_web_agent_reads_pages_quickly_and_uses_the_browser_only_for_the_res
     monkeypatch.setattr("mavo.site_skills.fetch_pages", quick)
     desktop = FakeDesktop(results, {"https://site1.example/a": "Menu\nHome\n" + SENTENCE * 6})
     rule = {"mode": "unrestricted", "domains": []}
-    out = json.loads(asyncio.run(web_read(desktop, rule, "o", WebParams(query="budget laptop"))))
+    params = WebParams(query="budget laptop", pages=3)
+    out = json.loads(asyncio.run(web_read(desktop, rule, "o", params)))
     assert [p["url"] for p in out["pages_read"]] == [
         "https://site0.example/a",
         "https://site2.example/a",

@@ -70,3 +70,16 @@ def short(text: str) -> str:
     cut = text[:MAX_CHARS]
     end = max(cut.rfind(". "), cut.rfind("; "))
     return cut[: end + 1] if end > MAX_CHARS // 2 else cut[: cut.rfind(" ")] + "…"
+
+
+# A thinking model's own reasoning (not the steps Mavo asks for above) is never the answer. Some
+# write it into the reply anyway, and some leak just a tag: "Plan today from all my data" ended
+# with "</think>]" in the person's plan.
+PAIRED = re.compile(r"<think>.*?</think>\s*", re.S | re.I)
+# A tag on its own, with the stray "]" one model left after it. Only the tag goes: the words
+# around it may be the answer itself. <thinking> blocks are left to split_thinking above.
+STRAY = re.compile(r"[ \t]*</?think>\]?", re.I)
+
+
+def without_thinking(text: str) -> str:
+    return STRAY.sub("", PAIRED.sub("", text)).strip()

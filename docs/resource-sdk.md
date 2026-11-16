@@ -1,5 +1,8 @@
 # Resource adapter SDK direction
 
+See [reference-bound reporting](source-reporting.md) for the implemented connector
+receipt/item-reference contract, partial result handling and verification boundaries.
+
 This document fixes the intended Resource Pool contract. A small read-only Open-Meteo adapter now implements the initial `read(query)` boundary for local personal use with permission-checked destination lookups for Crew. General resource subscriptions remain in development.
 
 A resource adapter will identify its resource type, capabilities, freshness policy, required grants, and normalized snapshot/event schemas. Adapters will be registered with the Resource Pool, not imported directly by Crew.

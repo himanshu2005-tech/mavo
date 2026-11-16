@@ -220,7 +220,7 @@ def test_model_faults_are_bounded_and_never_notified_as_success(client, auth, fa
             "template_id": "research",
             "route_id": route["id"],
             "responsibilities": "Research only the supplied facts",
-            "daily_call_limit": 5,
+            "daily_call_limit": 6 if fault == "invalid_json" else 5,
             "allow_notifications": True,
         },
     ).json()
@@ -230,8 +230,10 @@ def test_model_faults_are_bounded_and_never_notified_as_success(client, auth, fa
         runtime.router.chat = AsyncMock(
             return_value='{"summary":"UNVERIFIED","notification":"FAKE SUCCESS"}'
         )
-        attempts = 1
-        spent = 2  # the reply plus the single repair attempt that says what was wrong
+        # Each run: the reply plus one repair that says what was wrong. A bad reply is tried
+        # again (a mail watcher must not go deaf over one), three runs in a row at most.
+        attempts = 3
+        spent = 6
     else:
         runtime.router.chat = AsyncMock(
             side_effect=ModelProviderError("Fixture provider unavailable")

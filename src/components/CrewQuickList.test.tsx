@@ -29,21 +29,20 @@ it("lists every Crew with a button to run it now", () => {
   expect(markup).toContain('aria-label="Run News Watch now"');
 });
 
-it("offers the permission a stopped Crew is waiting for, right under its message", () => {
+it("never infers a security grant from an agent-written error message", () => {
   // "Allow device metrics in Edit to monitor this computer." used to send the person hunting.
   const stuck = crew({ template_id: "computer", name: "Battery Watch", last_runtime_error: "Allow device metrics in Edit to monitor this computer.", permissions: ["model:invoke"] });
-  expect(grantsFor(stuck).map(g => g.change)).toEqual([{ allow_device_metrics: true }]);
-  expect(renderToStaticMarkup(<CrewGrants crew={stuck} />)).toContain("Read device metrics");
+  expect(grantsFor(stuck)).toEqual([]);
+  expect(renderToStaticMarkup(<CrewGrants crew={stuck} />)).toBe("");
   // Already allowed, or nothing asked: nothing shown.
-  expect(grantsFor({ ...stuck, permissions: ["device:read"] })).toEqual([]);
+  expect(grantsFor(stuck)).toEqual([]);
   expect(renderToStaticMarkup(<CrewGrants crew={crew({ last_runtime_error: "The model took too long." })} />)).toBe("");
 });
 
-it("offers to free space when the Cleaner is waiting for it", () => {
+it("does not turn destructive permission prose into a grant", () => {
   const cleaner = crew({ template_id: "computer", name: "Temp & Drive Cleaner", last_runtime_error: "Allow cleaning temp files to free space on this computer.", permissions: ["device:read"] });
-  expect(grantsFor(cleaner).map(g => g.change)).toEqual([{ allow_temp_cleanup: true }]);
-  expect(renderToStaticMarkup(<CrewGrants crew={cleaner} />)).toContain("Free space on this computer");
-  expect(grantsFor({ ...cleaner, permissions: ["device:read", "device:clean_temp"] })).toEqual([]);
+  expect(grantsFor(cleaner)).toEqual([]);
+  expect(renderToStaticMarkup(<CrewGrants crew={cleaner} />)).toBe("");
 });
 
 it("says why an agent is waiting, in one short line", async () => {

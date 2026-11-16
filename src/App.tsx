@@ -1,3 +1,4 @@
+import { MotionConfig } from "motion/react";
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -5,12 +6,22 @@ import { api } from "./lib/api";
 import { Home } from "./pages/Home";
 import { useAppStore } from "./store/app";
 import { SessionGate } from "./components/SessionGate";
+import { OnboardingGate } from './components/OnboardingGate';
 import {validRuntimeSnapshot} from './lib/executionSignals';
+import {OPEN_PAGE,takeOpenPage} from './lib/openCrew';
 
 function WorkspaceApp() {
   useEffect(() => {
     const listeners = [listen("mavo-pause-all", () => { void api.pauseActions().then(async () => useAppStore.getState().setCrew(await api.crew())).catch((e: Error) => useAppStore.getState().setStatusError(e.message)); }), listen("mavo-open-activity", () => useAppStore.getState().setPage("activity"))];
     return () => { listeners.forEach(p => { void p.then(unlisten => unlisten()); }); };
+  }, []);
+  // An alert's "Set up Telegram": the alert window asks, this window opens the page.
+  useEffect(() => {
+    const take = () => { const page = takeOpenPage(); if (page === "resources") useAppStore.getState().setPage("resources"); };
+    const onStorage = (e: StorageEvent) => { if (e.key === OPEN_PAGE && e.newValue) take(); };
+    take();
+    window.addEventListener("storage", onStorage); window.addEventListener("focus", take);
+    return () => { window.removeEventListener("storage", onStorage); window.removeEventListener("focus", take); };
   }, []);
   useEffect(() => {
     let active = true;
@@ -49,7 +60,8 @@ function WorkspaceApp() {
     const timer = window.setInterval(refresh,2500);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
-  return <div className="app-shell h-screen overflow-hidden text-zinc-200"><ErrorBoundary><Home /></ErrorBoundary></div>;
+  // Every animation follows the person's Windows setting: with reduced motion, things just appear.
+  return <MotionConfig reducedMotion="user"><div className="app-shell h-screen overflow-hidden text-zinc-200"><ErrorBoundary><Home /></ErrorBoundary></div></MotionConfig>;
 }
 
-export default function App() { return <SessionGate><WorkspaceApp /></SessionGate>; }
+export default function App() { return <SessionGate><OnboardingGate><WorkspaceApp /></OnboardingGate></SessionGate>; }

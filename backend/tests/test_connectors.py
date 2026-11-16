@@ -716,6 +716,15 @@ def test_natural_language_github_draft_stays_unpublished_until_connection_and_ac
     assert waiting.status_code == 200 and waiting.json()["status"] == "draft"
     assert client.get("/api/v1/crew", headers=auth).json() == []
     seed("github", ["github:issues:read"])
+    runtime.router.chat = AsyncMock(
+        return_value=json.dumps(
+            {
+                "state": "wait_for_next_review",
+                "summary": "Reviewed the supplied repository issues.",
+                "actions": [],
+            }
+        )
+    )
     ready = client.post(endpoint, headers=auth, json=payload)
     assert (
         ready.status_code == 200
@@ -723,3 +732,4 @@ def test_natural_language_github_draft_stays_unpublished_until_connection_and_ac
         and ready.json()["is_running"]
     )
     assert not any(p.startswith("google:") for p in ready.json()["permissions"])
+    assert ready.json()["configuration_plan"]["first_run"]["status"] == "passed"

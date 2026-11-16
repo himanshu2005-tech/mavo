@@ -246,10 +246,42 @@ async def forms_create(desktop, rule, owner, params: FormParams) -> str:
 class WebParams(BaseModel):
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
     query: str = Field(min_length=2, max_length=300)
-    pages: int = Field(default=3, ge=1, le=4)
+    pages: int = Field(default=4, ge=1, le=6)
+    # Other ways to put the same question ("iphone 17 price india", "iphone 17 launch price"):
+    # their results are merged, so one engine's narrow first page is not all Mavo reads.
+    also: list[str] = Field(default_factory=list, max_length=2)
+    recent: str | None = Field(default=None, pattern=r"^(day|week|month|year)$")
 
 
-def readable(text: str, size: int = 2200) -> str:
+# Words that ask for what is current: the search then keeps to recent pages.
+RECENT = (
+    (re.compile(r"\b(today|tonight|right now|live|breaking|this morning)\b", re.I), "day"),
+    (
+        re.compile(r"\b(this week|latest|news|price|prices|rate|rates|score|deal|deals)\b", re.I),
+        "week",
+    ),
+    (re.compile(r"\b(this month|recent|recently|new|upcoming)\b", re.I), "month"),
+)
+
+# How the writer should answer from what was read (it reads this with the pages).
+ANSWERING = (
+    "Answer the question in the first line, plainly. Then the details that matter, short. Cite "
+    "the pages you used inline as [1], [2] by their n. For prices, dates, scores and anything "
+    "that changes, say how current it is (the page's date if it gives one). If pages disagree, "
+    "say so and which is newer. Never invent a figure no page gives: say it was not found. "
+    "In a list of jobs, products or places, each entry is a real one a page shows, linked to "
+    "its own page; a job board, aggregator or search page (Naukri, Indeed, Internshala) is "
+    "where to look, not an employer or a role, so list it separately if at all. A date, "
+    "deadline or requirement no page states is marked unconfirmed. End "
+    "with a Sources list: each line `[n] title - url`, only the pages you cited."
+)
+
+
+def recency(query: str) -> str | None:
+    return next((when for words, when in RECENT if words.search(query)), None)
+
+
+def readable(text: str, size: int = 4000) -> str:
     """A page's prose without its menus: lines long enough to be sentences."""
     lines = [line.strip() for line in (text or "").splitlines()]
     prose = [line for line in lines if len(line) >= 60]
@@ -350,10 +382,53 @@ async def web_read(desktop, rule, owner, params: WebParams) -> str:
     and what the pages say, for a writer to answer from with sources."""
     import json
 
-    found = await desktop.browser("browser.search", {"query": params.query}, rule, owner)
-    results = (found or {}).get("results") or []
+    recent = params.recent or recency(params.query)
+    results, seen, shown = [], set(), ""
+    for number, query in enumerate([params.query, *params.also]):
+        search = {"query": query, **({"recent": recent} if recent else {})}
+        found = await desktop.browser("browser.search", search, rule, owner)
+        shown = (found or {}).get("search_page") or shown
+        got = (found or {}).get("results") or []
+        if not got and recent and number == 0:
+            # Nothing that recent: the same words without the date limit.
+            found = await desktop.browser("browser.search", {"query": query}, rule, owner)
+            got = (found or {}).get("results") or []
+        for result in got:
+            if result.get("url") and result["url"] not in seen:
+                seen.add(result["url"])
+                results.append(result)
     if not results:
-        raise SkillStop("The web search returned no results. Try other words.")
+        # Long, exact wording often finds nothing: once more with the key words only.
+        short = " ".join(re.sub(r"[\"'()]", " ", params.query).split()[:6])
+        if short and short != params.query:
+            found = await desktop.browser("browser.search", {"query": short}, rule, owner)
+            results = [r for r in (found or {}).get("results") or [] if r.get("url")]
+    if not results:
+        # Nothing found is a finding, not a failed task: the writer says what could not be
+        # checked (a research task failed whole on one empty search).
+        return json.dumps(
+            {
+                "query": params.query,
+                "searched_recent": recent,
+                "how_to_answer": ANSWERING,
+                "pages_read": [],
+                "other_results": [],
+                "note": "The web search gave no results."
+                + (f" Instead, the search page showed: {shown!r}." if shown else "")
+                + " Say plainly what happened and what could not be found or checked; never "
+                "fill the gap from memory as if it were found.",
+            },
+            ensure_ascii=False,
+        )
+    # Several sites, not one site's pages: at most two pages from any one site.
+    per_site: dict[str, int] = {}
+    varied = []
+    for result in results:
+        host = (urlsplit(result["url"]).hostname or "").removeprefix("www.")
+        per_site[host] = per_site.get(host, 0) + 1
+        if per_site[host] <= 2:
+            varied.append(result)
+    results = varied
     # The pages at once, as plain requests; only a page that refused goes to the browser (one at a
     # time, and slow: 6 to 29 seconds a page).
     candidates = results[: params.pages + 3]
@@ -400,6 +475,8 @@ async def web_read(desktop, rule, owner, params: WebParams) -> str:
     return json.dumps(
         {
             "query": params.query,
+            "searched_recent": recent,
+            "how_to_answer": ANSWERING,
             "pages_read": pages,
             "other_results": [
                 {"title": r["title"], "url": r["url"], "snippet": r.get("snippet", "")}
@@ -497,9 +574,11 @@ def build_skills() -> dict[str, Skill]:
 SKILLS: dict[str, Skill] = {
     "web.read": Skill(
         id="web.read",
-        does="searches the web in Mavo's browser, opens the best results and reads them; give "
-        "its output to a writer helper that answers with sources",
-        params='{"query": the search words, "pages": 3}',
+        does="searches the web in Mavo's browser (recent pages for news, prices and 'latest'), "
+        "opens the best results from several sites and reads them; give its output to a writer "
+        "helper that answers with numbered sources",
+        params='{"query": the search words, "also": [up to 2 other phrasings], "pages": 4, '
+        '"recent": "day"|"week"|"month"|"year" when only current pages will do}',
         sites=(),
         actions=("browser.search", "browser.open", "browser.read"),
         model=WebParams,

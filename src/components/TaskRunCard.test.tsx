@@ -80,11 +80,12 @@ it("asks the person to decide with buttons when the team is out of rounds", () =
   expect(left.checks.find(c => c.text.startsWith("Still open"))!.ok).toBe(false);
 });
 
-it("shows how each step thought, in order, folded away until asked for", () => {
-  const thinking = [{ label: "Goal", text: "Merge the feeds into one list." }, { label: "Check", text: "A failed feed never breaks the rest." }];
+it("never shows a step's working notes; only what it did that a person cares about", () => {
+  const thinking = [{ label: "Goal", text: "Merge the feeds into one list." }, { label: "Check", text: "A failed feed never breaks the rest." }, { label: "", text: "Read 3 feeds" }];
   const markup = html({ ...base, steps: [{ ...base.steps[0], status: "done", thinking }, base.steps[1]] });
-  has(markup, "<details class=\"task-thought\">", "How it thought", "2 steps", "<b>Goal</b>Merge the feeds into one list.", "<b>Check</b>");
-  expect(html(base)).not.toContain("How it thought");
+  expect(markup).not.toContain("Merge the feeds into one list.");
+  expect(markup).not.toContain("How it thought");
+  has(markup, "Read 3 feeds");
 });
 
 it("shows any other result as a formatted report, maths included", () => {
@@ -121,4 +122,18 @@ it("reports a failure or a stop without pretending it finished", () => {
   has(failed, "Could not finish", "budget ran out");
   expect(failed).not.toContain("Copy");
   has(html({ ...base, status: "stopped", error: "Stopped." }), "Stopped");
+});
+
+it("offers Delete once a task has stopped or finished, never while it works", () => {
+  expect(html(base)).not.toContain(">Delete<");
+  expect(html({ ...base, status: "needs_you" })).not.toContain(">Delete<");
+  const stopped = html({ ...base, status: "stopped", error: "Stopped.", steps: base.steps.map(s => ({ ...s, status: "stopped" as const })) });
+  has(stopped, "Try again", "Delete");
+  const done = html({ ...base, status: "done", result: "Plan ready", steps: base.steps.map(s => ({ ...s, status: "done" as const })) });
+  has(done, "Delete");
+});
+
+it("shows which model did each step, so a team of models is visible", () => {
+  const markup = html({ ...base, steps: [{ ...base.steps[0], model: "Main Tasks" }, { ...base.steps[1], model: "Higher Model" }] });
+  has(markup, "Agent · Main Tasks", "Helper · Higher Model");
 });

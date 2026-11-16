@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from mavo.resources.feeds import FeedError, parse_feed
 
-AGENT = "Mavo/0.1 (personal desktop assistant; https://github.com/himanshu2005-tech)"
+AGENT = "Mavo/0.1 (personal desktop assistant)"
 MAX_BYTES = 3 * 1024 * 1024
 CACHE_SECONDS = 600
 

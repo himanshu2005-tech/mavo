@@ -1,14 +1,16 @@
 /* Design preview: every look in one page, no backend. Open /preview.html while `vite` runs.
-   ?theme=light|dark picks the theme, ?accent=graphite|coral|emerald|violet|sky the accent; ?view=cards|drawer|desktop|controls|setup narrows the page. */
+   ?theme=light|dark picks the theme, ?view=cards|drawer|desktop|controls|setup narrows the page. */
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { CrewCard, DraftCard, NewCrewCard } from "./components/CrewCard";
-import { CrewSetupCard } from "./components/CrewSetupCard";
+import { CrewSetupCard, Celebration, TelegramRow } from "./components/CrewSetupCard";
 import { ActionsPage } from "./pages/ActionsPage";
 import { TaskRunCard } from "./components/TaskRunCard";
 import { useAppStore } from "./store/app";
 import { CrewArt, HUES, artStyle } from "./components/CrewArt";
 import { DesktopUpdateCard } from "./components/DesktopUpdateCard";
+import { TelegramCard } from "./components/TelegramCard";
+import { identityColor, identityStyle } from "./lib/identityColors";
 import { Report } from "./components/Report";
 import { MissedList, OrbMenu, firstLine } from "./pages/StatusOverlay";
 import { ActivityView, happenings } from "./pages/EmptyPages";
@@ -20,13 +22,19 @@ import { CrewFan } from "./components/CrewFan";
 import { MentionText } from "./components/CrewMentions";
 import { Home } from "./pages/Home";
 import { AgentGraph } from "./components/AgentGraph";
-import { applyAccent, applyTheme, type AccentChoice, type ThemeChoice } from "./lib/theme";
+import { applyAccent, applyTheme, type ThemeChoice } from "./lib/theme";
 import type { CrewInstance, Reminder, TaskRun } from "./types";
+import { AgentLife } from "./components/AgentLife";
+import { AgentPanel } from "./components/GraphPanels";
+import { Rooms } from "./components/Rooms";
+import { api } from "./lib/api";
+import { AgentBot } from "./components/AgentBot";
+import { Thinking } from "./pages/ChatPage";
 import "./styles.css";
 
 const query = new URLSearchParams(window.location.search);
 applyTheme((query.get("theme") as ThemeChoice) ?? "dark");
-applyAccent((query.get("accent") as AccentChoice) ?? "graphite");
+applyAccent();
 const view = query.get("view") ?? "all";
 
 const SAMPLE = `Checked **placements.haveloc.com**. The portal currently displays **108 Jobs Listed**.
@@ -91,6 +99,59 @@ function Pill() {
   return <div style={{ width: 380, height: 72 }} className="pill-stage"><button className="pill"><span className="pill-mark"><svg className="orb-mark" viewBox="0 0 24 24" fill="none"><path d="M4.5 19V6.2c0-.5.6-.7.9-.3L12 14.4l6.6-8.5c.3-.4.9-.2.9.3V19" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/></svg></span><span className="pill-text"><b>AI News</b><span>{firstLine(NEWS)}</span></span><span className="pill-time">4m</span></button></div>;
 }
 
+
+const MAIL_LATEX = String.raw`\section{Inbox Summary}
+\begin{itemize}
+    \item \textbf{From:} Team Unstop
+    \textbf{Subject:} You're Missing Out on an Exciting AWS Opportunity!
+    \textbf{Key Point:} An AWS-related opportunity requiring action is available.
+    \textbf{Action:} Review the email for details and apply or register if interested.
+
+    \item \textbf{From:} Internshala
+    \textbf{Subject:} Update: You are about to lose this opportunity | Confirm your spot
+    \textbf{Key Point:} A previously secured internship requires immediate confirmation.
+    \textbf{Deadline:} Immediate action required.
+
+    \item \textbf{From:} Rohit Vishnu Y / LinkedIn
+    \textbf{Subject:} I want to connect
+    \textbf{Action:} Decide whether to accept the LinkedIn connection.
+\end{itemize}
+Note: The Internshala "confirm your spot" email likely has a tight deadline; please review that first.`;
+function MailReport() {
+  (api as unknown as Record<string, unknown>).telegram = async () => ({ connected: query.get("tg") === "on", linked: query.get("tg") === "on", alerts: true, bot_username: "my_mavo_bot", bot_name: null, chat_name: null, link_url: null });
+  const r = { ...reminder, crew_name: "Summarise my emails", message: MAIL_LATEX } as Reminder;
+  return <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
+    <div style={{ width: 470, height: 460 }} className="toast-stage mail-alert"><section className="toast-shell"><DesktopUpdateCard reminder={r} busy={false} onDismiss={() => undefined} onOpen={() => undefined} onClose={() => undefined} onSpeak={() => undefined} onSetupTelegram={() => undefined} /></section></div>
+    <div className="mail-chat surface" style={{ width: 720, padding: 20 }}><Report compact truncate={false} text={MAIL_LATEX} /></div>
+  </div>;
+}
+
+function TelegramView() {
+  const stage = query.get("stage") ?? "new";
+  const base = { connected: false, linked: false, alerts: true, bot_name: null, bot_username: null, chat_name: null, link_url: null };
+  const status = stage === "new" ? base : stage === "start" ? { ...base, connected: true, bot_name: "My Mavo", bot_username: "my_mavo_bot", link_url: "https://t.me/my_mavo_bot?start=482913", link_code: "482913" } : { ...base, connected: true, linked: true, bot_username: "my_mavo_bot", chat_name: "Asha" };
+  (api as unknown as Record<string, unknown>).telegram = async () => status;
+  useAppStore.setState({ crew: [{ id: "m", name: "Momentum Spark" }] as never });
+  return <div className="tg-preview" style={{ width: 560 }}><TelegramCard /></div>;
+}
+
+function TelegramRowView() {
+  const linked = { connected: true, linked: true, alerts: false, bot_name: null, bot_username: "my_mavo_bot", chat_name: null, link_url: null };
+  const crew = { id: "c", configuration_plan: { draft: { requested_telegram: true } } } as unknown as CrewInstance;
+  return <div className="tg-row-preview surface" style={{ width: 620, padding: 12 }}><div className="list-card">
+    <div className="list-row"><div className="flex-1"><p className="text-[14px] text-zinc-50">Tell me on my desktop</p><p className="text-[12px] text-zinc-500">New results show on the Mavo icon.</p></div><button className="resource-switch" role="switch" aria-checked="true"><span /></button></div>
+    <TelegramRow crew={crew} alerts initial={linked} />
+  </div></div>;
+}
+
+function OrbsView() {
+  const seeds = ["mavo", "credits", "meet", "news", "pc", "quote"];
+  const states = ["ready", "working", "needs", "stopped"] as const;
+  return <div className="orbs-preview" style={{ display: "grid", gridTemplateColumns: "repeat(6, 72px)", gap: 18, padding: 18 }}>
+    {states.flatMap(state => seeds.map((seed, i) => <span key={state + seed} className="map-face has-bot" style={{ width: 72, height: 72, ...identityStyle(identityColor(`crew:${seed}${i}`)) }}><AgentBot seed={seed} state={state} /></span>))}
+  </div>;
+}
+
 function CardOnly() {
   return <div style={{ width: 400, height: 360 }} className="toast-stage"><section className="toast-shell">
     <DesktopUpdateCard reminder={reminder} busy={false} onDismiss={() => undefined} onOpen={() => undefined} onClose={() => undefined} onSpeak={() => undefined} />
@@ -117,13 +178,15 @@ function Setup() {
   const draft = {
     id: "air", name: "AIRouter Credits Watch", template_id: "operator", status: "draft", route_id: null, is_running: false, permissions: ["model:invoke"],
     responsibilities: "Check the AIRouter credits balance on airouter.in.", trigger_type: "interval", review_interval_minutes: 30,
-    configuration_plan: { phase: "needs_access", questions: [], draft: {
+    configuration_plan: { phase: "needs_access", questions: [], ...(query.get("testing") ? { first_run: { status: "running", tested_with: "sample" } } : {}), draft: {
       name: "AIRouter Credits Watch", template_id: "operator", responsibilities: "Check the AIRouter credits balance on airouter.in.", trigger_type: "interval", review_interval_minutes: 30,
       requested_google_capabilities: [], requested_google_resources: [], requested_actions: ["browser.open", "browser.read", "browser.navigate"].map(action),
       requested_notifications: true, requested_device_metrics: false, requested_weather: false, daily_call_limit: 48, max_model_calls: 5,
     } },
   } as unknown as CrewInstance;
-  return <div style={{ width: 680 }}><CrewSetupCard crew={draft} onRefine={() => undefined} /></div>;
+  (api as unknown as Record<string, unknown>).actionPolicies = async () => ({ paused: false, actions: [] });
+  (api as unknown as Record<string, unknown>).telegram = async () => null;
+  return <div className="setup-preview" style={{ width: 680 }}><CrewSetupCard crew={draft} onRefine={() => undefined} /></div>;
 }
 
 /* A Crew that builds things: its tools are one switch. Needs the API mocked. */
@@ -139,7 +202,9 @@ function Blender() {
       requested_notifications: true, requested_device_metrics: false, requested_weather: false, daily_call_limit: 24, max_model_calls: 8,
     } },
   } as unknown as CrewInstance;
-  return <div style={{ width: 680 }}><CrewSetupCard crew={draft} onRefine={() => undefined} /></div>;
+  (api as unknown as Record<string, unknown>).actionPolicies = async () => ({ paused: false, actions: [] });
+  (api as unknown as Record<string, unknown>).telegram = async () => null;
+  return <div className="setup-preview" style={{ width: 680 }}><CrewSetupCard crew={draft} onRefine={() => undefined} /></div>;
 }
 
 /* The Actions page itself. Needs the API mocked. */
@@ -375,7 +440,7 @@ function HomeView() {
     useAppStore.setState({ crew: crews, setupDrafts: many ? [] : [crew("travel", "Trip Planner", { id: "trip", status: "draft", responsibilities: "Plan my Goa trip.", configuration_plan: { draft: { requested_actions: [{ operation: "browser.open", domains: ["irctc.co.in"] }] } } as never })],
       chatOpen: params.get("chat") !== "0", page: "home" });
   }, []);
-  if (params.get("bare") === "1") return <div className="map-preview" style={{ width: 1200, height: 760, position: "relative" }}><AgentGraph crews={crews} drafts={[]} me="Himanshu" memory={[{ id: "1", text: "My mom is Sita", source: "Lunch Reminder", at: "" }]} selection={null} onSelect={() => undefined} onNew={() => undefined} /></div>;
+  if (params.get("bare") === "1") return <div className="map-preview" style={{ width: 1200, height: 760, position: "relative" }}><AgentGraph crews={crews} drafts={[]} me="Asha" memory={[{ id: "1", text: "My mom is Sita", source: "Lunch Reminder", at: "" }]} selection={null} onSelect={() => undefined} onNew={() => undefined} /></div>;
   const step = (title: string, status: string, team?: string[]) => ({ id: title, title, kind: "helper", status, team });
   const tasks = [{
     id: "t1", title: "Build: Combined RSS Reader", status: "running", result: null, error: null, used_calls: 5, budget_calls: 17, conversation_id: null,
@@ -386,6 +451,106 @@ function HomeView() {
     ],
   }] as never;
   return <div className="map-preview" style={{ width: 1600, height: 940, position: "relative", overflow: "hidden" }}><Home previewTasks={params.get("tasks") === "0" ? undefined : tasks} /></div>;
+}
+
+/** The agent window as it opens on a click: a meeting crew working now, and a browser crew. */
+function AgentWindow() {
+  useAppStore.setState({ routes: [{ id: "r1", name: "Mavo Provider", provider: "cloud", model: "qwen3.7-flash" }] as never });
+  const recipe = { final: "desk", steps: [{ id: "read_gmail", kind: "read", source: "gmail", new_only: true }, { id: "read_calendar", kind: "read", source: "calendar" }, { id: "desk", kind: "automation", automation: "agent.desk", uses: ["read_gmail", "read_calendar"], params: { start: "09:00", end: "18:00", days: ["mon", "tue", "wed", "thu", "fri"], duration_minutes: 30 } }] };
+  const meeting = {
+    id: "meet", name: "Meeting Reply Desk", template_id: "research", status: "active", is_running: true, runtime_state: "running", route_id: "r1", trigger_type: "gmail_message",
+    responsibilities: "When someone emails to meet, check my calendar and book or offer times.", permissions: ["model:invoke", "google:gmail:read", "google:calendar:read"], agents: [],
+    checkpoint: "Booked Fri 20 Nov, 10:00–10:45 AM with Aditya and confirmed by email.", max_model_calls: 20, daily_call_limit: 200,
+    configuration_plan: { recipe, recipe_checked: true, composition: { agents: [{ key: "agent", actions: ["gmail.send", "calendar.create"] }] } },
+    cycle: { run_id: "r", status: "running", started_at: new Date(Date.now() - 60000).toISOString(), steps: [{ title: "Your mail", status: "done" }, { title: "Your calendar", status: "done" }, { title: "Agent decides", status: "running" }], current: 2, done: 2, total: 3, question: null,
+      thoughts: [{ label: "Aditya: Roadmap", text: "Reading it.", tool: "read" }, { label: "", text: "", tool: "find_free_times", outcome: "done", result: "Free: Fri 20 Nov, 10:00–10:45 AM" }, { label: "", text: "", tool: "calendar.create", outcome: "done", about: "Fri 20 Nov, 10:00–10:45 AM · Finalizing Project Roadmap" }] },
+  } as unknown as CrewInstance;
+  const browser = {
+    id: "air", name: "AIRouter Credits", template_id: "operator", status: "active", is_running: true, runtime_state: "waiting", route_id: "r1", trigger_type: "interval", review_interval_minutes: 60,
+    responsibilities: "Every hour, check my AIRouter credits on airouter.in.", permissions: ["model:invoke", "notifications:show"], agents: [], max_model_calls: 5, daily_call_limit: 48,
+    checkpoint: "Credits left: $0.50\n- Last top-up: Nov 14 ($1.00)\n- $1 = ₹94.25", configuration_plan: {},
+  } as unknown as CrewInstance;
+  return <div style={{ display: "flex", gap: 32, alignItems: "flex-start" }}>
+    {[meeting, browser].map(c => <div key={c.id} className="graph-panel" style={{ width: 460, position: "relative", padding: 16, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8 }}><AgentPanel crew={c} onClose={() => undefined} /></div>)}
+  </div>;
+}
+
+/** An agent just added, as its card shows in chat. */
+function AddedView() {
+  const draft = { name: "Priority Inbox Watch", responsibilities: "Every 30 minutes, read my new mail and alert me on my desktop about anything important: personal, work that needs action, security, billing, travel and time-sensitive mail. Skip promotions and newsletters.", template_id: "research", trigger_type: "interval", review_interval_minutes: 30, requested_google_capabilities: ["gmail:read"], requested_google_resources: ["gmail"], requested_actions: [], requested_notifications: true, requested_device_metrics: false, daily_call_limit: 48, max_model_calls: 5 };
+  const crew = { id: "inbox", name: draft.name, status: "active", is_running: true, runtime_state: "waiting", template_id: "research", trigger_type: "interval", review_interval_minutes: 30, responsibilities: draft.responsibilities,
+    permissions: ["model:invoke", "notifications:show", "google:gmail:read"], agents: [], hotkey: "Win+F9",
+    configuration_plan: { phase: "ready", questions: [], missing: [], draft, first_run: { status: "passed", message: "" } } } as unknown as CrewInstance;
+  return <div style={{ width: 760 }}><CrewSetupCard crew={crew} onRefine={() => undefined} /></div>;
+}
+
+/** Rooms: the list of agents and one agent's timeline. ?room=meet|air|mavo picks the room. */
+function RoomsView() {
+  useAppStore.setState({ routes: [{ id: "r1", name: "Mavo Provider", provider: "cloud", model: "qwen3.7-flash" }] as never });
+  try { localStorage.setItem("mavo-room", query.get("room") ?? "meet"); } catch { /* preview */ }
+  // Sample history for the rooms (no backend in the preview).
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+  (api as unknown as Record<string, unknown>).crewRuns = async () => [];
+  (api as unknown as Record<string, unknown>).googleStatus = async () => ({ signed_in: true, phase: "idle", expired: query.get("expired") === "1", capabilities: query.get("google") === "0" ? [] : ["gmail:read", "gmail:body"] });
+  (api as unknown as Record<string, unknown>).crewAsks = async (id: string) => id === "air" ? [
+    { id: "c1", kind: "run", question: "Check now", answer: String.raw`Credits left: 	extbf{\$0.50}`, pending: false, at: hoursAgo(1), task_id: null, delivered: ["desktop", "telegram"] },
+    { id: "c2", kind: "run", question: "Check now", answer: "On it: checking now.", pending: true, at: hoursAgo(0), task_id: null },
+  ] : id === "news" ? [
+    { id: "a0", question: "Summarise my emails", answer: "\\section{Opportunities \\& Career}\n\\begin{itemize}\n\\item \\textbf{From:} Internshala\n\\textbf{Subject:} You are about to lose this opportunity | Confirm your spot\n\\textbf{Date:} 15 Nov 2026, 17:10 IST\n\\textit{Summary:} Urgent request to confirm a spot for an internship.\n\\textbf{Action:} \textbf{Urgent reply needed.}\n\\item \\textbf{From:} Team Unstop\n\\textbf{Subject:} You're Missing Out on an Exciting AWS Opportunity!\n\\textbf{Date:} 15 Nov 2026, 20:54 IST\n\\textit{Summary:} Alert about an AWS opportunity.\n\\textbf{Action:} Review needed.\n\\end{itemize}", pending: false, at: hoursAgo(1), task_id: "t0" },
+    { id: "a2", kind: "beyond", question: "Email Ravi the summary every Friday", answer: "I can only read your inbox, so I can't send that email.", prompt: "Make an agent that emails Ravi my inbox summary every Friday at 5 PM.", pending: false, at: hoursAgo(0.5), task_id: null },
+    { id: "a3", kind: "error", question: "What changed since yesterday?", answer: "Mavo could not answer that. Ask again.", pending: false, at: hoursAgo(0.4), task_id: null },
+    { id: "a1", question: "Give me inbox summary", answer: "I'm reading your inbox now.", pending: true, at: hoursAgo(0), task_id: "t" }] : [];
+  (api as unknown as Record<string, unknown>).crewTasks = async (id: string) => id === "air" ? [
+    { id: "t3", title: "Credit check", status: "done", result: String.raw`Credits left: \textbf{\$0.50}` + "\n" + String.raw`\begin{itemize}\item Last top-up: Nov 14 (\$1.00)\end{itemize}`, error: null, used_calls: 4, budget_calls: 12, conversation_id: null, created_at: hoursAgo(1), finished_at: hoursAgo(0.98),
+      steps: [{ id: "s", title: "Read the credits page", kind: "agent", status: "done", thinking: [{ label: "", text: "", tool: "browser.open", outcome: "done", about: "airouter.in/settings/credits", result: "Credits · AIRouter" }, { label: "", text: "", tool: "browser.read", outcome: "done", about: "Credits · AIRouter", result: "airouter.in/settings/credits" }] }] },
+    { id: "t2", title: "Credit check", status: "failed", result: null, error: "It could not find the answer on the pages it read (airouter.in). It tries again at its next check.", used_calls: 3, budget_calls: 12, conversation_id: null, created_at: hoursAgo(2), finished_at: hoursAgo(1.97), steps: [] },
+    { id: "t1", title: "Credit check", status: "done", result: String.raw`Credits left: \textbf{\$0.62}`, error: null, used_calls: 5, budget_calls: 12, conversation_id: null, created_at: hoursAgo(26), finished_at: hoursAgo(25.98), steps: [] },
+  ] : [];
+  const base = { template_id: "research", status: "active", is_running: true, runtime_state: "waiting", route_id: "r1", permissions: ["model:invoke"], agents: [], max_model_calls: 5, daily_call_limit: 48, daily_calls_used: 3, daily_triggers: [], configuration_plan: {} };
+  const crews = [
+    { ...base, id: "meet", name: "Meeting Desk", trigger_type: "gmail_message", responsibilities: "Book meetings people ask for.",
+      checkpoint: "Aditya · Re: Roadmap\n- Booked Fri 20 Nov, 10:00–10:45 AM · Finalizing Project Roadmap\n- Replied: “Friday, November 20 from 10:00 AM works for me.”",
+      asks: [{ id: "q1", question: "Ravi · Sync: Thursday 2 PM is busy and he offered nothing else. What should I do?", choices: ["Offer other times", "Decline politely"] }] },
+    { ...base, id: "air", name: "AIRouter Credits", trigger_type: "interval", review_interval_minutes: 60, responsibilities: "Check my AIRouter credits.",
+      cycle: query.get("room") === "air" ? { run_id: "x", status: "running", started_at: new Date().toISOString(), steps: [{ title: "Checking the site", status: "running" }, { title: "Writing it up", status: "waiting" }], current: 0, done: 0, total: 2, question: null, thoughts: [
+        { label: "", text: "Opening airouter.in", tool: "action", aid: "a1", op: "browser.open", outcome: "done" },
+        { label: "", text: "", tool: "browser.open", outcome: "done", about: "airouter.in/settings/credits", result: "Credits · AIRouter", aid: "a1" },
+        { label: "", text: "Finding the credits page", tool: "action", aid: "a2", op: "browser.navigate", outcome: "done" },
+        { label: "", text: "Reading your credits", tool: "action", aid: "a3", op: "browser.read", outcome: "running" },
+      ] } : null, checkpoint: String.raw`Credits left: \textbf{\$0.50}
+\begin{itemize}
+\item Last top-up: Nov 14 (\$1.00)
+\item Rate: \$1 = ₹94.25
+\end{itemize}` },
+    { ...base, id: "news", name: "Inbox Digest", trigger_type: "interval", review_interval_minutes: 30, responsibilities: "Summarise my inbox.", runtime_state: "waiting", cycle: { run_id: "r", status: "running", asked: "Give me inbox summary", started_at: new Date(Date.now() - 40000).toISOString(),
+      steps: [{ title: "Read inbox", status: "done" }, { title: "Summarize priority inbox messages", status: "running" }, { title: "Send you the summary", status: "waiting" }], current: 1, done: 1, total: 3, question: null,
+      thoughts: [{ label: "", text: "Reading your Gmail" }, { label: "", text: "Read 14 emails" }, { label: "", text: "Writing it up" }] } },
+    { ...base, id: "inbox", name: "Priority Inbox Watch", trigger_type: "interval", review_interval_minutes: 30, responsibilities: "Read my new mail and alert me about anything important.", is_running: false, runtime_state: "needs_setup",
+      last_runtime_error: "Allow gmail:read · Allow gmail:body", configuration_plan: { missing: ["Allow gmail:read", "Allow gmail:body", "Allow desktop updates"] } },
+    { ...base, id: "pc", name: "PC Health", trigger_type: "interval", review_interval_minutes: 60, responsibilities: "Check disk space.", is_running: false, checkpoint: "Disk C: 41 GB free of 476 GB" },
+  ] as unknown as CrewInstance[];
+  return <div className="home" style={{ width: 1280, height: 780, border: "1px solid var(--border)" }}><Rooms crews={crews} drafts={[]} onOverview={() => undefined} /></div>;
+}
+
+/** The chat with its crews roaming behind it, Mavo thinking, and a long message being typed. */
+function ChatLife() {
+  const crews = ["mail", "meet", "news", "credits"].map((id, i) => ({ id, name: id, status: "active", is_running: i !== 3, runtime_state: i === 0 ? "running" : i === 1 ? "needs_input" : "waiting" } as CrewInstance));
+  const empty = query.get("empty") === "1";
+  const text = "Every morning at 8, read my unread mail from yesterday, pick out anything that needs a reply today, and draft short polite replies for me to check. Skip newsletters and anything from no-reply addresses, and tell me on my desktop when the drafts are ready.";
+  const grow = (el: HTMLTextAreaElement | null) => { if (el) { el.style.height = "auto"; el.style.height = `${Math.min(el.scrollHeight, 260)}px`; } };
+  return <div className="chat-workspace" style={{ width: 960, height: 660, border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
+    <section className="chat-stage relative flex min-w-0 flex-1 flex-col" style={{ height: 660 }}>
+      <AgentLife crews={crews} />
+      <div className="chat-message-scroll min-h-0 flex-1 overflow-y-auto px-8 py-8"><div className="mx-auto max-w-3xl space-y-6">
+        {empty ? <div className="chat-empty"><span className="chat-hello" aria-hidden="true"><AgentBot seed="mavo" state="ready" /></span><h2>What can I help with?</h2></div>
+          : <><div className="flex flex-col items-end gap-1"><div className="message-content message-user max-w-[80%] whitespace-pre-wrap text-[14px] leading-6">Book a call with Ravi next week</div></div><Thinking /></>}
+      </div></div>
+      <form className="chat-composer px-8 pb-7" onSubmit={e => e.preventDefault()}><div className="mx-auto max-w-3xl"><div className="composer relative flex items-end gap-2 p-1.5">
+        <div className="mention-field relative min-w-0 flex-1"><textarea ref={grow} rows={1} defaultValue={text} className="relative block min-h-9 w-full resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm outline-none" /></div>
+        <button className="composer-send" type="button">↑</button>
+      </div></div></form>
+    </section>
+  </div>;
 }
 
 function Preview() {
@@ -410,6 +575,15 @@ function Preview() {
       {show("swarm") && <><Swarm n={100} /><Swarm n={6} /></>}
       {show("mentions") && <Mentions />}
       {show("home") && <HomeView />}
+      {view === "chat" && <ChatLife />}
+      {view === "agent" && <AgentWindow />}
+      {view === "rooms" && <RoomsView />}
+      {view === "added" && <AddedView />}
+      {view === "mailreport" && <MailReport />}
+      {view === "telegram" && <TelegramView />}
+      {view === "orbs" && <OrbsView />}
+      {view === "tgrow" && <TelegramRowView />}
+      {view === "celebrate" && <div className="surface setup" style={{ width: 680 }}><Celebration seed="inbox" name="Priority Inbox Watch" passed /></div>}
     </div>
   </div>;
 }

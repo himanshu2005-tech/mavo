@@ -162,7 +162,7 @@ export async function saveSetup(crew: CrewInstance, key: string, op: string, rul
 /** The pool resource behind a node, for its global Off / Read / Read & act level. */
 export function poolIdFor(key: string): string | null {
   if (key.startsWith("google.")) return key.slice(7);
-  if (key === "feeds" || key === "github" || key === "weather" || key === "device") return key;
+  if (["feeds","github","weather","device","location","open_data"].includes(key)) return key;
   if (key === "web" || key === "web.act" || key.startsWith("site:") || key.startsWith("act:")) return "browser";
   if (key === "terminal.run") return "terminal";
   if (key === "notes" || key.startsWith("notes.")) return "notes";

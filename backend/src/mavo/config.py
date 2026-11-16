@@ -30,9 +30,17 @@ class Settings(BaseSettings):
     ollama_context: int = Field(default=8192, ge=2048, le=131072)
     log_level: str = "INFO"
     workers_enabled: bool = True
+    # Recurring agents run as recipes (recipes.py): planned once, replayed every run.
+    recipes: bool = True
+    # A setup test runs in the background; the card shows "Testing…" until it ends.
+    first_run_in_background: bool = True
+    max_concurrent_model_calls: int = Field(default=4, ge=1, le=16)
+    max_model_output_tokens: int = Field(default=16000, ge=256, le=16000)
     automation_dir: Path | None = None
-    require_login: bool = True
+    # No account needed: Mavo is local-first. Signing in is only for Mavo Core, and optional.
+    require_login: bool = False
     core_gateway_url: str | None = None
+    dev_manage_core: bool = False
     github_client_id: str | None = Field(
         default=None, validation_alias=AliasChoices("MAVO_GITHUB_CLIENT_ID", "GITHUB_CLIENT_ID")
     )

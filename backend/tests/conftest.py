@@ -95,6 +95,8 @@ def client(tmp_path) -> Iterator[TestClient]:
         workers_enabled=False,
         require_login=False,
         allow_google_developer_setup=True,
+        recipes=False,  # the agent-per-run path; recipe tests turn it on
+        first_run_in_background=False,  # a test reads the setup test's result at once
     )
     ollama = OllamaClient(settings.ollama_url, transport=httpx.MockTransport(handler))
     credentials = MemoryCredentialStore()
@@ -107,3 +109,22 @@ def client(tmp_path) -> Iterator[TestClient]:
 @pytest.fixture
 def auth() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
+
+
+@pytest.fixture
+def sample_mail(monkeypatch):
+    """A mail crew's setup test runs on a sample only: this one, in place of the sample a model
+    would write, so a test controls what the agents are given."""
+
+    def use(items, calendar=None):
+        sample = {"gmail": [{**item, "sample": True} for item in items]}
+        if calendar is not None:
+            sample["calendar"] = calendar
+
+        async def write(runtime, crew_id):
+            return sample
+
+        monkeypatch.setattr("mavo.first_run.write_sample", write)
+        return sample
+
+    return use

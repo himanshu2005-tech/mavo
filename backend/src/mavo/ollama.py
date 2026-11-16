@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import re
-
 import httpx
 
 from mavo.schemas import ModelInfo, ProviderStatus
-
-# A thinking model that writes its reasoning into the answer anyway (older Ollama, or a model that
-# ignores the switch): the reasoning is not the answer.
-THINKING = re.compile(r"<think>.*?</think>\s*", re.S | re.I)
+from mavo.thinking import without_thinking
 
 
 class OllamaUnavailable(RuntimeError):
@@ -68,15 +63,19 @@ class OllamaClient:
             )
 
     def request(self, model: str, messages: list[dict[str, str]], think: bool | None) -> dict:
+        from mavo.model_router import WORKER_SCHEMA, reply_tokens
+
         body = {
             "model": model,
             "messages": messages,
             "stream": False,
             "keep_alive": self.keep_alive,
-            "options": {"num_ctx": self.context},
+            "options": {"num_ctx": self.context, "num_predict": reply_tokens()},
         }
         if think is not None:
             body["think"] = think
+        if WORKER_SCHEMA.get() is not None:
+            body["format"] = WORKER_SCHEMA.get()
         return body
 
     async def chat(self, model: str, messages: list[dict[str, str]]) -> str:
@@ -100,7 +99,7 @@ class OllamaClient:
                     )
                 response.raise_for_status()
                 content = response.json().get("message", {}).get("content")
-                content = THINKING.sub("", content).strip() if isinstance(content, str) else ""
+                content = without_thinking(content) if isinstance(content, str) else ""
                 if not content:
                     raise OllamaUnavailable(
                         f"{model} answered with nothing. Try again, or choose another model."

@@ -111,7 +111,13 @@ function RunApprovals(){
   if(!items.length)return null;
   return <section aria-label="Waiting for you" className="space-y-3"><h2 className="text-sm font-semibold">Waiting for you</h2>
     {error&&<p role="alert" className="notice error-notice">{error}</p>}
-    {items.map(item=>{const tool=item.tool==="blender"?"Blender":"Python";const what=item.script??item.file??"a script";return <article key={item.id} className="surface run-card" aria-label={`Run ${what}`}>
+    {items.map(item=>item.kind==="command"?<article key={item.id} className="surface run-card" aria-label="Run a command">
+      <div><h3 className="text-[15px] font-semibold">Run a command</h3><p className="mt-1 text-xs text-zinc-500">{item.crew_name??"Your request"} · in {item.folder}</p></div>
+      {item.reason&&<p className="notice">Safety check: {item.reason}</p>}
+      <pre className="script-box" tabIndex={0} aria-label="Command">{item.command}</pre>
+      <p className="text-[11.5px] leading-5 text-zinc-500">It runs with your Windows account's rights, so read it first. Nothing runs unless you press Run.</p>
+      <div className="flex gap-2"><button className="btn-primary" disabled={busy===item.id||!item.sha256} onClick={()=>void answer(item,true)}>{busy===item.id&&<LoaderCircle size={12} className="animate-spin"/>}Run</button><button className="btn-secondary" disabled={busy===item.id} onClick={()=>void answer(item,false)}>Deny</button></div>
+    </article>:(()=>{const tool=item.tool==="blender"?"Blender":"Python";const what=item.script??item.file??"a script";return <article key={item.id} className="surface run-card" aria-label={`Run ${what}`}>
       <div><h3 className="text-[15px] font-semibold">Run {what} with {tool}</h3><p className="mt-1 text-xs text-zinc-500">{item.crew_name??"Your request"} · project {item.project}{item.show?" · opens its window":""}</p></div>
       {item.error?<p role="alert" className="notice error-notice">{item.error}</p>:<>
         {item.changed&&<p role="alert" className="notice error-notice">The scripts changed after this was requested. Deny it, and ask for the run again.</p>}
@@ -123,7 +129,7 @@ function RunApprovals(){
             <select className="form-control !mt-0 !w-auto" aria-label="How often" value={String(keep[item.id]!.every_minutes)} onChange={e=>setKeep({...keep,[item.id]:{...keep[item.id]!,every_minutes:e.target.value==="null"?null:Number(e.target.value)}})}>{SCHEDULES.map(o=><option key={o.label} value={String(o.minutes)}>{o.label}</option>)}</select>
             <select className="form-control !mt-0 !w-auto" aria-label="Tell me" value={keep[item.id]!.notify} onChange={e=>setKeep({...keep,[item.id]:{...keep[item.id]!,notify:e.target.value as AutomationChoice["notify"]}})}><option value="failure">Tell me if it fails</option><option value="always">Tell me every time</option><option value="never">Never tell me</option></select></div>}</div></>}
       <div className="flex gap-2"><button className="btn-primary" disabled={busy===item.id||!!item.error||item.changed||!item.sha256} onClick={()=>void answer(item,true)}>{busy===item.id&&<LoaderCircle size={12} className="animate-spin"/>}Run</button><button className="btn-secondary" disabled={busy===item.id} onClick={()=>void answer(item,false)}>Deny</button></div>
-    </article>;})}
+    </article>;})())}
   </section>;
 }
 

@@ -25,3 +25,11 @@ describe("Crew cards", () => {
     expect(renderToStaticMarkup(<CrewCard crew={crew({ is_running: false })} busy={false} onOpen={() => {}} onToggle={() => {}} />)).toContain('aria-label="Run Meals"');
   });
 });
+
+it("only an agent that stopped or asks something needs the person, not one retrying or resting", async () => {
+  const { needsPerson } = await import("./CrewCard");
+  expect(needsPerson({ last_runtime_error: "Had a hiccup (the AI model took too long to answer). Trying again in 2 min.", runtime_state: "waiting" } as never)).toBe(false);
+  expect(needsPerson({ last_runtime_error: "Used today's AI calls. Back tomorrow.", runtime_state: "budget_paused" } as never)).toBe(false);
+  expect(needsPerson({ last_runtime_error: "Inbox Digest is paused: the AI connection is out of credits, three runs in a row.", runtime_state: "error" } as never)).toBe(true);
+  expect(needsPerson({ last_runtime_error: null, runtime_state: "waiting" } as never)).toBe(false);
+});

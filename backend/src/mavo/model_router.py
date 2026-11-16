@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -16,14 +18,23 @@ class ModelProviderError(RuntimeError):
     pass
 
 
+class ReplyCutOff(ModelProviderError):
+    """The answer ran past the output limit: retried once with more room."""
+
+
 # Room for one reply. A short answer needs little; a whole file written by the build team does
 # not fit in 4096 tokens: a Pomodoro timer's index.html was cut off mid-line at 14,000 characters.
 # Set for the duration of a call that writes files (team_build), and read here.
 LONG_REPLY: ContextVar[bool] = ContextVar("long_reply", default=False)
+BEFORE_DISPATCH: ContextVar[Callable[[], None] | None] = ContextVar(
+    "model_dispatch_guard", default=None
+)
+OUTPUT_CEILING: ContextVar[int] = ContextVar("model_output_ceiling", default=16000)
+WORKER_SCHEMA: ContextVar[dict | None] = ContextVar("worker_checkpoint_schema", default=None)
 
 
 def reply_tokens() -> int:
-    return 16000 if LONG_REPLY.get() else 4096
+    return min(16000 if LONG_REPLY.get() else 4096, OUTPUT_CEILING.get())
 
 
 def reply_seconds() -> float:
@@ -51,11 +62,16 @@ class ModelRouter:
         ollama: OllamaClient,
         credentials: CredentialStore,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        max_concurrent_calls: int = 4,
+        max_output_tokens: int = 16000,
     ) -> None:
         self.ollama = ollama
         self.credentials = credentials
         self.transport = transport
         self.activity = ActivityFeed()
+        self.slots = asyncio.Semaphore(max(1, min(16, max_concurrent_calls)))
+        self.max_output_tokens = max(256, min(16000, max_output_tokens))
 
     async def statuses(self, defaults: dict[str, str]) -> list[ProviderStatus]:
         ollama_status = await self.ollama.status()
@@ -106,8 +122,16 @@ class ModelRouter:
         system: str,
         credential_id: str | None = None,
     ) -> str:
-        with self.activity.model_call(provider, model, credential_id):
-            return await self._chat(provider, model, messages, system, credential_id)
+        async with self.slots:
+            # Waiting for capacity is not permission to send a now-revoked prompt later.
+            if guard := BEFORE_DISPATCH.get():
+                guard()
+            token = OUTPUT_CEILING.set(self.max_output_tokens)
+            try:
+                with self.activity.model_call(provider, model, credential_id):
+                    return await self._chat(provider, model, messages, system, credential_id)
+            finally:
+                OUTPUT_CEILING.reset(token)
 
     async def _chat(
         self,
@@ -219,12 +243,44 @@ class ModelRouter:
             "max_tokens": reply_tokens(),
             "messages": [{"role": "system", "content": system}, *messages],
         }
+        if WORKER_SCHEMA.get() is not None:
+            payload["response_format"] = {"type": "json_object"}
         if provider in {"airouter", "openrouter"}:
             # Thinking models (DeepSeek V4 Flash) spent all 16,000 tokens of a Coder's reply
             # thinking and wrote nothing. Low effort: 1,024 tokens of thought, then the answer.
             payload["reasoning"] = {"effort": "low"}
-        text = await self._compatible_reply(provider, credential, payload)
+        try:
+            text = await self._compatible_reply(provider, credential, payload)
+        except ReplyCutOff:
+            text = None  # retried below with the room of a long reply
         if text is None:
+            if WORKER_SCHEMA.get() is not None:
+                # A thinking model spent its reply thinking, or the answer was cut off: once
+                # more, with room and a nudge to think briefly, before anything is reported.
+                again = {
+                    **payload,
+                    "max_tokens": max(reply_tokens(), 16000),
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system + "\n\nThink briefly, then write the JSON answer.",
+                        },
+                        *messages,
+                    ],
+                }
+                room = LONG_REPLY.set(True)
+                try:
+                    text = await self._compatible_reply(provider, credential, again)
+                except ReplyCutOff:
+                    text = None
+                finally:
+                    LONG_REPLY.reset(room)
+                if text is None:
+                    raise ModelProviderError(
+                        "The model wrote no answer twice (it used its reply thinking). Try a "
+                        "model that is not a thinking model."
+                    )
+                return self._require_text(text, PROVIDERS[provider].name)
             # It thought until the reply ran out (a writer given three research sources) and the
             # task step failed. Once more, with the room and time of a long reply and a nudge to
             # think briefly.
@@ -255,13 +311,73 @@ class ModelRouter:
 
     async def _compatible_reply(self, provider, credential, payload) -> str | None:
         """The reply's text; None when the model wrote only thinking."""
+        from mavo.reply_stream import LIVE
+
+        emit = LIVE.get()
+        if emit and WORKER_SCHEMA.get() is None:
+            return await self._compatible_stream(provider, credential, payload, emit)
         data = await self._post(provider, credential, "/chat/completions", payload)
         choices = data.get("choices", [])
+        if (
+            WORKER_SCHEMA.get() is not None
+            and choices
+            and choices[0].get("finish_reason") == "length"
+        ):
+            raise ReplyCutOff(
+                "The work checkpoint was cut off at the output token limit. "
+                "Use a shorter digest or refine the task."
+            )
         message = choices[0].get("message", {}) if choices else {}
         text = message.get("content") or ""
         if not str(text).strip() and (message.get("reasoning") or message.get("reasoning_content")):
             return None
         return text
+
+    async def _compatible_stream(self, provider, credential, payload, emit) -> str | None:
+        """The chat's planning reply, streamed: its "reply" text goes to the chat as it is
+        written (reply_stream). Same result and errors as the plain request."""
+        from mavo.reply_stream import Relay
+
+        definition = PROVIDERS[provider]
+        relay, thought = Relay(emit), False
+        try:
+            async with httpx.AsyncClient(
+                base_url=definition.base_url,
+                headers=self._headers(provider, credential),
+                timeout=reply_seconds(),
+                transport=self.transport,
+            ) as client:
+                async with client.stream(
+                    "POST", "/chat/completions", json={**payload, "stream": True}
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            choice = (json.loads(data).get("choices") or [{}])[0]
+                        except (ValueError, AttributeError, IndexError):
+                            continue
+                        delta = choice.get("delta") or {}
+                        thought |= bool(delta.get("reasoning") or delta.get("reasoning_content"))
+                        if delta.get("content"):
+                            relay.feed(delta["content"])
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {401, 403}:
+                raise ModelProviderError("The provider rejected the saved API key") from exc
+            raise ModelProviderError(
+                f"{definition.name} could not complete the request ({exc.response.status_code})"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ModelProviderError(f"{definition.name} is not reachable") from exc
+        if not relay.raw.strip() and thought:
+            return None
+        return relay.raw
 
     async def _post(
         self, provider: ProviderId, credential: str, path: str, payload: dict[str, object]
@@ -300,6 +416,10 @@ class ModelRouter:
 
     @staticmethod
     def _require_text(value: object, provider_name: str) -> str:
-        if not isinstance(value, str) or not value.strip():
+        from mavo.thinking import without_thinking
+
+        # Every provider, not only Ollama: a cloud thinking model leaked "</think>" into a plan.
+        text = without_thinking(value) if isinstance(value, str) else ""
+        if not text:
             raise ModelProviderError(f"{provider_name} returned no text")
-        return value.strip()
+        return text

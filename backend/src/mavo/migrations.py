@@ -47,7 +47,22 @@ def _repair_legacy_unversioned_database(config: Config, database_url: str) -> No
                     else set()
                 )
                 revision = (
-                    "0017"
+                    (
+                        "0020"
+                        if "crew_agents" in tables
+                        else "0019"
+                        if "mentioned_crew_ids" in message_columns
+                        else "0018"
+                    )
+                    if {
+                        "agent_envelopes",
+                        "agent_deliveries",
+                        "conversation_events",
+                        "configuration_edits",
+                    }
+                    <= tables
+                    and "config_version" in crew_columns
+                    else "0017"
                     if "task_run_id" in reminder_columns
                     else "0016"
                     if "task_runs" in tables

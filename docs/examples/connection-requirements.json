@@ -1,0 +1,18 @@
+{
+  "description": "Optional connection suggestions for the practical example catalog. Display only: never grants permission or claims an account is connected. User-supplied information remains an alternative where described in the catalog.",
+  "resources": {
+    "google.gmail": ["Important Inbox", "Recruiter Follow-ups", "Email Deadline Extractor", "Waiting for Replies", "Suspicious Mail Review", "Newsletter Briefing", "Receipt Organizer", "Shared Project Updates"],
+    "google.calendar": ["Tomorrow's Agenda", "Weekly Time Budget", "Class Timetable Check", "Commute Buffer Planner", "Appointment Preparation", "Occasion Planner"],
+    "google.tasks": ["Tomorrow's Agenda", "Weekly Time Budget", "Deadline Radar", "Project Blocker Review"],
+    "google.contacts": ["Occasion Planner"],
+    "device": ["C Drive Space Watch", "D Drive Capacity", "Battery Drain Review", "Charging Check", "Sustained CPU Review", "Memory Pressure Review", "Device Health Briefing", "Storage Growth Review", "Pre-presentation Device Check"],
+    "github": ["Pull Request Reviewer", "CI Failure Triage", "Issue Intake Triage", "Release Readiness Review", "Release Notes Writer", "Repository Activity Digest"],
+    "feeds": ["News Topic Digest"],
+    "web": ["Topic Research Brief", "Product Comparison Brief", "Scholarship Opportunity Review", "Placements Portal Watch", "Approved Page Change Watch", "Application Status Watch"],
+    "files": ["Downloads Organization Plan", "Duplicate Candidate Review", "Document Change Summary", "Document Naming Review"],
+    "weather": ["Destination Weather Review"]
+  },
+  "actions": {
+    "notify": ["Meal Reminders", "Wear My Watch", "Desk Breaks", "Deadline Radar", "Important Inbox", "Recruiter Follow-ups", "C Drive Space Watch", "D Drive Capacity", "Charging Check", "CI Failure Triage", "Placements Portal Watch", "Approved Page Change Watch", "Application Status Watch", "Destination Weather Review"]
+  }
+}

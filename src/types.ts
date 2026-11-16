@@ -1,4 +1,4 @@
-export type NavId = "home" | "resources" | "actions" | "settings" | "timeline" | "activity";
+export type NavId = "home" | "library" | "knowledge" | "resources" | "actions" | "settings" | "timeline" | "activity";
 
 export interface ModelInfo {
   name: string;
@@ -28,6 +28,8 @@ export interface ProviderStatus {
 }
 
 export interface Message {
+  mentioned_crew_ids?:string[];
+  mentioned_agent_ids?:string[];
   id: string;
   role: "user" | "assistant";
   content: string;
@@ -94,7 +96,20 @@ export interface CrewTemplate {
 }
 
 export interface DailyTrigger { id?: string; time: string; message: string; weekdays: number[]; enabled: boolean }
+export interface CrewAgent {
+  id:string;crew_id:string;key:string;name:string;role:string;instructions:string;route_id:string|null;
+  status:'active'|'retired';runtime_state:string;checkpoint:string|null;
+  definition:{capabilities?:string[];depends_on?:string[];completion_criteria?:string;max_model_calls?:number;verification?:string};
+  execution:{task_id?:string;step_id?:string;status?:string;output?:string;error?:string;question?:string;verification?:{operation:string;step:string;objective:string;reason:string}};
+}
+export interface CrewComposition {
+  agents:{key:string;name:string;role:string;instructions:string;route_id?:string|null;capabilities:string[];depends_on:string[];max_model_calls:number;completion_criteria:string;verification?:string}[];
+  limits:{max_agents:number;concurrency:number;model_calls:number;timeout_seconds:number;delegation_depth:number};
+  lead?:string|null;
+}
+export interface CrewCycle { run_id: string; status: string; started_at: string; steps: { title: string; status: string }[]; current: number | null; done: number; total: number; question: string | null; question_step?: string | null; thoughts?: Thought[]; /** Asked in its room: the question this run answers. */ asked?: string | null }
 export interface CrewInstance {
+  agents?:CrewAgent[];
   daily_triggers?: DailyTrigger[];
   question?: string | null;
   /** Work handed over that waits for your OK (approve it, or send it back). */
@@ -105,6 +120,13 @@ export interface CrewInstance {
   skipped_run?: { day: string; why: string } | null;
   /** The last run its local model could not do, done instead on a cloud model. */
   fallback?: { from: string; to: string; why: string; at: string; status?: "queued" | "completed" | "failed" | "cancelled" } | null;
+  /** The cycle it is working on now, step by step; absent between runs. */
+  cycle?: CrewCycle | null;
+  /** Its agent's questions waiting for you, each with the answers it offers. */
+  asks?: { id: string; question: string; choices: string[] }[];
+  /** Keys that run it at once ("Win+F9"), and why they could not be taken, if so. */
+  hotkey?: string | null;
+  hotkey_problem?: string | null;
   fallback_route_id?: string | null;
   id: string;
   template_id: string;
@@ -183,6 +205,8 @@ export interface GoogleStatus {
   missing_resources?: GoogleResource[];
   capabilities?: GoogleCapability[];
   missing_capabilities?: GoogleCapability[];
+  /** Google ended the sign-in: it needs connecting again. */
+  expired?: boolean;
 }
 export interface GoogleConnectionCheck {
   checked_at: string;
@@ -211,8 +235,10 @@ export interface CrewProposal {
 export interface MavoAgent { id: string; name: string; tagline: string; example: string }
 
 /** One question to a Crew and its answer. `pending` while the Crew is finding it out. */
-export interface CrewAsk { id: string; question: string; answer: string | null; pending: boolean; at: string; task_id?: string | null; kind?: "question" | "preference" | "fact" }
+export interface CrewAsk { id: string; question: string; answer: string | null; pending: boolean; at: string; task_id?: string | null; kind?: "question" | "preference" | "fact" | "note" | "schedule" | "beyond" | "chat" | "run" | "error"; /** For "beyond": the request, written out for Mavo to make an agent that can. */ prompt?: string | null; /** For a run: where its result went ("desktop", "telegram"). */ delivered?: string[] }
 /** Something the person told Mavo about themselves, known by every agent. */
+export interface RecipeView { enabled: boolean; off: boolean; recipe: Record<string, unknown> | null; line: string; planned_at: string | null; problem: string | null }
+export interface SavedFile { id: string; name: string; kind: string; size: number; words: number; added_at: string }
 export interface MemoryFact { id: string; text: string; source: string; source_id?: string | null; at: string }
 
 export interface Reminder {
@@ -228,10 +254,14 @@ export interface Reminder {
   /** A one-time task's alert: its run, and the step whose question it shows. */
   task_run_id?: string | null;
   task_step_id?: string | null;
+  /** An agent's question: the answers it offers as buttons. */
+  choices?: string[];
 }
 
 /** A script run waiting for the person: the scripts they would be approving, and whether they changed. */
 export interface RunApproval {
+  /** A held terminal command (the safety check asked the person), not a project script. */
+  kind?: "command"; command?: string; folder?: string; reason?: string | null;
   id: string; crew_id: string | null; crew_name: string | null; created_at: string;
   sha256: string | null; changed: boolean; trusted: boolean; project: string;
   tool?: "python" | "blender"; tool_path?: string; script?: string | null; file?: string | null;
@@ -311,14 +341,15 @@ export interface WeatherSnapshot {
 }
 
 export interface SuggestedAction { operation: string; reason: string; folders: string[]; domains: string[]; apps: string[]; recipients: string[]; repositories?:string[] }
-export interface CrewPlan { upstream?: string[]; review?: boolean; approve_first?: boolean; max_rounds?: number; leads_team?: boolean; lead?: string | null; members?: string[]; run_until?: string | null; goal?: string | null; finished?: { at: string; why: string }; preferences?: { text: string; at: string }[]; group?: string | null; phase: string; questions: string[]; missing?: string[]; denied_resources?: GoogleCapability[]; device_monitor?:DeviceMonitor; draft: { name: string; responsibilities: string; template_id: string; trigger_type: TriggerType; schedule_time?: string | null; daily_triggers?: DailyTrigger[]; depends_on?: string[]; route_id?: string | null; requested_google_capabilities: GoogleCapability[]; requested_google_resources: GoogleResource[]; requested_connector_capabilities?:string[]; requested_actions: SuggestedAction[]; requested_notifications: boolean; requested_device_metrics: boolean; device_monitor?:DeviceMonitor|null; requested_weather?: boolean; daily_call_limit: number; max_model_calls: number; run_until?: string | null; goal?: string | null } }
+export interface CrewPlan { question_choices?: string[]; changes_things?: boolean; ask_first?: { since: string; count: number }; upstream?: string[]; review?: boolean; approve_first?: boolean; max_rounds?: number; leads_team?: boolean; lead?: string | null; members?: string[]; run_until?: string | null; goal?: string | null; finished?: { at: string; why: string }; preferences?: { text: string; at: string }[]; notes?: { text: string; until: string; said: string }[]; delivery?: "now" | "summary"; group?: string | null; phase: string; questions: string[]; missing?: string[]; denied_resources?: GoogleCapability[]; device_monitor?:DeviceMonitor; draft: { name: string; responsibilities: string; template_id: string; trigger_type: TriggerType; schedule_time?: string | null; daily_triggers?: DailyTrigger[]; depends_on?: string[]; route_id?: string | null; requested_google_capabilities: GoogleCapability[]; requested_google_resources: GoogleResource[]; requested_connector_capabilities?:string[]; requested_actions: SuggestedAction[]; requested_notifications: boolean; /** Its alerts also go to the person's Telegram. */ requested_telegram?: boolean; requested_device_metrics: boolean; device_monitor?:DeviceMonitor|null; requested_weather?: boolean; daily_call_limit: number; max_model_calls: number; run_until?: string | null; goal?: string | null } }
 export interface RevocationReceipt {provider:string;local_disconnected:boolean;remote_revoked:boolean;requires_provider_action:boolean;message:string;manage_url:string;at:string}
 export interface ConnectorStatus {provider:"google"|"github"|"feeds";name:string;configured:boolean;connected:boolean;email:string|null;capabilities:string[];available_capabilities:string[];repositories?:string[];sources?:string[];available_sources?:{id:string;name:string;category?:string}[];error?:string|null;auth_mode?:"token"|"github_app"|null;revocation?:RevocationReceipt|null}
 export interface GitHubAuthStatus {configured:boolean;phase:"idle"|"starting"|"pending"|"exchanging"|"installing"|"select_repositories"|"complete"|"error";user_code:string|null;verification_uri:string;installation_url:string|null;repositories:{full_name:string;capabilities:string[]}[];coverage:string;error:string|null;simple?:boolean}
 /** One step of a one-time task, and how it is going. */
-export interface TaskStepView { id: string; title: string; kind: "helper" | "agent" | "crew" | "automation" | "skill"; status: "waiting" | "running" | "done" | "failed" | "blocked" | "skipped" | "stopped"; output?: string; error?: string; question?: string; ask?: string | null; asked_at?: string; choices?: string[] | null; team?: string[]; thinking?: Thought[] }
-export interface Thought { label: string; text: string }
-export interface TaskRun { id: string; title: string; status: "running" | "done" | "needs_you" | "failed" | "stopped"; steps: TaskStepView[]; result: string | null; error: string | null; used_calls: number; budget_calls: number; conversation_id: string | null; sign_in_url?: string | null; created_at: string; finished_at: string | null }
+export interface TaskStepView { interrupted?:boolean; model?: string; id: string; title: string; /** What it does, in the person's words ("Reading your email"). */ run_text?: string | null; kind: "helper" | "agent" | "crew" | "automation" | "skill" | "read" | "act"; status: "waiting" | "running" | "done" | "failed" | "blocked" | "skipped" | "stopped"; output?: string; error?: string; question?: string; ask?: string | null; asked_at?: string; choices?: string[] | null; team?: string[]; thinking?: Thought[] }
+/** A step of an agent's thinking; a tool's use also says which tool, how it ended and what about. */
+export interface Thought { label: string; text: string; tool?: string; outcome?: "done" | "waiting" | "refused" | "asked" | "failed" | "running"; about?: string; result?: string; /** An action's id: its live line and its card share it. */ aid?: string; op?: string }
+export interface TaskRun { id: string;crew_id?:string|null; title: string; status: "running" | "done" | "needs_you" | "failed" | "stopped"; steps: TaskStepView[]; result: string | null; error: string | null; used_calls: number; budget_calls: number; conversation_id: string | null; sign_in_url?: string | null; created_at: string; finished_at: string | null; /** Steps with a recording of their browser turn, to replay. */ traces?: string[] }
 export interface CoordinatorResponse { task_run_id?: string | null; reply: string; request_id: string; session_id: string; model: string; questions: string[]; crew: CrewInstance | null; draft: CrewInstance | null; crews?: CrewInstance[]; messages: Array<{role: "user" | "assistant"; content: string}>; conversation: Conversation | null }
 export interface CoreStatus { configured: boolean; connected: boolean; provider: string; model: string | null; error: string | null }
 
@@ -343,3 +374,6 @@ export interface HeldWork { kind: "approve" | "review_stuck" | "ask"; from: stri
 
 /** "run": the AI calls one run may make; "day": the ones it may make in a day. */
 export interface CallLimit { kind: "run" | "day"; current: number; suggested: number }
+
+/** The person's own Telegram bot: alerts out, "@Agent message" in. */
+export interface TelegramStatus { connected: boolean; bot_name: string | null; bot_username: string | null; linked: boolean; chat_name: string | null; alerts: boolean; link_url: string | null; /** Six digits to send the bot from the phone. */ link_code?: string | null; code_expired?: boolean }

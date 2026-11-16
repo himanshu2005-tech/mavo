@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from mavo.crew_behaviors import BEHAVIORS
 from mavo.crew_engine import recover_interrupted_runs
-from mavo.crew_workers import CrewWorkerRuntime, parse_checkpoint
+from mavo.crew_workers import CrewWorkerRuntime, as_utc, parse_checkpoint
 from mavo.database import (
     ActionRequest,
     CrewInstance,
@@ -129,7 +129,7 @@ class WeatherRouter(Router):
         assert "Chennai" in messages[-1]["content"]
         return json.dumps(
             {
-                "state": "continue",
+                "state": "wait_for_next_review",  # completed forecast, not more work this run
                 "summary": "Rain risk at destination; verify airline status.",
                 "next_step": "Review later",
                 "notification": "Rain risk in Chennai.",
@@ -176,11 +176,24 @@ async def test_destination_weather_uses_two_budgeted_calls_without_device_locati
 async def test_weather_denial_and_budgets_stop_before_resource_io(
     factory, global_access, crew_access, limit, session_limit
 ):
+    from mavo.database import utcnow
+    from mavo.limits import DAY_MAX
+
     add_crew(
         factory,
         permissions=["model:invoke"] + (["weather:read"] if crew_access else []),
         daily_call_limit=limit,
         max_model_calls=session_limit,
+        # limit 1: one call left under Mavo's daily safety ceiling (a crew's own small daily
+        # number no longer stops it).
+        **(
+            {
+                "daily_calls_used": DAY_MAX - 1,
+                "budget_day": utcnow().astimezone().date().isoformat(),
+            }
+            if limit == 1
+            else {}
+        ),
     )
     with factory() as session:
         session.add(
@@ -200,7 +213,7 @@ async def test_weather_denial_and_budgets_stop_before_resource_io(
             # Out of today's calls: it waits for tomorrow by itself, with the fix spelled out,
             # instead of sitting on a question the person cannot usefully answer.
             assert crew.runtime_state == "budget_paused" and crew.next_run_at is not None
-            assert crew.limit == {"kind": "day", "current": 1, "suggested": 5}
+            assert crew.limit == {"kind": "day", "current": DAY_MAX, "suggested": DAY_MAX}
             assert "model-call budget" not in (crew.last_runtime_error or "")
         else:
             assert crew.runtime_state == "needs_input"
@@ -622,14 +635,17 @@ async def test_stop_cancels_inflight_work_and_prevents_late_results(factory):
 
 @pytest.mark.asyncio
 async def test_budget_does_not_reset_on_restart_or_restart_button(factory):
-    add_crew(factory, daily_call_limit=1)
+    from mavo.limits import DAY_MAX
+
+    today = utcnow().astimezone().date().isoformat()
+    add_crew(factory, daily_call_limit=1, daily_calls_used=DAY_MAX - 1, budget_day=today)
     router = Router()
     await CrewWorkerRuntime(factory, router).work("crew")
     await CrewWorkerRuntime(factory, router).work("crew")
     with factory() as session:
         crew = session.get(CrewInstance, "crew")
         assert crew.is_running and crew.runtime_state == "budget_paused"
-        assert crew.daily_calls_used == 1
+        assert crew.daily_calls_used == DAY_MAX
         assert crew.next_run_at > utcnow().replace(tzinfo=None)
     assert len(router.calls) == 1
 
@@ -856,14 +872,22 @@ async def test_invalid_checkpoint_blocks_instead_of_spending_tokens_forever(fact
     router = Router("made-up-state")
     runtime = CrewWorkerRuntime(factory, router)
     await runtime.work("crew")
+    with factory() as session:
+        crew = session.get(CrewInstance, "crew")
+        # One bad reply is tried again later, not a dead agent: a few minutes on, same work.
+        assert crew.runtime_state == "waiting" and as_utc(crew.next_run_at) > utcnow()
+        assert crew.last_runtime_error.startswith("Had a hiccup")  # plain words for the person
+        assert "valid work checkpoint" in crew.observation["error_detail"]  # the detail is kept
+    # One reply, one repair attempt that says what was wrong.
+    assert len(router.calls) == 2
+    assert "not valid" in router.calls[1][0][-1]["content"]
+    for _ in range(2):
+        await runtime.work("crew")
     await runtime.tick()
     with factory() as session:
         crew = session.get(CrewInstance, "crew")
-        assert crew.runtime_state == "error" and crew.is_running
-        assert "valid work checkpoint" in crew.last_runtime_error
-    # One reply, one repair attempt that says what was wrong, then it stops.
-    assert len(router.calls) == 2
-    assert "not valid" in router.calls[1][0][-1]["content"]
+        assert crew.runtime_state == "error" and crew.is_running  # three in a row: it stops
+    assert len(router.calls) == 6
 
 
 def test_durable_claim_rejects_another_runtime_without_double_spending(factory):
@@ -1003,3 +1027,188 @@ async def test_interval_reviews_continue_and_same_listing_is_not_notified_twice(
         assert crew.is_running and crew.runtime_state == "waiting" and crew.next_run_at
         assert crew.observation["notified_items"] == ["job:123"]
         assert len(s.scalars(select(ReminderEvent)).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_refused_action_gets_another_turn_not_the_end_of_the_work(factory):
+    """A scheduler whose first event was refused (the time was busy) was stopped as "ran out of
+    steps" after 7 calls. It reads the refusal on its next turn and does it another way."""
+    add_crew(
+        factory,
+        template="operator",
+        permissions=["model:invoke", "action:browser.open"],
+    )
+
+    class Booker(Router):
+        async def chat(self, provider, model, messages, system, credential_id=None):
+            self.calls.append((messages, system))
+            first = len(self.calls) == 1
+            return json.dumps(
+                {
+                    "state": "continue" if first else "wait_for_next_review",
+                    "summary": "Booking 11:00."
+                    if first
+                    else "Booked 14:00 instead: 11:00 was busy.",
+                    "actions": [
+                        {"operation": "browser.open", "arguments": {"url": "https://example.com"}}
+                    ],
+                }
+            )
+
+    class Tools:
+        rules = True
+
+        def __init__(self):
+            self.done = 0
+
+        def available(self, *args):
+            return {"browser.open": {}}
+
+        def propose(self, draft, *args):
+            self.done += 1
+            return {"id": self.done}
+
+        async def maybe_execute(self, id):
+            if id == 1:
+                return {
+                    "operation": "browser.open",
+                    "status": "blocked",
+                    "error": "That time is busy",
+                }
+            return {"operation": "browser.open", "status": "completed"}
+
+    router = Booker()
+    runtime = CrewWorkerRuntime(factory, router)
+    runtime.actions = Tools()
+    await runtime.work("crew")
+    with factory() as session:
+        crew = session.get(CrewInstance, "crew")
+        assert not crew.observation.get("cut_short") and crew.next_run_at is not None
+    await runtime.work("crew")  # its next turn, due at once
+    assert len(router.calls) == 2  # a second turn, after the refusal
+    with factory() as s:
+        crew = s.get(CrewInstance, "crew")
+        assert not crew.observation.get("cut_short")
+        latest = s.scalar(select(CrewRun).order_by(CrewRun.created_at.desc()))
+        assert "Booked 14:00 instead" in (latest.result or "")
+
+
+@pytest.mark.asyncio
+async def test_the_page_where_the_answer_was_found_is_opened_first_next_time(factory):
+    """Found once (a credits page behind two menus), opened directly from then on."""
+    add_crew(
+        factory,
+        permissions=["model:invoke", "action:browser.open"],
+        observation={
+            "found_at": {
+                "url": "https://airouter.in/dashboard/billing",
+                "quote": "Credits remaining 1,240",
+            }
+        },
+    )
+    router = Router(state="wait_for_next_review")
+    await CrewWorkerRuntime(factory, router).work("crew")
+    system = router.calls[0][1]
+    assert "LAST TIME the answer was on https://airouter.in/dashboard/billing" in system
+    assert '"Credits remaining 1,240"' in system
+
+    add_crew(factory, id="plain", name="Plain", permissions=["model:invoke", "action:browser.open"])
+    router = Router(state="wait_for_next_review")
+    await CrewWorkerRuntime(factory, router).work("plain")
+    assert "LAST TIME" not in router.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_a_page_found_by_the_setup_test_is_used_by_the_real_crew(factory):
+    """The test ran on a copy, found the credits page, and the copy was deleted with it; the
+    real crew began at the front page and failed. Remembered by the job, it starts there."""
+    from mavo.found_pages import recall_found, remember_found
+
+    with factory() as session:  # what the test's copy found, before it was deleted
+        remember_found(
+            session,
+            "Complete this concrete task.",
+            "https://airouter.in/settings/credits",
+            "Credits remaining $0.50",
+        )
+        session.commit()
+        assert recall_found(session, "  complete this   CONCRETE task. ")["url"].endswith(
+            "/credits"
+        )
+        assert recall_found(session, "Another job entirely.") is None
+    add_crew(factory, permissions=["model:invoke", "action:browser.open"])
+    router = Router(state="wait_for_next_review")
+    await CrewWorkerRuntime(factory, router).work("crew")
+    assert "LAST TIME the answer was on https://airouter.in/settings/credits" in router.calls[0][1]
+
+
+def test_a_run_that_found_nothing_says_which_pages_it_read(factory):
+    from mavo.found_pages import not_found_words
+
+    add_crew(factory)
+    began = utcnow() - timedelta(minutes=1)
+    with factory() as session:
+        for n, url in enumerate(["https://www.airouter.in/", "https://www.airouter.in/"]):
+            session.add(
+                ActionRequest(
+                    crew_id="crew",
+                    account_subject="local",
+                    operation="browser.read",
+                    arguments={},
+                    fingerprint=f"nf{n}",
+                    status="completed",
+                    result={"url": url},
+                )
+            )
+        session.commit()
+        words = not_found_words(session, "crew", began)
+        assert words.startswith("It could not find the answer on the pages it read (airouter.in).")
+        assert not_found_words(session, "crew", utcnow() + timedelta(minutes=1)).startswith(
+            "It could not read the site"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_runs_one_off_helper_starts_from_the_page_its_crew_found(factory):
+    """Each run handed the job to a fresh helper with words of its own: a page remembered by the
+    helper's words never matched the next one. Remembered by the crew's job, every helper has it,
+    and one with nothing remembered is told to look past the front page."""
+    from mavo.database import TaskRun
+    from mavo.found_pages import remember_found
+
+    add_crew(
+        factory, id="owner", name="AIRouter Credits", responsibilities="Check my AIRouter credits."
+    )
+    with factory() as session:
+        run = TaskRun(crew_id="owner", title="Credit check", plan={}, steps=[])
+        session.add(run)
+        remember_found(
+            session,
+            "Check my AIRouter credits.",
+            "https://airouter.in/settings/credits",
+            "Credits remaining $0.50",
+        )
+        session.commit()
+        run_id = run.id
+    add_crew(
+        factory,
+        id="helper",
+        name="One-time s1",
+        responsibilities="Read the balance shown.",
+        permissions=["model:invoke", "action:browser.open"],
+        configuration_plan={"task_run_id": run_id},
+    )
+    router = Router(state="wait_for_next_review")
+    await CrewWorkerRuntime(factory, router).work("helper")
+    assert "LAST TIME the answer was on https://airouter.in/settings/credits" in router.calls[0][1]
+
+    add_crew(
+        factory,
+        id="fresh",
+        name="Fresh",
+        responsibilities="Something new.",
+        permissions=["model:invoke", "action:browser.open"],
+    )
+    router = Router(state="wait_for_next_review")
+    await CrewWorkerRuntime(factory, router).work("fresh")
+    assert "front page rarely shows an account's own numbers" in router.calls[0][1]

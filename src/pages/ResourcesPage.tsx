@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { CrewArt, HUES } from "../components/CrewArt";
 import { GoogleAccountCard } from "../components/GoogleAccountCard";
 import { ConnectorAccounts } from "../components/ConnectorAccounts";
+import { TelegramCard } from "../components/TelegramCard";
 import { PageHeader } from "../components/PageHeader";
 import { BrowserCard } from "../components/BrowserCard";
 import { ResourceAccess } from "../components/ResourceAccess";
@@ -11,7 +12,7 @@ import type { WeatherLocation, WeatherSnapshot } from "../types";
 
 type ResourceAccess = {weather: boolean; location: boolean};
 
-export function ResourcesPage() {
+export function ResourcesPage({setup=false}:{setup?:boolean}={}) {
   const [access, setAccess] = useState<ResourceAccess | null>(null);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
@@ -97,8 +98,8 @@ export function ResourcesPage() {
     : access?.location ? "Windows location access is required for automatic detection." : "Use this computer's location automatically when allowed.";
 
   return <>
-    <PageHeader eyebrow="Workspace" title="Resources" description="What Mavo can use." />
-    <div className="page-content masonry">
+    {!setup&&<PageHeader eyebrow="Workspace" title="Resources" description="What Mavo can use." />}
+    <div className={setup?'onboarding-resources':'page-content masonry'}>
       <section aria-label="Default resources">
         <h2 className="group-title">On this computer</h2>
         <div className="tile-grid">
@@ -109,11 +110,12 @@ export function ResourcesPage() {
       </section>
       <section aria-label="Accounts" className="space-y-4">
         <h2 className="group-title">Accounts</h2>
-        <BrowserCard />
+        {!setup&&<BrowserCard />}
         <GoogleAccountCard />
         <ConnectorAccounts />
+        {!setup&&<TelegramCard />}
       </section>
-      <section aria-label="Access"><h2 className="group-title">Access</h2><ResourceAccess /></section>
+      {!setup&&<section aria-label="Access"><h2 className="group-title">Access</h2><ResourceAccess /></section>}
       {error && <p role="alert" className="notice error-notice">{error}</p>}
     </div>
   </>;

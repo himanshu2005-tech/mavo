@@ -6,7 +6,7 @@ import { CrewArt, artStyle } from "./CrewArt";
 import { identityColor, identityStyle } from "../lib/identityColors";
 
 const clock = (value: string) => { const [h, m] = value.split(":").map(Number); return `${h % 12 || 12}:${String(m).padStart(2, "0")} ${h >= 12 ? "pm" : "am"}`; };
-const every = (minutes: number) => minutes % 60 === 0 ? (minutes === 60 ? "Every hour" : `Every ${minutes / 60} hours`) : `Every ${minutes} min`;
+import { every } from "../lib/library";
 
 /** One line that says when a Crew acts. */
 /** When the job ends, if it does: "until a guest is booked, or 30 Nov"; "Done" once it has. */
@@ -21,13 +21,29 @@ export function endLine(plan?: { run_until?: string | null; goal?: string | null
   return day ? `until ${day}` : "";
 }
 
+const DAY_NAMES = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"];
+/** The days an agent works, as a person says them: "Weekdays", "Fridays", "Mondays and Thursdays". */
+export function dayWords(days: number[]): string {
+  const set = [...new Set(days)].sort();
+  if (set.join() === "0,1,2,3,4") return "Weekdays";
+  if (set.join() === "5,6") return "Weekends";
+  const names = set.map(d => DAY_NAMES[d]);
+  return names.length > 1 ? names.slice(0, -1).join(", ") + " and " + names[names.length - 1] : names[0];
+}
+
 export function triggerLine(crew: CrewInstance): string {
   switch (crew.trigger_type) {
     case "daily": {
       const times = crew.daily_triggers?.length ? crew.daily_triggers.filter(t => t.enabled).map(t => t.time) : crew.schedule_time ? [crew.schedule_time] : [];
       return times.length ? "Daily at " + times.map(clock).join(", ") : "Daily";
     }
-    case "interval": return crew.schedule_time ? "Every day at " + clock(crew.schedule_time) : every(crew.review_interval_minutes);
+    case "interval": {
+      if (!crew.schedule_time) return every(crew.review_interval_minutes);
+      const days = crew.daily_triggers?.[0]?.weekdays;
+      if (days && days.length < 7) return dayWords(days) + " at " + clock(crew.schedule_time);
+      const span = Math.round((crew.review_interval_minutes ?? 1440) / 1440);
+      return (span === 7 ? "Every week at " : span > 1 ? `Every ${span} days at ` : "Every day at ") + clock(crew.schedule_time);
+    }
     case "gmail_message": return "When mail arrives";
     case "calendar_changed": return "When your calendar changes";
     case "tasks_changed": return "When your tasks change";
@@ -35,9 +51,15 @@ export function triggerLine(crew: CrewInstance): string {
   }
 }
 
+/** A message on an agent that is retrying by itself, or resting until tomorrow, is not a call
+ *  for the person: only an agent that stopped or asks for something is. */
+export function needsPerson(crew: Pick<CrewInstance, "last_runtime_error" | "runtime_state">): boolean {
+  return !!crew.last_runtime_error && !["waiting", "working", "budget_paused"].includes(crew.runtime_state ?? "");
+}
+
 function tone(crew: CrewInstance): "run" | "work" | "warn" | "off" {
   if (crew.status === "draft") return "off";
-  if (crew.last_runtime_error || crew.runtime_state === "error" || crew.runtime_state === "needs_input" || crew.configuration_plan?.phase === "needs_access") return "warn";
+  if (needsPerson(crew) || crew.runtime_state === "error" || crew.runtime_state === "needs_input" || crew.configuration_plan?.phase === "needs_access") return "warn";
   if (!crew.is_running) return "off";
   return crew.runtime_state === "working" ? "work" : "run";
 }
@@ -54,7 +76,7 @@ export function CrewCard({ crew, busy, onOpen, onToggle }: { crew: CrewInstance;
       <h3>{crew.name}</h3>
       <p>{[triggerLine(crew), endLine(crew.configuration_plan)].filter(Boolean).join(" · ")}</p>
       <div className="crew-foot">
-        <span>{crew.is_running && crew.next_run_at && crew.trigger_type !== "daily" ? "Next " + clockTime(crew.next_run_at) : crew.last_runtime_error ? "Needs attention" : " "}</span>
+        <span>{crew.is_running && crew.next_run_at && crew.trigger_type !== "daily" ? "Next " + clockTime(crew.next_run_at) : needsPerson(crew) ? "Needs attention" : " "}</span>
         <button className="crew-toggle" data-on={crew.is_running} aria-label={`${crew.is_running ? "Stop" : "Run"} ${crew.name}`} disabled={busy} onClick={onToggle}>
           {busy ? <LoaderCircle size={13} className="animate-spin" /> : crew.is_running ? <Square size={11} fill="currentColor" /> : <Play size={11} fill="currentColor" />}
           {crew.is_running ? "Stop" : "Run"}

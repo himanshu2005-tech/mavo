@@ -132,6 +132,9 @@ def test_revoking_fallback_discards_an_already_queued_retry(factory):
 
 
 def test_fallback_cannot_bypass_the_daily_model_call_budget(factory):
+    from mavo.database import utcnow
+    from mavo.limits import DAY_MAX
+
     with_routes(factory)
     add_crew(
         factory,
@@ -139,6 +142,9 @@ def test_fallback_cannot_bypass_the_daily_model_call_budget(factory):
         provider="ollama",
         model="qwen2.5:3b",
         daily_call_limit=1,
+        # One call left under Mavo's daily safety ceiling.
+        daily_calls_used=DAY_MAX - 1,
+        budget_day=utcnow().astimezone().date().isoformat(),
         configuration_plan={"fallback_route_id": "cloud"},
     )
     router = SmallLocalModel()

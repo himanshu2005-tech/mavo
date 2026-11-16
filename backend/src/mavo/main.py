@@ -37,7 +37,7 @@ from mavo.migrations import run_migrations
 from mavo.model_router import ModelRouter
 from mavo.model_routes import import_legacy_provider_routes
 from mavo.ollama import OllamaClient
-from mavo.publisher import publisher_github_config, publisher_google_config
+from mavo.publisher import publisher_core_url, publisher_github_config, publisher_google_config
 from mavo.reminders import backfill_daily_schedules
 from mavo.resources.google import GoogleResourcePool
 from mavo.resources.weather import OpenMeteoWeatherAdapter
@@ -61,7 +61,13 @@ def create_app(
         app_settings.ollama_url, context=app_settings.ollama_context
     )
     credential_store = credentials or DpapiCredentialStore(app_settings.data_dir)
-    model_router = ModelRouter(ollama_client, credential_store, cloud_transport)
+    model_router = ModelRouter(
+        ollama_client,
+        credential_store,
+        cloud_transport,
+        max_concurrent_calls=app_settings.max_concurrent_model_calls,
+        max_output_tokens=app_settings.max_model_output_tokens,
+    )
     weather = OpenMeteoWeatherAdapter(cloud_transport)
     google = GoogleAuth(
         session_factory,
@@ -78,7 +84,16 @@ def create_app(
     crew_runtime = CrewWorkerRuntime(session_factory, model_router, google_pool, weather)
     crew_runtime.actions = GoogleActions(google_pool)
     crew_runtime.actions.rules = ActionRules(session_factory)
+    # The terminal safety reviewer thinks through the same router as the agents (looked up at
+    # call time, so a route change applies at once).
+    crew_runtime.actions.chat = lambda *args, **kwargs: crew_runtime.router.chat(*args, **kwargs)
     desktop = DesktopActions(app_settings.automation_dir or app_settings.data_dir / "automation")
+    import mavo.knowledge_files as knowledge_files
+
+    # The person's saved files: the only ones an agent may attach to a web form.
+    knowledge_files.ACTIVE = desktop.files_dir = app_settings.data_dir
+    crew_runtime.recipes = app_settings.recipes
+    crew_runtime.first_run_in_background = app_settings.first_run_in_background
     site_logins = SiteLogins(session_factory, credential_store)
     desktop.login_lookup = site_logins.lookup
     crew_runtime.actions.desktop = desktop
@@ -98,6 +113,10 @@ def create_app(
         publisher_github_config(app_settings.github_client_id, app_settings.github_app_slug),
     )
     crew_runtime.connectors = connectors
+    from mavo.telegram import Telegram
+
+    telegram = Telegram(session_factory, credential_store, crew_runtime)
+    crew_runtime.telegram = telegram
     crew_runtime.actions.connectors = connectors
     firebase_config = (
         publisher_google_config(
@@ -112,6 +131,13 @@ def create_app(
     crew_runtime.coordinator = coordinator or CoordinatorClient(
         app_settings, firebase, cloud_transport
     )
+    from mavo.dev_core import DevCore
+
+    dev_core = DevCore(
+        publisher_core_url(app_settings.core_gateway_url), app_settings.dev_manage_core
+    )
+    if isinstance(crew_runtime.coordinator, CoordinatorClient):
+        crew_runtime.coordinator.lifecycle = dev_core
     crew_runtime.planner = CrewPlanner(
         crew_runtime, crew_runtime.coordinator, google, credential_store
     )
@@ -153,7 +179,10 @@ def create_app(
             )
             session.commit()
 
-    firebase.on_sign_out = stop_signed_out_work
+    # Signing out of Mavo Core (optional) leaves your agents running; only a workspace that
+    # needs an account stops its work when signed out.
+    if app_settings.require_login:
+        firebase.on_sign_out = stop_signed_out_work
 
     def desktop_allowed():
         with session_factory() as session:
@@ -180,19 +209,47 @@ def create_app(
             import_legacy_provider_routes(session)
             backfill_daily_schedules(session)
             recover_interrupted_runs(session)
+        from mavo.first_run import recover_first_runs
+
+        recover_first_runs(session_factory)
         crew_runtime.task_runner.recover()
+        dev_core.start()
         logger.info("Mavo backend ready on loopback")
         worker_task = (
             asyncio.create_task(crew_runtime.run()) if app_settings.workers_enabled else None
         )
+        # Keyboard shortcuts that run an agent (registered with Windows while Mavo runs).
+        from mavo.hotkeys import keep_hotkeys
+
+        hotkey_task = (
+            asyncio.create_task(keep_hotkeys(session_factory))
+            if app_settings.workers_enabled
+            else None
+        )
+        # The person's Telegram bot, when they connected one: alerts out, messages in.
+        from mavo.telegram import keep_telegram
+
+        telegram_task = (
+            asyncio.create_task(keep_telegram(telegram)) if app_settings.workers_enabled else None
+        )
         try:
             yield
         finally:
+            try:
+                await dev_core.close()
+            except Exception:
+                logger.exception(
+                    "Could not close the development Core process; continuing tool cleanup"
+                )
             for job in list(crew_runtime.task_runner.jobs.values()):
                 job.cancel()
             if worker_task:
                 worker_task.cancel()
                 await asyncio.gather(worker_task, return_exceptions=True)
+            for task in (hotkey_task, telegram_task):
+                if task:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
             await google.close()
             await connectors.github_auth.close()
             await desktop.close()
@@ -207,6 +264,9 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    from mavo.core_errors import CoreHTTPError, core_error_response
+
+    app.add_exception_handler(CoreHTTPError, core_error_response)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(app_settings.allowed_origins),
@@ -235,6 +295,7 @@ def create_app(
         yield from session_dependency(session_factory)
 
     app.state.crew_runtime = crew_runtime
+    app.state.dev_core = dev_core
     app.state.firebase = firebase
     protected_api = build_api(
         get_session, model_router, credential_store, weather, crew_runtime, google
@@ -249,6 +310,20 @@ def create_app(
         prefix="/api/v1",
         dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
     )
+    from mavo.knowledge_files import build_files_api
+    from mavo.recipes import build_recipe_api
+
+    app.include_router(
+        build_recipe_api(crew_runtime),
+        prefix="/api/v1",
+        dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
+    )
+
+    app.include_router(
+        build_files_api(app_settings.data_dir),
+        prefix="/api/v1",
+        dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
+    )
     app.include_router(
         build_google_api(google, google_pool),
         prefix="/api/v1",
@@ -259,10 +334,14 @@ def create_app(
         prefix="/api/v1",
         dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
     )
+    from mavo.attention import build_attention_api
     from mavo.autostart import build_autostart_api
+    from mavo.configuration import build_configuration_api
     from mavo.connectors.api import build_connector_api
     from mavo.crew_ask import build_ask_api
     from mavo.mavo_agents import build_agents_api
+    from mavo.onboarding import build_onboarding_api
+    from mavo.orchestration import build_orchestration_api
     from mavo.resource_pool import build_pool_api
     from mavo.shared_memory import build_memory_api
     from mavo.site_logins import build_logins_api
@@ -271,6 +350,9 @@ def create_app(
     from mavo.trial import build_trial_api
 
     for extra in (
+        build_onboarding_api(get_session, credential_store),
+        build_orchestration_api(crew_runtime),
+        build_configuration_api(crew_runtime),
         build_pool_api(crew_runtime, weather, get_session),
         build_timeline_api(get_session),
         build_logins_api(site_logins),
@@ -278,6 +360,7 @@ def create_app(
         build_autostart_api(),
         build_tasks_api(crew_runtime.task_runner),
         build_ask_api(crew_runtime),
+        build_attention_api(session_factory),
         build_memory_api(crew_runtime),
         build_agents_api(),
         build_open_api(crew_runtime),
@@ -291,6 +374,13 @@ def create_app(
 
     app.include_router(
         build_connector_api(connectors),
+        prefix="/api/v1",
+        dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
+    )
+    from mavo.telegram import build_telegram_api
+
+    app.include_router(
+        build_telegram_api(telegram),
         prefix="/api/v1",
         dependencies=[Depends(token_guard(app_settings.api_token)), Depends(require_identity)],
     )

@@ -1,8 +1,10 @@
-import { Brain, Check, ListChecks, LoaderCircle, Maximize2, Minus, Plus, ShieldCheck, UserCheck } from "lucide-react";
+import { Brain, Check, CircleAlert, ListChecks, LoaderCircle, Maximize2, Minus, Network, Plus, ShieldCheck, Timer, UserCheck } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import type { CrewInstance, MemoryFact } from "../types";
+import { AgentBot, type BotState } from "./AgentBot";
 import { triggerLine } from "./CrewCard";
 import { agentStyle } from "./CrewFan";
+import { CrewMembers } from './CrewMembers';
 import { nextRun } from "./CrewQuickList";
 import { workerLabel } from "../lib/crewStatus";
 import { GraphConnections } from "./GraphConnections";
@@ -13,14 +15,22 @@ import { identityColor, identityStyle, persistIdentityColors, reserveIdentityCol
 import { listens, runClock } from "../lib/runClock";
 import type { TaskOnMap } from "../lib/taskTeams";
 import {executionLabel,executionSignals,type ExecutionFeed} from '../lib/executionSignals';
+import {freshHandoff,type AgentMessage} from '../lib/orchestration';
+import {mergeConnections} from '../lib/connectionInventory';
 
-export type Selection = { kind: "me" } | { kind: "agent"; id: string } | { kind: "resource" | "action"; key: string } | { kind: "task"; id: string } | { kind: "route"; key: string } | null;
+export type Selection = { kind: "me" } | { kind: "agent"; id: string } | {kind:'member';crewId:string;id:string} | { kind: "resource" | "action" | "handoff"; key: string } | { kind: "task"; id: string } | { kind: "route"; key: string } | null;
 /** One of Mavo's models (a route: AIRouter in the cloud, Ollama on this computer). */
 export interface Brain { id: string; name: string; provider: string; model: string; connected?: boolean; signature?: string }
-export type GraphNode = Wire & { users: string[] };
+export type GraphNode = Wire & { users: string[]; pendingUsers?:string[]; connectionState?:string };
 
 export function agentState(crew: CrewInstance): "working" | "running" | "needs" | "stopped" | "done" | "draft" {
   if (crew.status === "draft") return "draft";
+  // A cycle it is working through right now: it shows as working, or as needing you when a
+  // step waits on your answer ("Running · next run in 25 min" showed while it worked).
+  if (crew.cycle?.question) return "needs";
+  if (crew.cycle?.status === "running") return "working";
+  if(crew.agents?.some(a=>a.runtime_state==='working'))return 'working';
+  if(crew.agents?.some(a=>a.runtime_state==='needs_input'))return 'needs';
   if (crew.configuration_plan?.finished) return "done";
   if (!crew.is_running || crew.status === "paused") return "stopped";
   if (crew.runtime_state === "working") return "working";
@@ -28,6 +38,22 @@ export function agentState(crew: CrewInstance): "working" | "running" | "needs" 
   return tone === "off" ? "stopped" : tone === "wait" ? "needs" : "running";
 }
 export const STATE_WORD = { working: "Working now", running: "Running", needs: "Needs you", stopped: "Stopped", done: "Done", draft: "Draft" };
+
+/** "Step 4 of 9 · Decide", or "Waiting for your answer": where its running cycle is. */
+export function cycleLine(crew: Pick<CrewInstance, "cycle">): string | null {
+  const c = crew.cycle;
+  if (!c) return null;
+  if (c.question) return "Waiting for your answer";
+  if (c.current == null) return `${c.done} of ${c.total} steps done`;
+  return `Step ${c.current + 1} of ${c.total} · ${c.steps[c.current]?.title ?? "working"}`;
+}
+
+/** How an agent's bot looks right now. */
+export function botState(crew: CrewInstance, working = false): BotState {
+  const state = agentState(crew);
+  if (working || state === "working") return "working";
+  return state === "running" ? "ready" : state === "draft" ? "idle" : state;
+}
 
 /** Enabled responsibilities and actual worker execution are different visual states. */
 export function agentActivity(crew: CrewInstance): "off" | "ready" | "working" | "waiting" {
@@ -44,17 +70,18 @@ export function gatherNodes(rows: { crew: CrewInstance; list: Wire[] }[]): Graph
   const nodes = new Map<string, GraphNode>();
   rows.forEach(({ crew, list }) => list.forEach(w => {
     const had = nodes.get(w.key);
-    if (had) { had.users.push(crew.id); had.allowed ||= w.allowed; }
-    else nodes.set(w.key, { ...w, users: [crew.id] });
+    if (had) { had.users.push(crew.id); had.allowed ||= w.allowed; if (!w.allowed) had.pendingUsers?.push(crew.id); }
+    else nodes.set(w.key, { ...w, users: [crew.id], pendingUsers:w.allowed?[]:[crew.id] });
   }));
   return [...nodes.values()];
 }
 
-export function useGraphModel(crews: CrewInstance[], drafts: CrewInstance[]) {
+const EMPTY_CONNECTIONS:GraphNode[]=[];
+export function useGraphModel(crews: CrewInstance[], drafts: CrewInstance[],inventory:GraphNode[]=EMPTY_CONNECTIONS) {
   return useMemo(() => {
     const ordered = [...flowOrder(crews), ...drafts];
     const wired = ordered.map(crew => ({ crew, ...wiring(crew) }));
-    const outer = [...gatherNodes(wired.map(w => ({ crew: w.crew, list: w.reads }))), ...gatherNodes(wired.map(w => ({ crew: w.crew, list: w.does })))];
+    const outer = mergeConnections([...gatherNodes(wired.map(w => ({ crew: w.crew, list: w.reads }))), ...gatherNodes(wired.map(w => ({ crew: w.crew, list: w.does })))],inventory);
     const ids = new Set(ordered.map(c => c.id));
     // Who hands work to whom: a fixed hand-over (upstream), and a team lead to each member.
     const talks = ordered.flatMap(c => [
@@ -62,11 +89,11 @@ export function useGraphModel(crews: CrewInstance[], drafts: CrewInstance[]) {
       ...(c.configuration_plan?.lead && ids.has(c.configuration_plan.lead) ? [{ from: c.configuration_plan.lead, to: c.id }] : []),
     ]);
     return { ordered, wired, outer, talks };
-  }, [crews, drafts]);
+  }, [crews, drafts,inventory]);
 }
 
 /** Radial agents beside a grouped Connections box. Drag the graph to pan, scroll to zoom. */
-export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset = 0, onSelect, onNew, onRun, tasks = [], routes = [],execution }: {
+export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset = 0, onSelect, onNew, onRun, tasks = [], routes = [],execution,messages=[],inventory=EMPTY_CONNECTIONS,connectionsLoading=false,connectionsError=null }: {
   crews: CrewInstance[]; drafts: CrewInstance[]; me: string; memory: MemoryFact[]; selection: Selection;
   /** Agents and nodes a search found: everything else fades. */
   hits?: { agents: Set<string>; keys: Set<string> } | null;
@@ -80,12 +107,17 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
   /** Run a scheduled agent now, from its clock. */
   onRun?: (id: string) => Promise<void>;
   execution?:ExecutionFeed|null;
+  messages?:AgentMessage[];
+  inventory?:GraphNode[]; connectionsLoading?:boolean;connectionsError?:string|null;
 }) {
-  const { ordered, wired, outer, talks } = useGraphModel(crews, drafts);
+  const { ordered, wired, outer, talks } = useGraphModel(crews, drafts,inventory);
+  const [expandedCrew,setExpandedCrew]=useState<string|null>(null);
   const signalNow=useNow(1000);
   const signals=useMemo(()=>executionSignals(execution,signalNow),[execution,signalNow]);
-  const runCards=Object.values(signals.crews).filter(s=>ordered.some(c=>c.id===s.crewId))
-    .sort((a,b)=>Number(['running','requesting'].includes(b.stage))-Number(['running','requesting'].includes(a.stage))||b.at.localeCompare(a.at)).slice(0,3);
+  // Keep execution attached to its node, not duplicated in a floating notification stack.
+  // Limit expanded live labels in dense overviews; every other node still has its ring/status.
+  const liveDetails=new Set(Object.values(signals.crews).filter(s=>ordered.some(c=>c.id===s.crewId))
+    .sort((a,b)=>Number(['running','requesting'].includes(b.stage))-Number(['running','requesting'].includes(a.stage))||b.at.localeCompare(a.at)).slice(0,3).map(s=>s.crewId));
   const identityKeys = [...ordered.map(c=>`crew:${c.id}`),...routes.map(r=>`route:${r.id}`),...outer.map(n=>`${n.kind}:${n.key}`)];
   const palette = useMemo(() => reserveIdentityColors(identityKeys), [identityKeys.join('\0')]);
   useEffect(() => persistIdentityColors(), [palette]);
@@ -93,13 +125,15 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
   const liveRouteUsers=Object.values(signals.crews).map(s=>`${s.crewId}:${s.routeId}`).sort().join('|');
   // The models agents think with, each with the agents that use it.
   const brains = useMemo(() => routes
-    .map(route => ({ key: "route:" + route.id, route, users: ordered.filter(c => c.status!=="draft"&&(c.route_id===route.id||Object.values(signals.crews).some(s=>s.crewId===c.id&&s.routeId===route.id))).map(c => c.id) }))
-    .filter(b => b.users.length), [routes, ordered,liveRouteUsers]);
+    .map(route => ({ key: "route:" + route.id, route, users: ordered.filter(c => c.status!=="draft"&&(c.route_id===route.id||c.agents?.some(a=>a.status==='active'&&a.route_id===route.id)||Object.values(signals.crews).some(s=>s.crewId===c.id&&s.routeId===route.id))).map(c => c.id) }))
+    , [routes, ordered,liveRouteUsers]);
   const teamSizes = tasks.map(t => t.members.length).join(",");
   const radial = useMemo(() => radialLayout(ordered.map(c => c.id), [...outer, ...brains.map(b => ({ key: b.key, users: b.users }))], memory.length, teamSizes ? teamSizes.split(",").map(Number) : tasks.map(() => 0)), [ordered, outer, brains, memory.length, teamSizes, tasks.length]);
   // A big team: lines are drawn for what you point at, not all at once (hundreds of agents would
   // be a web of thousands of lines, and slow).
   const many = ordered.length > 40;
+  const [showLinks,setShowLinks]=useState(true);
+  const [showClocks,setShowClocks]=useState(true);
   const [hover, setHover] = useState<Selection>(null);
   // Hover with intent: light up after a beat, let go after a slightly longer one, so passing over
   // the map does not flash and moving from a node to its clock does not flicker. Leaving a node
@@ -137,7 +171,9 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
     if (hits) return hits;
     if (!focus || focus.kind === "me") return null;
     const agents = new Set<string>(), keys = new Set<string>();
+    if(focus.kind==='member'){agents.add(focus.crewId);return {agents,keys};}
     if (focus.kind === "task") return { agents, keys }; // a task's team is its own: the rest fades
+    if (focus.kind === 'handoff') { focus.key.split('|').forEach(id=>agents.add(id));return {agents,keys}; }
     if (focus.kind === "route") {
       keys.add(focus.key);
       brains.find(b => b.key === focus.key)?.users.forEach(u => agents.add(u));
@@ -147,7 +183,8 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
       agents.add(focus.id);
       const w = wired.find(x => x.crew.id === focus.id);
       w?.reads.forEach(r => keys.add(r.key)); w?.does.forEach(d => keys.add(d.key));
-      if (w?.crew.route_id) keys.add("route:" + w.crew.route_id);
+      // A Crew's specialists may use different routes from its default route.
+      brains.filter(b => b.users.includes(focus.id)).forEach(b => keys.add(b.key));
       talks.forEach(t => { if (t.from === focus.id) agents.add(t.to); if (t.to === focus.id) agents.add(t.from); });
     } else {
       keys.add(focus.key);
@@ -192,6 +229,8 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
       const i = tasks.findIndex(t => t.run.id === selection.id), place = radial.tasks[i];
       return place ? [place.hub, ...place.members] : [];
     }
+    if(selection?.kind==='handoff')return selection.key.split('|').map(id=>radial.agents[id]).filter(Boolean);
+    if(selection?.kind==='member')return [radial.agents[selection.crewId]].filter(Boolean);
     if (selection && selection.kind !== "me") {
       const n = outer.find(x => x.key === selection.key);
       return (n?.users ?? []).map(u => radial.agents[u]).filter(Boolean);
@@ -214,7 +253,13 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
   // little, not to a stamp, and slides so what you picked stays in sight.
   useLayoutEffect(() => {
     if (moved || !size.w || !size.h) return;
-    setView(keepInView(frameAgents(radial,mapLeft,Math.max(200,free-mapLeft-16),size.h),target));
+    const fit=frameAgents(radial,mapLeft,Math.max(200,free-mapLeft-16),size.h);
+    // An inspector can leave only a narrow map strip. Keep the selected Crew readable;
+    // clipping/panning is preferable to shrinking its entire internal graph into a stamp.
+    if(target.length===1&&selection&&(selection.kind==='member'||selection.kind==='agent')){
+      fit.k=Math.max(.55,fit.k);fit.x=mapLeft+(free-mapLeft)/2-target[0].x*fit.k;fit.y=size.h/2-target[0].y*fit.k;
+    }
+    setView(keepInView(fit,target));
   }, [moved, size, free, mapLeft, radial, target, keepInView]);
   useEffect(() => { if (moved) setView(v => keepInView(v, target)); }, [moved, target, keepInView]);
   useEffect(() => {
@@ -270,58 +315,75 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
     if (!traceKey || !focus) return out;
     const follow = (crewId: string, start: number) => {
       const a = layout.agents[crewId], w = wired.find(x => x.crew.id === crewId);
-      if (!a || !w || agentState(w.crew) === "stopped") return;
+      if (!a || !w || !signals.crews[crewId] || !['running','requesting'].includes(signals.crews[crewId].stage)) return;
       out.push({ d: `M${c.x},${c.y} L${a.x},${a.y}`, delay: start, kind: "you", identity:`crew:${crewId}` });
       const thinks = w.crew.route_id && edgePath(crewId, "route:" + w.crew.route_id);
       if (thinks) out.push({ d: thinks, delay: start + 0.45, kind: "think", identity:`route:${w.crew.route_id}`, local: isLocal(w.crew.route_id) });
-      w.reads.filter(x => x.allowed).forEach((x, i) => { const d = edgePath(crewId, x.key); if (d) out.push({ d, delay: start + 0.9 + i * 0.08, kind: "read", identity:`resource:${x.key}` }); });
-      w.does.filter(x => x.allowed).forEach((x, i) => { const d = edgePath(crewId, x.key); if (d) out.push({ d, delay: start + 1.35 + i * 0.08, kind: "act", identity:`action:${x.key}` }); });
+      // Tool/resource paths are structural access, not evidence that an operation happened.
     };
     if (focus.kind === "agent") follow(focus.id, 0);
     else if (focus.kind === "route") brains.find(b => b.key === focus.key)?.users.slice(0, 24).forEach((u, i) => {
-      if (agentState(ordered.find(c => c.id === u)!) === "stopped") return;
+      if (!signals.crews[u]||!['running','requesting'].includes(signals.crews[u].stage)) return;
       const d = edgePath(u, focus.key);
       if (d) out.push({ d, delay: i * 0.05, kind: "think", identity:focus.key, local: focus.key.startsWith("route:") && isLocal(focus.key.slice(6)) });
     });
     return out;
-  }, [traceKey, layout, wired, brains, routes]);
+  }, [traceKey, layout, wired, brains, routes,signals]);
   const picked = (s: Selection) => JSON.stringify(s) === JSON.stringify(selection);
-  return <div className="graph-canvas" ref={box} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={() => { drag.current = null; setDragging(false); }} onMouseLeave={() => point(null)} data-dragging={dragging} data-focus={!!lit} data-many={many} data-zoom={detailAt(view.k)}
-    style={{ ["--lift" as string]: Math.min(4, Math.max(1, 0.85 / view.k)), ["--lift-soft" as string]: Math.min(2.6, Math.max(1, 0.62 / view.k)), ["--far" as string]: Math.min(2.2, Math.max(1, 0.5 / view.k)) } as CSSProperties}>
+  return <div className="graph-canvas" ref={box} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={() => { drag.current = null; setDragging(false); }} onMouseLeave={() => point(null)} data-dragging={dragging} data-focus={!!lit} data-many={many} data-links={showLinks} data-clocks={showClocks} data-zoom={detailAt(view.k)}
+    style={{ ["--lift" as string]: Math.min(4, Math.max(1, 0.85 / view.k)), ["--clock-lift" as string]:Math.max(1,0.9/view.k), ["--live-lift" as string]: Math.max(1, 0.85 / view.k), ["--lift-soft" as string]: Math.min(2.6, Math.max(1, 0.62 / view.k)), ["--far" as string]: Math.min(2.2, Math.max(1, 0.5 / view.k)) } as CSSProperties}>
     <div className="graph-world" style={{ width: layout.W, height: layout.H, transform: `translate(${view.x}px, ${view.y}px) scale(${view.k})` }}>
       <svg className="graph-wires" width={layout.W} height={layout.H} aria-hidden="true">
         {ordered.map(crew => { const a = layout.agents[crew.id]; return <line key={"s" + crew.id} className="wire wire-spoke" data-identity={`crew:${crew.id}`} data-state={stopped.has(crew.id)?"stopped":undefined} style={colorStyle(`crew:${crew.id}`)} data-on={!lit || lit.agents.has(crew.id)} data-flow={working.has(crew.id) ? "out" : undefined} x1={c.x} y1={c.y} x2={a.x} y2={a.y} />; })}
         <line className="wire wire-spoke wire-new" x1={c.x} y1={c.y} x2={layout.newAgent.x} y2={layout.newAgent.y} data-on={!lit} />
         {wired.flatMap(({ crew, reads, does }) => [...reads, ...does].map(w => {
           const a = layout.agents[crew.id], b = layout.nodes[w.key]; if (!a || !b) return null;
-          return <path key={crew.id + w.key} className={"wire " + (w.kind === "resource" ? "wire-read" : "wire-act")} data-target={w.key} data-identity={`${w.kind}:${w.key}`} data-state={stopped.has(crew.id)?"stopped":undefined} style={colorStyle(`${w.kind}:${w.key}`)} data-on={edgeOn(crew.id, w.key)} data-allowed={w.allowed}
-            data-flow={working.has(crew.id) && w.allowed ? (w.kind === "resource" ? "in" : "out") : undefined} d={edgePath(crew.id,w.key) ?? undefined} />;
+          const sel: Selection = {kind:w.kind,key:w.key};
+          return <path key={crew.id + w.key} className={"wire wire-connection " + (w.kind === "resource" ? "wire-read" : "wire-act")} data-agent={crew.id} data-link-kind={w.kind} data-target={w.key} data-identity={`${w.kind}:${w.key}`} data-state={stopped.has(crew.id)?"stopped":undefined} style={colorStyle(`${w.kind}:${w.key}`)} data-on={edgeOn(crew.id, w.key)} data-allowed={w.allowed}
+            onPointerDown={e=>e.stopPropagation()} onClick={()=>onSelect(sel)}
+            d={edgePath(crew.id,w.key) ?? undefined}><title>{`${crew.name} ${w.kind==='resource'?'reads':'can use'} ${w.label} · ${w.allowed?'Access granted':'Needs access'}${stopped.has(crew.id)?' · Crew stopped':''}. Select to inspect.`}</title></path>;
         }))}
         {brains.flatMap(b => b.users.map(u => {
           const d = edgePath(u, b.key); if (!d) return null;
           const requesting=signals.calls.some(call=>call.crew_id===u&&call.route_id===b.route.id);
-          return <path key={"think" + u} className="wire wire-route" data-target={b.key} data-identity={b.key} data-state={stopped.has(u)&&!requesting?"stopped":undefined} data-provider-active={requesting} style={colorStyle(b.key)} data-local={b.route.provider === "ollama"} data-on={edgeOn(u, b.key)} data-flow={requesting ? "out" : undefined} d={d} />;
+          return <path key={b.key+":"+u} className="wire wire-connection wire-route" data-agent={u} data-link-kind="route" data-target={b.key} data-identity={b.key} data-state={stopped.has(u)&&!requesting?"stopped":undefined} data-provider-active={requesting} style={colorStyle(b.key)} data-local={b.route.provider === "ollama"} data-on={edgeOn(u, b.key)} data-flow={requesting ? "out" : undefined}
+            onPointerDown={e=>e.stopPropagation()} onClick={()=>onSelect({kind:'route',key:b.key})} d={d}><title>{`${ordered.find(c=>c.id===u)?.name} uses model route ${b.route.name} · ${requesting?'Request in progress':stopped.has(u)?'Crew stopped':'Assigned, not necessarily executing'}. Select to inspect.`}</title></path>;
         }))}
         {talks.map(({ from, to }) => {
           const a = layout.agents[from], b = layout.agents[to]; if (!a || !b) return null;
           const m = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, k = { x: m.x + (c.x - m.x) * 0.45, y: m.y + (c.y - m.y) * 0.45 };
           const id = `talk-${from}-${to}`, on = !lit || (lit.agents.has(from) && lit.agents.has(to));
+          const forward=freshHandoff(messages,from,to,signalNow),live=forward??freshHandoff(messages,to,from,signalNow);
           return <g key={id} data-on={on} data-state={stopped.has(from)||stopped.has(to)?"stopped":undefined} data-identity={`crew:${to}`} style={colorStyle(`crew:${to}`)}><path id={id} className="wire wire-talk" data-identity={`crew:${to}`} data-state={stopped.has(from)||stopped.has(to)?"stopped":undefined} d={`M${a.x},${a.y} Q${k.x},${k.y} ${b.x},${b.y}`} />
-            <circle className="wire-pulse" r={3.6}><animateMotion dur="2.4s" repeatCount="indefinite"><mpath href={"#" + id} /></animateMotion></circle></g>;
+            {live&&<circle key={live.id} className="wire-pulse" data-message={live.id} r={3.6}><animateMotion dur="2.4s" repeatCount="2" keyPoints={forward?'0;1':'1;0'} keyTimes="0;1" calcMode="linear"><mpath href={"#" + id} /></animateMotion></circle>}</g>;
         })}
         {tasks.map((t, i) => {
           const place = layout.tasks[i]; if (!place) return null;
           const dim = !!focus && !(focus.kind === "task" && focus.id === t.run.id);
           return <g key={"task" + t.run.id} data-on={!dim} data-state={t.state}>
             <line className="wire wire-task" x1={c.x} y1={c.y} x2={place.hub.x} y2={place.hub.y} />
-            {t.members.map((m, k) => place.members[k] && <line key={m.name} className="wire wire-task-member" data-flow={m.state === "working" ? "out" : undefined}
-              x1={place.hub.x} y1={place.hub.y} x2={place.members[k].x} y2={place.members[k].y} />)}
+            {t.members.map((m, k) => {
+              const point=place.members[k];if(!point)return null;
+              const live=messages.find(message=>(message.sender===m.id||message.recipient===m.id)&&signalNow-Date.parse(message.created_at)>=0&&signalNow-Date.parse(message.created_at)<8000);
+              const id=`task-wire-${t.run.id}-${k}`;
+              return <g key={m.id??m.name}><path id={id} className="wire wire-task-member" data-flow={m.state==='working'?'out':undefined} d={`M${place.hub.x},${place.hub.y} L${point.x},${point.y}`}/>
+                {live&&<circle className="wire-pulse" data-message={live.id} r={3}><animateMotion dur="2s" repeatCount="2" keyPoints={live.sender===m.id?'1;0':'0;1'} keyTimes="0;1" calcMode="linear"><mpath href={`#${id}`}/></animateMotion></circle>}
+              </g>;
+            })}
           </g>;
         })}
       </svg>
+      {talks.map(({from,to})=>{
+        const a=layout.agents[from],b=layout.agents[to];if(!a||!b)return null;
+        const m={x:(a.x+b.x)/2,y:(a.y+b.y)/2};
+        const midpoint={x:m.x+(c.x-m.x)*.225,y:m.y+(c.y-m.y)*.225};
+        return <button key={`handoff-${from}-${to}`} className="graph-handoff-hit" style={pos(midpoint)}
+          aria-label={`Inspect handoff from ${ordered.find(c=>c.id===from)?.name} to ${ordered.find(c=>c.id===to)?.name}`}
+          title="Inspect dependency and message delivery" onClick={()=>onSelect({kind:'handoff',key:`${from}|${to}`})}>↗</button>;
+      })}
 
       <button className="graph-me" style={pos(c)} aria-pressed={selection?.kind === "me"} {...hoverable({ kind: "me" })} onClick={() => onSelect({ kind: "me" })} title="You, and what Mavo remembers">
-        <span className="graph-me-face">{myInitials(me)}</span><b>{me}</b>
+        <span className="graph-me-face">{myInitials(me)}</span><b>{me}</b><span className="graph-me-sub">Mavo Core</span>
         <span className="graph-me-sub"><Brain size={11} />{memory.length ? `${memory.length} thing${memory.length === 1 ? "" : "s"} remembered` : "Memory"}</span>
       </button>
       {layout.memory.map((p, i) => memory[i] && <span key={memory[i].id} className="graph-fact" style={pos(p)} title={`${memory[i].text} (from ${memory[i].source})`} onClick={() => onSelect({ kind: "me" })}>{memory[i].text}</span>)}
@@ -344,7 +406,7 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
           </button>)}
         </span>;
       })}
-      <RunClocks crews={ordered} layout={layout} lit={lit} focus={focus?.kind === "agent" ? focus.id : null} onRun={onRun} onOpen={id => onSelect({ kind: "agent", id })} hoverable={id => hoverable({ kind: "agent", id })} />
+      <RunClocks crews={ordered} layout={layout} zoom={view.k} lit={lit} focus={focus?.kind === "agent" ? focus.id : null} onRun={onRun} onOpen={id => onSelect({ kind: "agent", id })} hoverable={id => hoverable({ kind: "agent", id })} />
       {Object.entries(ripples).map(([id, at]) => layout.agents[id] && <span key={id + at} className="graph-ripple" style={pos(layout.agents[id])} aria-hidden="true" />)}
       {/* A step in a line that checks the work (a reviewer) or waits for you: a badge on its arc. */}
       {talks.map(({ from, to }) => {
@@ -363,18 +425,33 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
       {ordered.map((crew, i) => {
         const state = agentState(crew), live=signals.crews[crew.id], activity=live&&['running','requesting'].includes(live.stage)?'working':agentActivity(crew), sel: Selection = { kind: "agent", id: crew.id };
         const motion=activity==="working"||(activity==="ready"&&(readyMotion.has(crew.id)||(focus?.kind==="agent"&&focus.id===crew.id)));
-        return <button key={crew.id} className="graph-agent" style={{ ...pos(layout.agents[crew.id]), ...agentStyle(crew), ["--i" as string]: Math.min(i + 1, 24) }} data-identity={`crew:${crew.id}`} data-state={state} data-activity={activity} data-execution={live?.stage} data-motion={motion} data-listen={listens(crew) && state === "running"} data-dim={!!lit && !lit.agents.has(crew.id)} aria-pressed={picked(sel)}
-          {...hoverable(sel)} onClick={() => onSelect(sel)} title={`${crew.name}: ${activity==="waiting"?workerLabel(crew):STATE_WORD[state]}`}>
-          <span className="map-face">{initials(crew.name)}{(activity==="ready"||activity==="working")&&
+        const route=live&&routes.find(r=>r.id===live.routeId);
+        const liveLabel=live?`${executionLabel(live.stage)}${live.stage==='requesting'?` · ${route?.name??live.provider??'Model'}`:''}`:null;
+        return <button key={crew.id} className="graph-agent" style={{ ...pos(layout.agents[crew.id]), ...agentStyle(crew), ["--i" as string]: Math.min(i + 1, 24) }} data-identity={`crew:${crew.id}`} data-state={state} data-activity={activity} data-execution={live?.stage} data-live-detail={liveDetails.has(crew.id)&&(!lit||lit.agents.has(crew.id))} data-motion={motion} data-listen={listens(crew) && state === "running"} data-dim={!!lit && !lit.agents.has(crew.id)} aria-pressed={picked(sel)}
+          {...hoverable(sel)} onClick={() => onSelect(sel)} title={`${crew.name}: ${liveLabel??(activity==="waiting"?workerLabel(crew):STATE_WORD[state])}`}>
+          <span className="map-face has-bot"><AgentBot seed={crew.id} state={botState(crew, activity==="working")} />{(activity==="ready"||activity==="working")&&
             <svg className="agent-state-ring" viewBox="0 0 40 40" aria-hidden="true">
               <circle className="agent-ring-track" cx="20" cy="20" r="17"/>
               <circle className="agent-ring-motion" cx="20" cy="20" r="17" pathLength="100"/>
             </svg>}</span>
-          <span className="graph-agent-text"><b>{crew.name}</b>{live?<span className="agent-execution-line">{executionLabel(live.stage)}</span>:state === "working"
+          <span className="graph-agent-text"><b>{crew.name}</b>{crew.cycle?<span className="cycle-line" data-asking={!!crew.cycle.question}>
+            <span>{cycleLine(crew)}</span>
+            <span className="cycle-bar" aria-hidden="true"><i style={{width:`${Math.round(crew.cycle.done/Math.max(1,crew.cycle.total)*100)}%`}}/></span>
+          </span>:live?<span className="agent-execution-line">
+            {['running','requesting'].includes(live.stage)?<LoaderCircle size={11} className="provider-request-spinner" aria-hidden="true"/>:live.stage==='completed'?<Check size={11} aria-hidden="true"/>:['failed','interrupted'].includes(live.stage)?<CircleAlert size={11} aria-hidden="true"/>:<Minus size={11} aria-hidden="true"/>}
+            <span>{liveLabel}</span>
+          </span>:state === "working"
             ? <span className="working-line">Working<i /><i /><i /></span>
             : <span className={activity==="ready"?"agent-ready-line":activity==="waiting"?"agent-waiting-line":undefined}>{state === "draft" ? "Draft · finish setting it up" : activity==="waiting"?workerLabel(crew):activity==="ready"?`${listens(crew)?"Listening":"Running"} · ${triggerLine(crew)}`:triggerLine(crew)}</span>}</span>
           <span className="map-dot" aria-label={STATE_WORD[state]} />
         </button>;
+      })}
+      {ordered.filter(crew=>!!crew.agents?.some(a=>a.status==='active')&&(!many||expandedCrew===crew.id||(selection?.kind==='agent'&&selection.id===crew.id)||(selection?.kind==='member'&&selection.crewId===crew.id))).map(crew=>{
+        const p=layout.agents[crew.id],open=expandedCrew===crew.id;
+        return <div key={`members:${crew.id}`} className="map-crew-members" style={{left:p.x+110,top:p.y+22,transform:`scale(${Math.max(1,.85/view.k)})`,transformOrigin:'top left'}} onPointerDown={e=>e.stopPropagation()}>
+          <button className="crew-expand" aria-label={`${open?'Collapse':'Expand'} ${crew.name} agents`} aria-expanded={open} onClick={()=>setExpandedCrew(open?null:crew.id)}>{crew.agents!.filter(a=>a.status==='active').length} agents {open?'−':'+'}</button>
+          {open&&<div className="map-crew-cluster"><CrewMembers crew={crew} expanded onSelect={id=>onSelect({kind:'member',crewId:crew.id,id})} onEdge={(from,to)=>onSelect({kind:'handoff',key:`agent:${from}|agent:${to}`})}/></div>}
+        </div>;
       })}
       <button className="graph-agent graph-new" style={pos(layout.newAgent)} data-dim={!!lit} onClick={onNew}><span className="map-face"><Plus size={15} /></span><b>New agent</b></button>
 
@@ -389,26 +466,23 @@ export function AgentGraph({ crews, drafts, me, memory, selection, hits, inset =
     </div>
 
     <GraphConnections models={brains} nodes={outer} width={connectionWidth} selection={selection}
-      lit={lit} onSelect={onSelect} hoverable={hoverable} onAnchors={updateAnchors} providerActivity={signals.providers}/>
-
-    {!!runCards.length&&<div className="graph-run-notices" role="status" aria-live="polite" style={{right:inset+16,maxWidth:Math.max(180,Math.min(280,free-connectionWidth-48))}}>
-      {runCards.map(signal=>{
-        const crew=ordered.find(c=>c.id===signal.crewId)!;
-        const route=routes.find(r=>r.id===signal.routeId);
-        const active=['running','requesting'].includes(signal.stage);
-        return <button key={signal.runId} className="graph-run-notice" data-stage={signal.stage} style={agentStyle(crew)} onClick={()=>onSelect({kind:'agent',id:crew.id})} onPointerDown={e=>e.stopPropagation()}>
-          {active?<LoaderCircle size={14} className="provider-request-spinner" aria-hidden="true"/>:signal.stage==='completed'?<Check size={14} aria-hidden="true"/>:<Minus size={14} aria-hidden="true"/>}
-          <span><b>{crew.name}</b><span>{executionLabel(signal.stage)}{signal.stage==='requesting'&&` · ${route?.name??signal.provider??'Model'}`}</span></span>
-        </button>;
-      })}
-    </div>}
+      lit={lit} onSelect={onSelect} hoverable={hoverable} onAnchors={updateAnchors} providerActivity={signals.providers} loading={connectionsLoading} error={connectionsError}/>
 
     <div className="graph-tools" onPointerDown={e => e.stopPropagation()}>
       <button className="btn-quiet !p-1.5" aria-label="Zoom in" title="Zoom in" onClick={() => zoomBy(1.2)}><Plus size={14} /></button>
       <button className="btn-quiet !p-1.5" aria-label="Zoom out" title="Zoom out" onClick={() => zoomBy(1 / 1.2)}><Minus size={14} /></button>
       <button className="btn-quiet !p-1.5" aria-label="Fit to screen" title="Fit to screen" disabled={!moved} onClick={() => setMoved(false)}><Maximize2 size={13} /></button>
+      <button className="btn-quiet !p-1.5" aria-label="Show connections" title="Show resource, action and model connections" aria-pressed={showLinks} onClick={()=>setShowLinks(value=>!value)}><Network size={14}/></button>
+      <button className="btn-quiet !p-1.5" aria-label="Show scheduled-run dots" title="Show green countdown dots for scheduled agents" aria-pressed={showClocks} onClick={()=>setShowClocks(value=>!value)}><Timer size={14}/></button>
     </div>
-    <div className="graph-legend" aria-label="Graph help" style={{ maxWidth: Math.max(160, free - 140) }}>Select an agent to preview its connections.</div>
+    <div className="graph-legend" aria-label="Graph help" style={{ maxWidth: Math.max(160, free - 200) }}>
+      <span><i className="lg-link lg-route-link"/>Model route</span>
+      <span><i className="lg-link lg-resource-link"/>Resource</span>
+      <span><i className="lg-link lg-action-link"/>Action</span>
+      <span><i className="lg-link lg-pending-link"/>Needs access</span>
+      <span>Grey dashed: stopped</span>
+      <span><i className="lg-clock"/>Next scheduled run</span>
+    </div>
   </div>;
 }
 
@@ -421,8 +495,8 @@ function useNow(ms: number) {
 
 /** Each scheduled agent's clock: a dot travels from you to the agent, and when it arrives the
  *  agent runs. The line behind it fills as it goes. Point at it to see when; press it to run now. */
-function RunClocks({ crews, layout, lit, focus, onRun, onOpen, hoverable }: {
-  crews: CrewInstance[]; layout: GraphLayout; lit: { agents: Set<string> } | null; focus: string | null;
+function RunClocks({ crews, layout, zoom, lit, focus, onRun, onOpen, hoverable }: {
+  crews: CrewInstance[]; layout: GraphLayout; zoom:number; lit: { agents: Set<string> } | null; focus: string | null;
   onRun?: (id: string) => Promise<void>; onOpen: (id: string) => void;
   /** Pointing at a clock lights up its agent. */
   hoverable: (id: string) => Record<string, () => void>;
@@ -435,7 +509,7 @@ function RunClocks({ crews, layout, lit, focus, onRun, onOpen, hoverable }: {
     if (!clock || !a) return [];
     const dx = a.x - c.x, dy = a.y - c.y, len = Math.hypot(dx, dy) || 1;
     // From just outside your circle to the edge of the agent's card.
-    const t0 = Math.min(0.4, 40 / len);
+    const t0 = Math.min(0.4, 40 / (len*zoom));
     const t1 = Math.max(t0 + 0.1, 1 - Math.min(Math.abs(dx) > 1 ? 112 / Math.abs(dx) : 1, Math.abs(dy) > 1 ? 30 / Math.abs(dy) : 1));
     const t = t0 + (t1 - t0) * clock.progress;
     return [{ crew, clock, len, t0, t1, t, at: { x: c.x + dx * t, y: c.y + dy * t } }];

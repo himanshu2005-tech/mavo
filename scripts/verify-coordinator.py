@@ -37,7 +37,7 @@ def main():
     agent_key=protected.get(credential_id)
     report=json.loads((ROOT/".build/coordinator-live-verification.json").read_text(encoding="utf-8")) if args.triage_only else {}
     with TemporaryDirectory(prefix='coordinator-live-',dir=ROOT/'.build') as directory:
-        settings=Settings(require_login=False,workers_enabled=False,data_dir=Path(directory),api_token=secrets.token_urlsafe(32),core_gateway_url='http://127.0.0.1:8741')
+        settings=Settings(require_login=False,first_run_in_background=False,workers_enabled=False,data_dir=Path(directory),api_token=secrets.token_urlsafe(32),core_gateway_url='http://127.0.0.1:8741')
         with TestClient(create_app(settings,credentials=MemoryCredentialStore())) as client:
             client.headers['Authorization']='Bearer '+settings.api_token
             runtime=client.app.state.crew_runtime

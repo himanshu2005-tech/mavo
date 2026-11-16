@@ -1,9 +1,12 @@
-"""Notes and files on this computer, inside the folders the person chose.
+"""Notes and files on this computer, inside the folders the person chose (a whole drive, if they
+choose it).
 
 Every path is resolved (symlinks and ".." included) and must land inside one of the rule's
-folders; a rule with no folders allows nothing, even "without limits". Nothing here deletes or
-overwrites: notes are created or appended to, files are moved only where nothing has that name,
-and a backup is a new zip beside the others.
+folders; a rule with no folders allows nothing, even "without limits". Mavo's own data (its
+database, sign-ins and keys) is never reachable, whatever folder is chosen. Nothing here
+overwrites: notes and files are created or appended to, files are moved or copied only where
+nothing has that name, a backup is a new zip beside the others, and deleting sends to the Recycle
+Bin, only once the person says yes.
 """
 
 from __future__ import annotations
@@ -92,6 +95,58 @@ class FilesBackup(Args):
     destination_folder: str = Field(min_length=1, max_length=1024)
 
 
+class FilesRead(Args):
+    """Read a file's text: plain text, code, CSV, JSON, Markdown, PDF or Word (.docx). Up to
+    `max_chars` characters, from `start` (to read a long file in parts)."""
+
+    path: str = Field(min_length=1, max_length=1024)
+    start: int = Field(default=0, ge=0)
+    max_chars: int = Field(default=20000, ge=100, le=60000)
+
+
+class FilesFind(Args):
+    """Find files under `folder` (or all allowed folders): by words in their name, and, with
+    `in_text`, inside text files too. Newest first. `pattern` narrows by name, like *.pdf."""
+
+    query: str = Field(default="", max_length=200)
+    folder: str | None = Field(default=None, max_length=1024)
+    pattern: str = Field(default="*", min_length=1, max_length=100)
+    in_text: bool = False
+    limit: int = Field(default=25, ge=1, le=100)
+
+
+class FilesCopy(Args):
+    """Copy a file or folder into an allowed folder. Fails if something already has that name
+    there: nothing is overwritten."""
+
+    source: str = Field(min_length=1, max_length=1024)
+    destination_folder: str = Field(min_length=1, max_length=1024)
+    new_name: str | None = Field(default=None, min_length=1, max_length=255)
+
+    @field_validator("new_name")
+    @classmethod
+    def plain_name(cls, value):
+        if value is not None and (value in {".", ".."} or any(c in value for c in '/\\:*?"<>|')):
+            raise ValueError("Give a plain file name, without folders")
+        return value
+
+
+class FilesWrite(Args):
+    """Write a text file: `create` makes a new one (fails if one exists), `append` adds to the
+    end (or creates it). Never replaces what is there."""
+
+    path: str = Field(min_length=1, max_length=1024)
+    text: str = Field(min_length=1, max_length=200000)
+    mode: Literal["create", "append"] = "create"
+
+
+class FilesDelete(Args):
+    """Delete a file or folder: it goes to the Recycle Bin (it can be restored), and only once
+    the person has said yes."""
+
+    path: str = Field(min_length=1, max_length=1024)
+
+
 FILE_MODELS = {
     "notes.find": NotesFind,
     "notes.read": NotesRead,
@@ -99,7 +154,58 @@ FILE_MODELS = {
     "files.list": FilesList,
     "files.move": FilesMove,
     "files.backup": FilesBackup,
+    "files.read": FilesRead,
+    "files.find": FilesFind,
+    "files.copy": FilesCopy,
+    "files.write": FilesWrite,
+    "files.delete": FilesDelete,
 }
+
+TEXT_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".json",
+    ".log",
+    ".py",
+    ".js",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".html",
+    ".css",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".sql",
+    ".sh",
+    ".ps1",
+    ".bat",
+    ".java",
+    ".c",
+    ".cpp",
+    ".h",
+    ".cs",
+    ".go",
+    ".rs",
+    ".rb",
+}
+MAX_READ_BYTES = 20 * 1024**2
+
+
+def protected() -> list[Path]:
+    """Mavo's own data: its database, the sign-ins and keys it keeps. Never an agent's to read,
+    write or delete, whatever folder (or drive) the person allowed."""
+    places = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        places += [Path(local) / "dev.mavo.desktop", Path(local) / "Mavo"]
+    places.append(Path.home() / "AppData" / "Local" / "Mavo")
+    return [p.resolve() for p in places]
 
 
 def roots(rule) -> list[Path]:
@@ -116,6 +222,8 @@ def inside(path: str, rule, *, must_exist=True) -> Path:
     target = (raw if raw.is_absolute() else allowed[0] / raw).resolve(strict=False)
     if not any(target == root or target.is_relative_to(root) for root in allowed):
         raise ValueError("That path is outside the allowed folders")
+    if any(target == own or target.is_relative_to(own) for own in protected()):
+        raise ValueError("That is Mavo's own data: no agent may touch it")
     if must_exist and not target.exists():
         raise ValueError(f"Nothing at {target}")
     return target
@@ -274,6 +382,163 @@ def backup_folder(args, rule):
     return {"backup": str(target), "files": len(files), "bytes": target.stat().st_size}
 
 
+def read_file(args, rule):
+    target = inside(args["path"], rule)
+    if not target.is_file():
+        raise ValueError("That is a folder, not a file")
+    if target.stat().st_size > MAX_READ_BYTES:
+        raise ValueError("That file is too large to read (over 20 MB)")
+    suffix = target.suffix.lower()
+    if suffix in {".pdf", ".docx"}:
+        from mavo.knowledge_files import extract_text
+
+        text = extract_text(target)
+        if not text.strip():
+            raise ValueError("No text could be read from that file")
+    elif suffix in TEXT_SUFFIXES or not suffix:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    else:
+        raise ValueError(f"{suffix} files are not text Mavo can read")
+    start, size = args.get("start", 0), args.get("max_chars", 20000)
+    part = text[start : start + size]
+    return {
+        "path": str(target),
+        "text": part,
+        "characters": len(text),
+        "more": start + len(part) < len(text),
+        "untrusted": True,
+    }
+
+
+def find_files(args, rule):
+    places = [inside(args["folder"], rule)] if args.get("folder") else roots(rule)
+    words = [w for w in str(args.get("query") or "").lower().split() if w]
+    own = protected()
+    found, seen = [], 0
+    for place in places:
+        if not place.is_dir():
+            continue
+        for here, dirs, names in os.walk(place):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            if any(Path(here).resolve().is_relative_to(p) for p in own):
+                dirs[:] = []
+                continue
+            for name in names:
+                path = Path(here) / name
+                if not path.match(args.get("pattern", "*")):
+                    continue
+                seen += 1
+                if seen > MAX_SCAN * 4:
+                    break
+                hay = name.lower()
+                if words and not all(w in hay for w in words):
+                    if not args.get("in_text") or path.suffix.lower() not in TEXT_SUFFIXES:
+                        continue
+                    try:
+                        if path.stat().st_size > MAX_NOTE_BYTES:
+                            continue
+                        hay = path.read_text(encoding="utf-8", errors="ignore").lower()
+                    except OSError:
+                        continue
+                    if not all(w in hay for w in words):
+                        continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                found.append((stat.st_mtime, path, stat.st_size))
+    found.sort(key=lambda f: -f[0])
+    return {
+        "files": [
+            {
+                "path": str(p),
+                "name": p.name,
+                "bytes": size,
+                "changed": datetime.fromtimestamp(m).isoformat(timespec="minutes"),
+            }
+            for m, p, size in found[: args.get("limit", 25)]
+        ],
+        "looked_at": seen,
+        "untrusted": True,
+    }
+
+
+def copy_file(args, rule):
+    source = inside(args["source"], rule)
+    destination = inside(args["destination_folder"], rule, must_exist=False)
+    if destination.exists() and not destination.is_dir():
+        raise ValueError("The destination is a file, not a folder")
+    if source.is_dir() and (destination == source or destination.is_relative_to(source)):
+        raise ValueError("A folder cannot be copied into itself")
+    target = destination / (args.get("new_name") or source.name)
+    if target.exists():
+        raise ValueError(f"{target.name} already exists there. Nothing was copied.")
+    destination.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns(*SKIP_DIRS))
+    else:
+        shutil.copy2(source, target)
+    return {"copied": True, "from": str(source), "to": str(target)}
+
+
+def write_file(args, rule):
+    target = inside(args["path"], rule, must_exist=False)
+    mode = args.get("mode", "create")
+    if target.exists() and not target.is_file():
+        raise ValueError("That path is a folder")
+    if target.exists() and mode == "create":
+        raise ValueError("A file already exists there. Add to it (append), or choose another name.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a" if mode == "append" else "x", encoding="utf-8") as handle:
+        handle.write(args["text"])
+    return {"written": True, "mode": mode, "path": str(target)}
+
+
+def to_recycle_bin(path: Path) -> None:  # pragma: no cover - Windows' own Recycle Bin
+    """Sends a file or folder to the Recycle Bin, where the person can restore it."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FileOp(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", ctypes.c_uint16),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    fo_delete, allow_undo, no_confirm, silent, no_errors = 3, 0x40, 0x10, 0x4, 0x400
+    # The path list ends in two NULs: the string's own, and this one.
+    op = FileOp(
+        None,
+        fo_delete,
+        str(path) + chr(0),
+        None,
+        allow_undo | no_confirm | silent | no_errors,
+        False,
+        None,
+        None,
+    )
+    if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) or op.fAnyOperationsAborted:
+        raise ValueError("Windows could not move it to the Recycle Bin")
+
+
+def delete_file(args, rule):
+    target = inside(args["path"], rule)
+    if target in roots(rule):
+        raise ValueError("An allowed folder itself cannot be deleted")
+    if os.name != "nt":
+        raise ValueError("Deleting to the Recycle Bin needs Windows")
+    to_recycle_bin(target)
+    if target.exists():
+        raise ValueError("It is still there: Windows did not delete it")
+    return {"deleted": True, "path": str(target), "restorable": "from the Recycle Bin"}
+
+
 def perform(operation, args, rule):
     """Runs one notes or files action (blocking: call it off the event loop)."""
     if operation == "notes.find":
@@ -296,4 +561,14 @@ def perform(operation, args, rule):
         return move_file(args, rule)
     if operation == "files.backup":
         return backup_folder(args, rule)
+    if operation == "files.read":
+        return read_file(args, rule)
+    if operation == "files.find":
+        return find_files(args, rule)
+    if operation == "files.copy":
+        return copy_file(args, rule)
+    if operation == "files.write":
+        return write_file(args, rule)
+    if operation == "files.delete":
+        return delete_file(args, rule)
     raise ValueError("Unknown files action")

@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { cursorPosition, getCurrentWindow } from "@tauri-apps/api/window";
 import { ArrowUpRight, BellDot, BellOff, Bot, ChevronLeft, ChevronRight, CircleAlert, Power } from "lucide-react";
 import { CrewQuickList } from "../components/CrewQuickList";
-import { OPEN_CREW } from "../lib/openCrew";
+import { OPEN_CREW, OPEN_PAGE } from "../lib/openCrew";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { MUTE_CHOICES, countdown, useMute } from "../lib/mute";
@@ -18,7 +18,6 @@ function MavoMark() {
 
 type Status = { paused: boolean; running: number; pending: number; needs?: { id: string; name: string; reason: string }[]; working?: string[] };
 
-const PEEK_MS = 9000;
 
 /** The first thing an update says, as one plain line. */
 export function firstLine(message: string): string {
@@ -52,18 +51,29 @@ export function MissedList({ items, busy, error, onBack, onClear, onOpen }: {
 /** The desktop icon. Rest the pointer on it and a small menu opens: Open Mavo, Mute for a while,
  * or Quit (which stops everything). Click it to keep the menu open; drag it to move it. */
 export function StatusOverlay() {
+  const [missed, setMissed] = useState<Reminder[]>([]);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  // Keep one watcher mounted across pill/card/menu transitions. Remounting reset
+  // delivery IDs and could replay unread popups or starve later ones.
+  return <><ReminderWatcher onMissed={setMissed} onError={setDeliveryError} /><StatusOverlayContent missed={missed} setMissed={setMissed} deliveryError={deliveryError} /></>;
+}
+
+function StatusOverlayContent({ missed, setMissed, deliveryError }: {
+  missed: Reminder[]; setMissed: React.Dispatch<React.SetStateAction<Reminder[]>>; deliveryError: string | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [status, setStatus] = useState<Status | null>(null);
-  const [signedIn, setSignedIn] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [localError, setError] = useState<string | null>(null);
+  const error = deliveryError ?? localError;
   const [busy, setBusy] = useState(false);
   const [confirmQuit, setConfirmQuit] = useState(false);
   const [reminder, setReminder] = useState<Reminder | null>(null);
   const [voice, setVoice] = useState<"ready" | "speaking" | "unavailable">("ready");
   const [peek, setPeek] = useState(false);
+  const [reader, setReader] = useState(false);
+  const [resizing, setResizing] = useState(false);
   // Updates that came while the laptop was closed: kept here, not popped up one after another.
-  const [missed, setMissed] = useState<Reminder[]>([]);
   const [showMissed, setShowMissed] = useState(false);
   const [showCrew, setShowCrew] = useState(false); // the agents, as a list in the menu
   const opening = useRef(false); // a missed update opened from the list: straight to the card
@@ -76,9 +86,7 @@ export function StatusOverlay() {
 
   async function refresh() {
     try {
-      const session = await api.firebaseStatus();
-      setSignedIn(session.signed_in);
-      setStatus(session.signed_in ? await api.desktopStatus() : null);
+      setStatus(await api.desktopStatus());
       setError(null);
     } catch (e) { setError(e instanceof Error ? e.message : "Mavo is reconnecting."); }
   }
@@ -89,6 +97,7 @@ export function StatusOverlay() {
     function show(value: Reminder | null) {
       if (!active) return;
       setReminder(value);
+      setReader(false);
       if (value && opening.current) {
         opening.current = false;
         setExpanded(true); setPeek(false); setShowMissed(false); setError(null);
@@ -96,11 +105,11 @@ export function StatusOverlay() {
         return;
       }
       if (value) {
-        // It slides out of the icon as a one-line pill, then tucks back in, leaving the dot.
-        setExpanded(true); setPeek(true); setError(null);
-        void invoke("status_expanded", { expanded: true, peek: true }).catch(e => setError(String(e)));
+        // New work is readable immediately, including while the main app is open.
+        // Never silently tuck an unread report back into the orb after nine seconds.
+        setExpanded(true); setPeek(false); setError(null);
+        void invoke("status_expanded", { expanded: true, peek: false }).catch(e => setError(String(e)));
         window.clearTimeout(peekTimer.current);
-        peekTimer.current = window.setTimeout(() => hide.current(), PEEK_MS);
         if (value.kind !== "crew_update") speak(value.message, setVoice);
       }
     }
@@ -116,11 +125,30 @@ export function StatusOverlay() {
     window.clearTimeout(peekTimer.current);
     try {
       await invoke("status_expanded", { expanded: value, peek: false, missed: value && !!list, fan: false });
+      setReader(false);
       setPeek(false); setExpanded(value); setShowMissed(value && list === true); setShowCrew(value && list === "list");
       if (!value) { setPinned(false); setConfirmQuit(false); }
     }
     catch (e) { setError(String(e)); }
   }
+  async function setReading(value: boolean) {
+    if (resizing) return;
+    window.clearTimeout(peekTimer.current);
+    setResizing(true);
+    try {
+      await invoke("status_expanded", { expanded: true, peek: false, reader: value });
+      setReader(value); setPeek(false); setExpanded(true);
+    } catch (e) { setError(String(e)); }
+    finally { setResizing(false); }
+  }
+  useEffect(() => {
+    if (!reader) return;
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); void setReading(false); }
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [reader, resizing]);
   async function openMissed(item: Reminder) {
     opening.current = true;
     try { await invoke("show_reminder_overlay", { reminder: item }); setMissed(m => m.filter(r => r.id !== item.id)); }
@@ -152,6 +180,10 @@ export function StatusOverlay() {
   async function openCrewById(id: string) {
     try { localStorage.setItem(OPEN_CREW, JSON.stringify({ id, at: Date.now() })); } catch { /* Mavo still opens */ }
     try { await invoke("show_main", { activity: true }); } catch (e) { setError(String(e)); }
+  }
+  async function openPage(page: string) {
+    try { localStorage.setItem(OPEN_PAGE, JSON.stringify({ page, at: Date.now() })); } catch { /* Mavo still opens */ }
+    try { await invoke("show_main", { activity: false }); } catch (e) { setError(String(e)); }
   }
   async function openCrew() {
     if (!reminder?.crew_id) return;
@@ -213,7 +245,7 @@ export function StatusOverlay() {
   }, [expanded, reminder]);
 
   const working = status?.working ?? [];
-  const orbState = reminder ? "attention" : error || !signedIn ? "offline" : status?.paused ? "paused" : working.length ? "working" : (status?.running ?? 0) > 0 ? "running" : "idle";
+  const orbState = reminder ? "attention" : error ? "offline" : status?.paused ? "paused" : working.length ? "working" : (status?.running ?? 0) > 0 ? "running" : "idle";
   const minutes = Math.ceil(seconds / 60);
   const orb = <button className="status-orb" data-state={orbState} data-muted={muted}
     aria-label={muted ? `Mavo · muted, ${minutes} min left` : reminder ? "Mavo status · unread update" : "Mavo status"}
@@ -225,19 +257,19 @@ export function StatusOverlay() {
       : missed.length > 0 && !reminder ? <span className="orb-badge orb-missed" aria-hidden="true">{missed.length > 9 ? "9+" : missed.length}</span> : null}
   </button>;
 
-  if (expanded && showCrew && !reminder) return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}><ReminderWatcher onMissed={setMissed} />
+  if (expanded && showCrew && !reminder) return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}>
     <CrewQuickList onBack={() => void expand(true)} onOpen={crew => void openCrewById(crew.id)} />
     <div className="orb-foot"><span /><div className="orb-slot">{orb}</div></div>
   </div>;
 
-  if (expanded && showMissed && !reminder) return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}><ReminderWatcher onMissed={setMissed} />
+  if (expanded && showMissed && !reminder) return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}>
     <MissedList items={missed} busy={busy} error={error} onBack={() => void expand(true)} onClear={() => void clearMissed()} onOpen={item => void openMissed(item)} />
     <div className="orb-foot"><span /><div className="orb-slot">{orb}</div></div>
   </div>;
 
-  if (!expanded) return <div className="orb-stage" onPointerEnter={enter} onPointerLeave={leave}><ReminderWatcher onMissed={setMissed} />{orb}</div>;
+  if (!expanded) return <div className="orb-stage" onPointerEnter={enter} onPointerLeave={leave}>{orb}</div>;
 
-  if (reminder && peek) return <div className="pill-stage"><ReminderWatcher onMissed={setMissed} />
+  if (reminder && peek) return <div className="pill-stage">
     <button className="pill" aria-label={`${reminder.crew_name}: ${firstLine(reminder.message)}. Open`}
       onPointerEnter={() => { overPill.current = true; window.clearTimeout(peekTimer.current); }}
       onPointerLeave={() => { overPill.current = false; window.clearTimeout(peekTimer.current); peekTimer.current = window.setTimeout(() => hide.current(), 2500); }}
@@ -248,15 +280,16 @@ export function StatusOverlay() {
     </button>
   </div>;
 
-  if (reminder) return <div className="toast-stage"><ReminderWatcher onMissed={setMissed} /><section className="toast-shell">
-    <DesktopUpdateCard reminder={reminder} busy={busy} onDismiss={() => void dismiss()} onClose={() => void expand(false)} onOpen={() => void openCrew()} onSpeak={() => speak(reminder.message, setVoice)} />
+  if (reminder) return <div className="toast-stage" data-reader={reader}><section className="toast-shell">
+    <DesktopUpdateCard key={reminder.id} reminder={reminder} busy={busy} onDismiss={() => void dismiss()} onClose={() => void expand(false)} onOpen={() => void openCrew()} onSetupTelegram={() => void openPage("resources")} onSpeak={() => speak(reminder.message, setVoice)}
+      fullScreen={reader} resizing={resizing} onToggleFullScreen={() => void setReading(!reader)} />
     {(voice === "unavailable" || error) && <p role="alert" className="toast-error">{error ?? "Voice unavailable. Check Windows voices."}</p>}
   </section></div>;
 
-  const tone = error || !signedIn ? "off" : muted || status?.paused ? "warn" : working.length ? "busy" : (status?.running ?? 0) > 0 ? "good" : "off";
-  const headline = error ? "Reconnecting…" : !signedIn ? "Signed out" : muted ? `Muted · ${countdown(seconds)}` : status?.paused ? "Paused"
+  const tone = error ? "off" : muted || status?.paused ? "warn" : working.length ? "busy" : (status?.running ?? 0) > 0 ? "good" : "off";
+  const headline = error ? "Reconnecting…" : muted ? `Muted · ${countdown(seconds)}` : status?.paused ? "Paused"
     : working.length === 1 ? `${working[0]} is working` : working.length ? `${working.length} working` : `${status?.running ?? 0} running`;
-  return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}><ReminderWatcher onMissed={setMissed} />
+  return <div className="orb-menu-stage" onPointerEnter={enter} onPointerLeave={leave}>
     <OrbMenu headline={headline} tone={tone} running={status?.running ?? 0} missed={missed.length} pending={muted ? 0 : status?.pending ?? 0}
       needs={status?.needs} muted={muted} confirmQuit={confirmQuit}
       onOpen={() => { void invoke("show_main", { activity: false }); void expand(false); }}

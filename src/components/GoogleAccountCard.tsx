@@ -41,13 +41,13 @@ export function GoogleAccountCard() {
       <div className="flex items-center gap-3">
         <span className="crew-icon"><Workflow size={18} /></span>
         <div><h2 className="text-sm font-semibold">Google</h2>
-          <p className="mt-1 text-xs text-zinc-500">{connected ? google.status?.email : "Gmail, Calendar, Tasks, Drive and Contacts"}</p>
+          <p className="mt-1 text-xs text-zinc-500">{connected ? google.status?.email : "Gmail, Calendar, Tasks, Drive, Contacts and YouTube"}</p>
         </div>
       </div>
       <span className="badge" aria-label="Google connection status">{revoking ? "Disconnecting…" : !google.status ? "Checking…" : connected ? "Connected" : "Not connected"}</span>
     </div>
-    {connected && <details className="mt-4 text-xs" aria-label="Google access details">
-      <summary className="cursor-pointer text-zinc-300">{connected ? "What Mavo can access" : "What you’re connecting"}</summary>
+    <details className="mt-4 text-xs" aria-label="Google access details">
+      <summary className="cursor-pointer text-zinc-300">{connected ? "What Mavo can access" : "Review requested access"}</summary>
       {connected ? <ul className="mt-3 space-y-2 text-zinc-400">
         {capabilities.map(cap => <li key={cap}>{permissionLabels[cap] ?? cap}</li>)}
         {!capabilities.length && <li>No service permissions granted.</li>}
@@ -56,8 +56,9 @@ export function GoogleAccountCard() {
         <li>Calendar and Tasks — read, create, update and delete entries.</li>
         <li>Drive — file names, types and links only; no document contents or changes.</li>
         <li>Contacts — read saved names, email addresses and phone numbers.</li>
+        <li>YouTube — read subscriptions, their videos and your liked videos.</li>
       </ul>}
-    </details>}
+    </details>
     <div className="mt-5 flex items-center gap-2">
       {connected ? <button className="btn-secondary" disabled={busy || google.pending} onClick={() => void revoke()}>{revoking && <LoaderCircle size={14} className="animate-spin" />}Revoke access</button>
         : <button className="btn-primary" disabled={!google.status?.configured || busy || google.pending} onClick={() => void google.connect({ capabilities: Object.keys(permissionLabels) as GoogleCapability[] })}>

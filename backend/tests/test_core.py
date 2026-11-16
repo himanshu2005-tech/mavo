@@ -82,7 +82,9 @@ def test_proposal_null_optional_limits_use_bounded_application_defaults():
     _, parsed = parse_core_output(json.dumps({"reply": "Review", "crew_proposal": draft}))
     assert parsed is not None and parsed.daily_call_limit == 12
     assert parsed.review_interval_minutes == 30 and parsed.requested_google_resources == []
-    _, invalid = parse_core_output(
+    # A model's wild call count is clamped, not a reason to throw the proposal away
+    # (limits.py caps the real work).
+    _, clamped = parse_core_output(
         json.dumps(
             {
                 "reply": "Review",
@@ -93,7 +95,7 @@ def test_proposal_null_optional_limits_use_bounded_application_defaults():
             }
         )
     )
-    assert invalid is None
+    assert clamped is not None and clamped.daily_call_limit == 100
 
 
 def test_google_setup_and_resources_require_local_auth(client, auth):

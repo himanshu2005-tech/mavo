@@ -1,0 +1,63 @@
+.onboarding { height:100dvh; overflow:auto; display:grid; place-items:center; padding:24px; background:var(--background); color:var(--text); }
+.onboarding-shell { width:min(820px,100%); height:min(610px,calc(100dvh - 48px)); min-height:320px; display:grid; grid-template-columns:144px minmax(0,1fr); grid-template-rows:auto minmax(0,1fr) auto; grid-template-areas:"brand brand" "steps content" "footer footer"; border:1px solid var(--border); border-radius: 6px; background:var(--surface); overflow:hidden; box-shadow:0 12px 40px rgb(0 0 0 / .16); }
+.onboarding-brand { grid-area:brand; display:flex; align-items:center; gap:9px; padding:13px 18px; border-bottom:1px solid var(--border); }
+.onboarding-brand > span { display:grid; place-items:center; width:23px; height:23px; border:1px solid var(--border); border-radius: 6px; background:var(--background); font-size:12px; font-weight:600; }
+.onboarding-brand b { font-size:13px; font-weight:550; }
+.onboarding-brand button { margin-left:auto; }
+.onboarding-progress { grid-area:steps; display:flex; flex-direction:column; align-items:stretch; gap:5px; list-style:none; margin:0; padding:20px 12px; border-right:1px solid var(--border); background:var(--background); }
+.onboarding-progress li { display:flex; align-items:center; gap:8px; padding:8px; border-radius: 6px; font-size:12px; color:var(--faint); }
+.onboarding-progress li > span { display:grid; place-items:center; width:19px; height:19px; flex:none; border:1px solid var(--border); border-radius: 4px; font-size:10px; font-variant-numeric:tabular-nums; }
+.onboarding-progress li[aria-current=step] { color:var(--text); background:var(--fill-hover); }
+.onboarding-progress li[data-done=true] { color:var(--muted); }
+.onboarding-content { grid-area:content; min-width:0; overflow:auto; padding:26px; }
+.onboarding-intro { margin-bottom:24px; }
+.onboarding h1 { margin:0 0 9px; font-size:20px; line-height:1.3; letter-spacing:-.02em; font-weight:550; }
+.onboarding-intro > p { max-width:480px; color:var(--muted); font-size:12.5px; line-height:1.65; }
+.onboarding-principles { display:grid; margin-top:25px; }
+.onboarding-principles article { display:grid; grid-template-columns:22px minmax(0,1fr); column-gap:10px; row-gap:3px; padding:17px 0; }
+.onboarding-principles article + article { border-top:1px solid var(--border); }
+.onboarding-principles svg { grid-row:span 2; align-self:start; margin-top:2px; color:var(--muted); }
+.onboarding h2 { margin:0; font-size:13px; font-weight:550; }
+.onboarding-principles p,.onboarding-note { color:var(--faint); font-size:12px; line-height:1.6; }
+.onboarding-note { margin-top:14px; }
+.onboarding-routes { display:flex; flex-direction:column; }
+.onboarding-routes article { display:flex; align-items:center; gap:10px; padding:13px 0; border-bottom:1px solid var(--border); }
+.onboarding-routes article > div { flex:1; min-width:0; }
+.onboarding-routes article > svg { flex:none; color:var(--muted); }
+.onboarding-routes h2,.onboarding-routes p { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.onboarding-routes p { margin-top:3px; color:var(--faint); font-size:11.5px; }
+.onboarding-routes article > span { color:var(--muted); font-size:10.5px; }
+.onboarding-add { display:inline-flex; align-items:center; gap:6px; padding:8px 11px; border:1px solid var(--border); border-radius: 6px; margin:14px 0 0; font-size:12px; color:var(--text); background:var(--fill); }
+.onboarding-add:hover { background:var(--fill-hover); }
+.onboarding-footer { grid-area:footer; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 18px; border-top:1px solid var(--border); background:var(--surface); }
+.onboarding-footer > div { display:flex; gap:8px; align-items:center; }
+.onboarding-footer .onboarding-note { margin:0; font-size:11px; }
+.onboarding :is(.btn-primary,.btn-secondary,.btn-quiet) { min-height:30px; border-radius: 6px; font-size:12px; padding:6px 11px; }
+.onboarding :is(button,input,select):focus-visible { outline:2px solid var(--muted); outline-offset:2px; }
+.onboarding-loading { grid-area:content; padding:28px; display:flex; flex-direction:column; gap:14px; align-items:flex-start; }
+.onboarding-loading p,.onboarding-inline-status { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12px; line-height:1.6; }
+.onboarding-shell > .error-notice { grid-area:content; align-self:end; z-index:1; margin:12px 20px; background:var(--raised); }
+.onboarding-resources { display:grid; gap:20px; }
+.onboarding-resources .group-title { margin-bottom:8px; font-size:11px; }
+.onboarding-resources .tile-grid { display:flex; flex-direction:column; gap:0; }
+.onboarding-resources .tile-art { display:none; }
+.onboarding-resources .tile { min-height:0; background:transparent; box-shadow:none; border:0; border-bottom:1px solid var(--border); border-radius: 0; transform:none; }
+.onboarding-resources .tile-body { min-height:0; padding:12px 0; }
+.onboarding-resources .tile-body h3 { font-size:13px; }
+.onboarding-resources .tile-body p { font-size:11.5px; }
+.onboarding-resources .surface { border-radius: 4px; padding:14px; box-shadow:none; }
+.onboarding-resources .crew-icon { width:30px; height:30px; border-radius: 4px; }
+.onboarding .workspace-form { margin-top:15px; padding:15px; border-radius: 4px; }
+.onboarding .workspace-form > div:first-child > div > div { display:none; }
+.onboarding .workspace-form h2 { font-size:14px; }
+.onboarding .workspace-form .form-control { min-height:34px; font-size:12px; border-radius: 5px; }
+@media(max-width:620px) {
+  .onboarding { padding:12px; }
+  .onboarding-shell { height:calc(100dvh - 24px); grid-template-columns:minmax(0,1fr); grid-template-rows:auto auto minmax(0,1fr) auto; grid-template-areas:"brand" "steps" "content" "footer"; }
+  .onboarding-progress { flex-direction:row; padding:10px 12px; border-right:0; border-bottom:1px solid var(--border); gap:3px; }
+  .onboarding-progress li { gap:6px; padding:6px; font-size:11px; }
+  .onboarding-content { padding:22px 18px; }
+  .onboarding .workspace-form .grid { grid-template-columns:1fr; }
+  .onboarding-footer { padding:12px; }
+  .onboarding-footer > div { gap:4px; }
+}

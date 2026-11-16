@@ -50,6 +50,8 @@ def google_env(tmp_path):
             fields = parse_qs(request.content.decode())
             state["token_requests"].append(fields)
             if fields["grant_type"] == ["refresh_token"]:
+                if state.get("refresh_error"):
+                    return httpx.Response(400, json={"error": state["refresh_error"]})
                 return httpx.Response(200, json={"access_token": "new-access", "expires_in": 3600})
             flow = dict(auth.pending)
             if state.get("token_error"):
@@ -379,7 +381,21 @@ async def test_mail_worker_only_uses_matching_events_and_stops_after_revocation(
             )
         )
         session.commit()
-    router = Router()
+
+    class MailRouter(Router):
+        async def chat(self, *args, **kwargs):
+            data = json.loads(await super().chat(*args, **kwargs))
+            data["mail_decisions"] = [
+                {
+                    "message_id": "new",
+                    "important": False,
+                    "reason": "Fixture deadline reviewed",
+                    "summary": "No alert requested.",
+                }
+            ]
+            return json.dumps(data)
+
+    router = MailRouter(state="wait_for_next_review")
     runtime = CrewWorkerRuntime(factory, router, pool)
     await runtime.work("mail-crew")
     assert not router.calls
@@ -631,4 +647,23 @@ async def test_identity_time_allows_small_skew_but_rejects_large_offsets(
     else:
         assert auth.status()["error_code"] == "clock_skew"
         assert credentials.get("google-tokens") == before
+    await auth.close()
+
+
+@pytest.mark.asyncio
+async def test_an_ended_google_sign_in_says_reconnect_and_reconnecting_clears_it(google_env):
+    """Google ends a sign-in (an app in testing keeps one 7 days): every run then failed with
+    "Google's sign-in link expired or was used". It says so plainly, once, and the status asks
+    for a reconnect, which a new sign-in clears."""
+    auth, credentials, _, state = google_env
+    await complete(auth, ["gmail"])
+    tokens = json.loads(credentials.get("google-tokens"))
+    credentials.set("google-tokens", json.dumps({**tokens, "expires_at": 0}))
+    state["refresh_error"] = "invalid_grant"
+    with pytest.raises(GoogleConnectionError, match="Reconnect Google"):
+        await auth.access_token("gmail")
+    assert auth.status()["expired"] is True
+    state.pop("refresh_error")
+    await complete(auth, ["gmail"])
+    assert auth.status()["expired"] is False
     await auth.close()

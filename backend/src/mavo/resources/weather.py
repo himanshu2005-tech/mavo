@@ -37,8 +37,15 @@ class OpenMeteoWeatherAdapter:
                     "https://geocoding-api.open-meteo.com/v1/search", params=params
                 )
                 response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(
+                    payload.get("results", []), list
+                ):
+                    raise ValueError("Invalid location search response")
                 result = []
-                for place in response.json().get("results", []):
+                for place in payload.get("results", []):
+                    if not isinstance(place, dict):
+                        raise ValueError("Invalid location search item")
                     location = WeatherLocation(
                         id=place.get("id"),
                         name=place["name"],

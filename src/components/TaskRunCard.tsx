@@ -1,10 +1,14 @@
-import { Bot, Check, CircleAlert, Copy, ExternalLink, Folder, LoaderCircle, RotateCcw, Sparkles, Users, X } from "lucide-react";
-import { Report } from "./Report";
+import type { Thought } from "../types";
+import { ThoughtCard, isCard } from "./ThoughtCard";
+import { Bot, Check, CircleAlert, Copy, ExternalLink, Folder, LoaderCircle, RotateCcw, Sparkles, Trash2, Users, X } from "lucide-react";
+import { Report, withoutThinking } from "./Report";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { plainError } from "../lib/shownText";
+import { ReplayButton } from "./ReplayButton";
 import type { TaskRun, TaskStepView } from "../types";
 
-const KIND: Record<TaskStepView["kind"], string> = { helper: "Helper", agent: "Agent", crew: "Your Crew", automation: "Automation", skill: "Built-in" };
+const KIND: Record<TaskStepView["kind"], string> = { helper: "Helper", agent: "Agent", crew: "Your Crew", automation: "Automation", skill: "Built-in", read: "Read", act: "Action" };
 const WORD: Record<TaskRun["status"], string> = { running: "Working", done: "Done", needs_you: "Needs you", failed: "Could not finish", stopped: "Stopped" };
 
 function StepIcon({ step }: { step: TaskStepView }) {
@@ -54,18 +58,36 @@ function BuildResult({ build }: { build: Build }) {
 
 /** A one-time task in the chat: who is doing what, how far it is, and the result. Only what was
  *  asked for is shown as the result; the steps stay small underneath. */
-export function TaskRunCard({ run }: { run: TaskRun }) {
+/** `details`: shown under a result already on screen: only how it was done (steps, model calls,
+ *  replay), never the title, status or the result a second time. */
+/** What a step did that a person cares about: a page it read, a line like "Read 14 emails".
+ *  Never its working notes ("Goal", "Given", "Approach", quoting JSON). */
+export function shownThoughts(thinking?: Thought[]): Thought[] {
+  return (thinking ?? []).filter(t => t.tool !== "action" && (isCard(t) || (!t.label && !!t.text?.trim())));
+}
+
+export function TaskRunCard({ run, onDeleted, details = false }: { run: TaskRun; onDeleted?: (id: string) => void; details?: boolean }) {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [retried, setRetried] = useState(false);
+  const [deleted, setDeleted] = useState(false);
   const [answer, setAnswer] = useState("");
   const [answeredAt, setAnsweredAt] = useState<string | null>(null);
   const waiting = run.steps.find(s => s.status === "blocked");
   const asking = run.status === "running" ? run.steps.find(s => s.ask) : undefined;
   const sent = !!asking && answeredAt === (asking.asked_at ?? asking.ask);
   const canRetry = (run.status === "needs_you" || run.status === "failed" || run.status === "stopped") && !retried;
-  async function copy() { try { await navigator.clipboard.writeText(run.result ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1800); } catch { setError("Could not copy."); } }
+  useEffect(()=>{if(run.status==='running'){setRetried(false);setNote(null);}},[run.status]);
+  async function copy() { try { await navigator.clipboard.writeText(withoutThinking(run.result ?? "").trim()); setCopied(true); window.setTimeout(() => setCopied(false), 1800); } catch { setError("Could not copy."); } }
+  // Stopped, failed or finished: it can go. A running task is stopped first.
+  const canDelete = run.status === "done" || run.status === "failed" || run.status === "stopped";
+  async function remove() {
+    if (!window.confirm(`Delete "${run.title.replace(/^build:\s*/i, "")}"?`)) return;
+    setError(null);
+    try { await api.deleteTask(run.id); setDeleted(true); onDeleted?.(run.id); }
+    catch (e) { setError(e instanceof Error ? e.message : "Could not delete it."); }
+  }
   async function stop() { try { await api.stopTask(run.id); } catch (e) { setError(e instanceof Error ? e.message : "Could not stop it."); } }
   async function signIn() { setError(null); try { await api.browserSignIn(run.sign_in_url ?? ""); setNote("Sign in in the window that opened, then press Try again."); } catch (e) { setError(e instanceof Error ? e.message : "Could not open Mavo's browser."); } }
   async function reply(choice?: string) {
@@ -74,12 +96,13 @@ export function TaskRunCard({ run }: { run: TaskRun }) {
     setError(null);
     try { await api.answerTask(run.id, text, asking.id); setAnswer(""); setAnsweredAt(asking.asked_at ?? asking.ask ?? ""); } catch (e) { setError(e instanceof Error ? e.message : "Could not send your answer."); }
   }
-  async function again() { setError(null); try { await api.retryTask(run.id); setRetried(true); setNote("Started again below."); } catch (e) { setError(e instanceof Error ? e.message : "Could not start it again."); } }
-  return <section className="surface task-card" aria-label={"Task: " + run.title} data-status={run.status}>
-    <div className="flex items-start justify-between gap-3">
+  async function again() { setError(null); try { await api.retryTask(run.id); setRetried(true); setNote("Resuming this task. Completed steps are retained."); } catch (e) { setError(e instanceof Error ? e.message : "Could not resume this task."); } }
+  if (deleted) return null;
+  return <section className={"task-card" + (details ? " task-details" : " surface")} aria-label={"Task: " + run.title} data-status={run.status}>
+    {details ? <p className="text-xs text-zinc-500">{run.used_calls} of {run.budget_calls} model calls</p> : <div className="flex items-start justify-between gap-3">
       <div className="min-w-0"><h3 className="text-[15px] font-semibold tracking-[-0.01em]">{run.title}</h3><p className="mt-0.5 text-xs text-zinc-500">One-time task · {run.used_calls} of {run.budget_calls} model calls</p></div>
       <span className="chip" data-tone={run.status === "done" ? "on" : asking ? "limit" : run.status === "running" ? "info" : run.status === "needs_you" ? "limit" : "warn"}><i />{asking ? "Asks you" : WORD[run.status]}</span>
-    </div>
+    </div>}
     {asking && asking.choices?.length ? <form className="grid gap-2" aria-label="Your call" onSubmit={e => { e.preventDefault(); void reply(); }}>
       <p role="status" className="notice">{asking.ask}</p>
       <div className="flex flex-wrap items-center gap-2">{asking.choices.map((choice, i) =>
@@ -98,31 +121,44 @@ export function TaskRunCard({ run }: { run: TaskRun }) {
       </div>
       <p className="text-xs text-zinc-500">Your answer goes to the agent's model. Type passwords and codes in Mavo's browser instead.</p>
     </form>}
-    {run.status === "done" && run.result && (parseBuild(run.result)
+    {!details && run.status === "done" && run.result && (parseBuild(run.result)
       ? <BuildResult build={parseBuild(run.result)!} />
       : <div className="task-result"><div className="min-w-0 flex-1 break-words" aria-label="Result"><Report text={run.result} /></div><button className="btn-quiet !py-1" onClick={() => void copy()}><Copy size={12} />{copied ? "Copied" : "Copy"}</button></div>)}
     {run.status === "needs_you" && <p role="status" className="notice">{waiting?.question ?? run.error}</p>}
-    {(run.status === "failed" || run.status === "stopped") && run.error && <p role="status" className="notice error-notice">{run.error}</p>}
+    {(run.status === "failed" || run.status === "stopped") && run.error && <p role="status" className="notice error-notice">{plainError(run.error)}</p>}
+    {!!run.traces?.length && run.status !== "running" && <ReplayButton runId={run.id} steps={run.traces} />}
     <ol className="task-steps" aria-label="Steps">{run.steps.map(step => <li key={step.id} data-status={step.status} className="!block">
-      <div className="flex min-w-0 items-center gap-2.5"><span className="task-mark"><StepIcon step={step} /></span><span className="min-w-0 flex-1 truncate" title={step.title}>{step.title}</span><span className="task-kind"><KindIcon kind={step.kind} />{KIND[step.kind]}</span></div>
+      {/* What it did, in plain words; how (its kind, its model) only on hover. Its working notes
+          and the JSON between steps are never shown: only what it did that a person cares about
+          (a page it read, "Read 14 emails"). */}
+      <div className="flex min-w-0 items-center gap-2.5"><span className="task-mark"><StepIcon step={step} /></span><span className="min-w-0 flex-1 truncate" title={`${KIND[step.kind]}${step.model ? ` · ${step.model}` : ""}`}>{step.run_text || step.title}</span></div>
       {step.team?.length ? <div className="task-team" aria-label="The team">{step.team.map(name => <span key={name}>{name}</span>)}</div> : null}
-      {step.thinking?.length ? <details className="task-thought">
-        <summary>How it thought<span>{step.thinking.length} steps</span></summary>
-        <ol aria-label={"How " + step.title + " thought"}>{step.thinking.map((t, i) => <li key={i}><span className="thought-n">{i + 1}</span><p>{t.label && <b>{t.label}</b>}{t.text}</p></li>)}</ol>
-      </details> : null}
+      {shownThoughts(step.thinking).length ? <ol className="task-did" aria-label={"What " + (step.run_text || step.title) + " did"}>
+        {shownThoughts(step.thinking).map((t, i) => isCard(t) ? <li key={i}><ThoughtCard thought={t} /></li> : <li key={i} className="task-did-line">{t.text}</li>)}
+      </ol> : null}
     </li>)}</ol>
-    {run.status === "running" && <div><button className="btn-quiet !py-1" onClick={() => void stop()}>Stop</button></div>}
+    {run.steps.filter(s=>s.interrupted).map(step=><InterruptedCheckpoint key={step.id} runId={run.id} stepId={step.id} title={step.title}/>)}
+    {(run.status === "running"||run.status==='needs_you') && <div><button className="btn-quiet !py-1" onClick={() => void stop()}>Stop</button></div>}
     {canRetry && <div className="flex flex-wrap items-center gap-2">
       {run.status === "needs_you" && run.sign_in_url && <button className="btn-secondary !py-1" onClick={() => void signIn()}><ExternalLink size={12} />Sign in</button>}
-      <button className="btn-quiet !py-1" onClick={() => void again()}><RotateCcw size={12} />Try again</button>
+      <button className="btn-quiet !py-1" title="Resume unfinished work; completed steps are retained" disabled={run.steps.some(s=>s.interrupted)} onClick={() => void again()}><RotateCcw size={12} />Try again</button>
+      {canDelete && <button className="btn-quiet !py-1" onClick={() => void remove()}><Trash2 size={12} />Delete</button>}
       {run.status === "needs_you" && run.sign_in_url && <span className="text-xs text-zinc-500">{run.sign_in_url}</span>}
     </div>}
+    {canDelete && !canRetry && <div><button className="btn-quiet !py-1" onClick={() => void remove()}><Trash2 size={12} />Delete</button></div>}
     {note && <p role="status" className="text-xs leading-6 text-zinc-400">{note}</p>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
   </section>;
 }
 
 type Said = { role: string; created_at: string };
+function InterruptedCheckpoint({runId,stepId,title}:{runId:string;stepId:string;title:string}){
+  const [value,setValue]=useState(''),[busy,setBusy]=useState(false),[saved,setSaved]=useState(false),[error,setError]=useState<string|null>(null);
+  async function verify(){setBusy(true);setError(null);try{await api.verifyTaskCheckpoint(runId,stepId,value);setSaved(true);}catch(e){setError(String(e));}finally{setBusy(false);}}
+  return <form className="conversation-activity mt-3" onSubmit={e=>{e.preventDefault();void verify();}}><strong>Review interrupted work · {title}</strong><p>Actions may have happened before Mavo stopped. This step will not be replayed. Check its outcome in Actions, then record the result you verified, or stop the task.</p>
+    <textarea aria-label={`Verified result for ${title}`} className="form-control" value={value} maxLength={6000} disabled={busy||saved} onChange={e=>setValue(e.target.value)}/><button className="btn-secondary mt-2" disabled={busy||saved||!value.trim()}>{saved?'Checkpoint saved':'Save verified result'}</button>{error&&<p role="alert" className="notice error-notice">{error}</p>}
+  </form>;
+}
 type Setup = { status: string; created_at: string; updated_at: string };
 export type TimelineItem<M extends Said, C extends Setup = Setup> =
   | { kind: "message"; message: M; at: number }

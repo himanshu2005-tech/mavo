@@ -4,6 +4,8 @@ import { api } from "../lib/api";
 import { clockTime, parseTime } from "../lib/time";
 import type { CrewInstance } from "../types";
 import { triggerLine } from "./CrewCard";
+import { AgentBot } from "./AgentBot";
+import { identityColor, identityStyle } from "../lib/identityColors";
 import { runClock } from "../lib/runClock";
 import { limitOf } from "./LimitCard";
 
@@ -33,7 +35,6 @@ export function needsReason(crew: Pick<CrewInstance, "runtime_state" | "question
   if (crew.runtime_state === "needs_setup") return "Finish setting it up";
   if (crew.runtime_state === "budget_paused") return "Used today's AI calls; it carries on tomorrow";
   const limit = limitOf(crew as CrewInstance);
-  if (limit?.kind === "run") return `Needs more AI calls per run to finish (allow ${limit.suggested})`;
   if (limit?.kind === "day") return "Used today's AI calls; it carries on tomorrow";
   const text = (crew.runtime_state === "needs_input" ? crew.question : null) || crew.last_runtime_error || "";
   const line = text.split(/\r?\n/).map(l => l.trim()).find(Boolean) ?? "";
@@ -83,7 +84,7 @@ export function CrewQuickList({ onBack, onOpen, initial }: { onBack: () => void;
           const state = crew.runtime_state === "working" ? "working" : next.tone === "wait" ? "needs" : next.tone === "off" ? "stopped" : "running";
           return <li key={crew.id} className="dlist-row" data-state={state}>
             <button className="dlist-open" onClick={() => onOpen(crew)} title={`Open ${crew.name} in Mavo`}>
-              <span className="dlist-line"><i className="dlist-dot" /><b>{crew.name}</b></span>
+              <span className="dlist-line"><span className="dlist-bot" style={identityStyle(identityColor(`crew:${crew.id}`))} aria-hidden="true"><AgentBot seed={crew.id} state={state === "running" ? "ready" : state} /></span><b>{crew.name}</b></span>
               <span className="dlist-next" data-tone={next.tone} title={next.tone === "wait" ? needsReason(crew) : undefined}>{next.tone === "wait" ? needsReason(crew) : next.text}{clock ? ` · ${clock.every}` : ""}</span>
               {clock && <span className="dlist-bar" aria-hidden="true"><i style={{ width: `${clock.progress * 100}%` }} /></span>}
             </button>

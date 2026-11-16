@@ -59,6 +59,11 @@ def test_weather_setup_needs_both_global_and_crew_access_not_device_location(pla
     client.put("/api/v1/resources/access", headers=auth, json={"weather": True, "location": False})
     runtime.planner.next_reconcile = 0
     runtime.planner.reconcile_pending()
+    client.post(
+        f"/api/v1/crew/{crew['id']}/access",
+        headers=auth,
+        json={"route_id": route["id"], "weather": True},
+    )
     saved = client.get("/api/v1/crew", headers=auth).json()[0]
     assert saved["is_running"] and "device:read" not in saved["permissions"]
     client.put("/api/v1/resources/access", headers=auth, json={"weather": False})
@@ -90,6 +95,22 @@ def planning(client, auth):
     coordinator = Coordinator()
     runtime.coordinator = runtime.planner.coordinator = coordinator
     runtime.router.chat = AsyncMock(side_effect=AssertionError("Agent key used by coordinator"))
+
+    # Planner tests simulate execution verification; first_run tests exercise the real runner.
+    async def simulated_verification(runtime, crew_id):
+        with runtime.factory() as session:
+            crew = session.get(CrewInstance, crew_id)
+            record = {
+                "status": "passed",
+                "kind": "fixture",
+                "measured_calls": 0,
+                "message": "Simulated verification for planner-only tests",
+            }
+            crew.configuration_plan = {**crew.configuration_plan, "first_run": record}
+            session.commit()
+        return record
+
+    runtime.verify_first_run = simulated_verification
     return client, auth, runtime, coordinator
 
 
@@ -211,6 +232,7 @@ def test_access_save_and_connection_readiness_start_event_worker(planning, monke
     monkeypatch.setattr(runtime.planner.google, "status", lambda: {"capabilities": ["gmail:read"]})
     runtime.planner.next_reconcile = 0
     runtime.planner.reconcile_pending()
+    client.post(f"/api/v1/crew/{created['id']}/access", headers=auth, json=body)
     active = client.get("/api/v1/crew", headers=auth).json()[0]
     assert active["is_running"] and active["trigger_type"] == "gmail_message"
     assert active["schedule_time"] is None and active["configuration_plan"]["phase"] == "ready"
@@ -532,3 +554,20 @@ def test_a_job_now_can_come_with_the_crew_that_carry_it_on():
         CoordinatorDecision.model_validate(
             {"reply": "?", "task": task, "questions": ["Which one?"]}
         )
+
+
+def test_mavo_core_plans_when_the_persons_planning_connection_is_gone(planning):
+    """The person removed their models; the planning connection they had chosen went with them,
+    and every chat said "Choose a configured planning connection" though Mavo Core was there."""
+    from mavo.database import WorkspaceSetting
+
+    client, auth, runtime, coordinator = planning
+    with runtime.factory() as session:
+        session.add(WorkspaceSetting(key="planning-route", value={"route_id": "deleted-route"}))
+        session.commit()
+    status = client.get("/api/v1/core/status", headers=auth).json()
+    assert status["connected"] and status["model"] == "minimax-test" and not status["error"]
+    assert turn(planning, "Plan my day tomorrow.")["reply"] == "Hello"
+    assert len(coordinator.calls) == 1  # Mavo Core planned it
+    with runtime.factory() as session:
+        assert session.get(WorkspaceSetting, "planning-route") is None  # the stale choice is gone

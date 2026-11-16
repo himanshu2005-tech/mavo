@@ -65,15 +65,15 @@ describe("Mavo dark presentation", () => {
       }}} as unknown as CrewInstance;
     const card=renderToStaticMarkup(<CrewSetupCard crew={draft}/>);
     if(answered) {
-      expect(card).toContain("Agent connection");
-      expect(card).toContain("Resource access");
+      expect(card).toContain("Add a model");
+      expect(card).toContain("What it can read");
       expect(card).toContain("Read inbox headers");
-      expect(card).toContain("Add Crew");
+      expect(card).toContain("Test it");
       expect(card).not.toContain("Show important updates");
     } else {
       expect(card).toContain("What is the portal URL?");
-      expect(card).toContain("Connections and permissions come next.");
-      expect(card).not.toMatch(/Agent connection|Resource access|Read inbox headers|Add Crew|Show important updates|browser/);
+      expect(card).not.toContain("Connections and permissions come next.");
+      expect(card).not.toMatch(/Add a model|What it can read|Read inbox headers|Add Crew|Show important updates|browser/);
     }
   });
   it("offers explicit deletion and cancellation even for a running Crew", () => {

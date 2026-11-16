@@ -22,19 +22,30 @@ class FeedError(GoogleConnectionError):
 
 def safe_link(value):
     try:
-        uri = urlsplit(value)
-        if uri.scheme != "https" or not uri.hostname or uri.username or uri.password:
-            return ""
-        if uri.hostname == "localhost" or uri.hostname.endswith(
-            (".local", ".internal", ".localhost")
+        if (
+            not isinstance(value, str)
+            or len(value) > 2048
+            or any(c.isspace() or ord(c) < 32 for c in value)
         ):
             return ""
+        uri = urlsplit(value)
+        if (
+            uri.scheme != "https"
+            or not uri.hostname
+            or uri.username
+            or uri.password
+            or uri.port not in {None, 443}
+        ):
+            return ""
+        hostname = uri.hostname.rstrip(".")
+        if hostname == "localhost" or hostname.endswith((".local", ".internal", ".localhost")):
+            return ""
         try:
-            if not ipaddress.ip_address(uri.hostname).is_global:
+            if not ipaddress.ip_address(hostname).is_global:
                 return ""
         except ValueError:
             pass
-        return value[:2048]
+        return value
     except ValueError:
         return ""
 

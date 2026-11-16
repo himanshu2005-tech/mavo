@@ -19,6 +19,7 @@ def main():
         app = create_app(
             Settings(
                 _env_file=None,
+                recipes=False,  # the agent-per-run path this check covers
                 data_dir=Path(directory),
                 workers_enabled=False,
                 require_login=False,

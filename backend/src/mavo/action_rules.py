@@ -1,6 +1,8 @@
 """User-owned action policy. Models cannot create or change these settings."""
 
+import json
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -15,10 +17,33 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from sqlalchemy import func, select
 
 from mavo.connectors.catalog import ACTIONS, action_grant, provider_for
 from mavo.database import ActionRequest, CrewInstance, WorkspaceSetting, utcnow
 from mavo.projects import NEEDS_APPROVAL
+
+# Tools that only look: they change nothing, so redoing them is safe and they are not what an
+# agent "did" for the person.
+LOOKS_ONLY = frozenset(
+    {
+        "browser.open",
+        "browser.read",
+        "browser.search",
+        "browser.navigate",
+        "browser.scroll",
+        "browser.wait",
+        "browser.close",
+        "notes.find",
+        "notes.read",
+        "files.list",
+        "files.read",
+        "files.find",
+        "project.read",
+        "windows.list",
+    }
+)
+
 
 CATALOG = {
     **{op: (entry[2], entry[3], entry[4]) for op, entry in ACTIONS.items()},
@@ -44,6 +69,7 @@ CATALOG = {
     "browser.hover": ("Browser", "Hover over element", False),
     "browser.drag": ("Browser", "Drag and drop", True),
     "browser.fill": ("Browser", "Fill field", True),
+    "browser.upload": ("Browser", "Attach a saved file", True),
     "browser.select": ("Browser", "Choose an option", True),
     "browser.press": ("Browser", "Press a key", True),
     "browser.scroll": ("Browser", "Scroll", False),
@@ -66,7 +92,13 @@ CATALOG = {
     "files.list": ("Files", "List a folder", False),
     "files.move": ("Files", "Move or rename files (never overwrites)", True),
     "files.backup": ("Files", "Back up a folder as a zip", False),
+    "files.read": ("Files", "Read a file", False),
+    "files.find": ("Files", "Find files by name or text", False),
+    "files.copy": ("Files", "Copy files (never overwrites)", False),
+    "files.write": ("Files", "Write a file (new, or add to one)", True),
+    "files.delete": ("Files", "Delete files (to the Recycle Bin, asks first)", True),
     "helper.ask": ("Agents", "Ask a one-time helper agent", False),
+    "user.remind": ("You", "Remind you", False),
     "project.create": ("Projects", "Create a project folder", False),
     "project.write": ("Projects", "Write a file in a project", False),
     "project.read": ("Projects", "Read a project's files", False),
@@ -242,6 +274,15 @@ class ActionRules:
         return "action:" + (crew_id or "core") + ":" + operation
 
     def read(self, session, operation, crew_id=None):
+        if crew_id:
+            from mavo.crew_composition import execution_agent
+
+            owners = session.info.setdefault("agent_policy_owners", {})
+            if crew_id not in owners:
+                member = execution_agent(session, crew_id)
+                owners[crew_id] = member.crew_id if member else crew_id
+            # Parent ownership is immutable. Policies themselves are still read fresh below.
+            crew_id = owners[crew_id]
         saved = session.get(WorkspaceSetting, self.key(operation, crew_id))
         if saved:
             return saved.value
@@ -342,11 +383,120 @@ class ActionRules:
         rule = self.check(session, action)
         if not rule["enabled"]:
             return False
+        if action.approved_by != "user" and asks_first(session, action):
+            return False
+        if action.operation in ALWAYS_ASKS and action.approved_by != "user":
+            return False  # deleting waits for the person's OK, whatever its rule says
+        if action.approved_by not in {"user", "review"} and held_for_review(session, action):
+            return False
         if action.operation in NEEDS_APPROVAL:
             return action.approved_by == "user" or project_trusted(
                 session, action.arguments.get("project")
             )
+        if action.operation == "terminal.run" and action.arguments.get("shell"):
+            # Any command line runs on its own only when the safety reviewer allowed it; else
+            # the person decides (terminal_safety).
+            verdict = self.terminal_verdict(session, action.id)
+            return action.approved_by == "user" or bool(verdict and verdict["verdict"] == "allow")
         return True
+
+    def terminal_verdict(self, session, action_id):
+        from mavo.terminal_safety import saved
+
+        return saved(session, action_id)
+
+
+ASK_FIRST = 3  # actions the person approves before an agent added without a test runs alone
+
+
+def held_for_review(session, action) -> bool:
+    """A change by an agent whose work a reviewer checks waits for that review: made at once, a
+    closer's email went out before its reviewer could stop it (tasks.review releases it)."""
+    looks = action.operation in LOOKS_ONLY or action.operation.startswith("helper.")
+    if looks or not action.crew_id:
+        return False
+    crew = session.get(CrewInstance, action.crew_id)
+    return bool(crew and (crew.configuration_plan or {}).get("held_for_review"))
+
+
+# The words of a change, not what it changes: two versions of one reply differ in their body.
+WORDING = frozenset(
+    {
+        "body",
+        "description",
+        "summary",
+        "title",
+        "text",
+        "notes",
+        "message",
+        "content",
+        "html",
+        "label",
+    }
+)
+
+
+def same_change(operation, a: dict, b: dict, other_operation=None) -> bool:
+    """Two proposals that make one change twice: the same action on the same target (the same
+    thread, the same address and subject, the same time), however differently worded. An agent
+    proposed a booking and its reply, then again on its next turn, and its reviewer's pass made
+    both: two events and two replies."""
+    if other_operation is not None and other_operation != operation:
+        return False
+
+    def plain(value):
+        return json.dumps(value, sort_keys=True, default=str).casefold().strip()
+
+    shared = [k for k in a if k in b and k not in WORDING and a[k] not in (None, "", [], {})]
+    return bool(shared) and all(plain(a[k]) == plain(b[k]) for k in shared)
+
+
+def changes_things(crew, draft) -> bool:
+    """Can this agent (or one of its members) change something: send, create, move, click?
+    One that only reads and reports may skip its setup test with nothing more to it."""
+    operations = {a.operation for a in draft.requested_actions}
+    for agent in getattr(crew, "agents", None) or []:
+        if agent.status == "active":
+            operations |= set((agent.definition or {}).get("actions") or [])
+    return any(op not in LOOKS_ONLY and not op.startswith("helper.") for op in operations)
+
+
+# Changes that wait for the person's OK every time, whatever the rule: deleting files (to the
+# Recycle Bin, but still the person's to decide).
+ALWAYS_ASKS = frozenset({"files.delete"})
+
+
+def asks_first(session, action) -> bool:
+    """An agent turned on without its setup test asks before each change it makes, until the
+    person has approved ASK_FIRST of them: the test is where its mistakes were caught before
+    they reached anyone (times nobody offered, a reply to the wrong address)."""
+    if action.operation in ALWAYS_ASKS:
+        return True  # its Approve answers it, like any held change
+    looks = action.operation in LOOKS_ONLY or action.operation.startswith("helper.")
+    if looks or not action.crew_id:
+        return False
+    from mavo.crew_notes import owner
+
+    crew = session.get(CrewInstance, action.crew_id)
+    if crew is None:
+        return False
+    parent = owner(session, crew)
+    plan = parent.configuration_plan or {}
+    trial = plan.get("ask_first")
+    # Only when the person chose it: once a crew is set up and its actions allowed, it does not
+    # stop to ask while it runs (a crew waited on approvals nobody knew how to give).
+    if not trial or not plan.get("ask_first_choice"):
+        return False
+    workers = {parent.id, *[a.worker_id for a in parent.agents if a.worker_id]}
+    approved = session.scalar(
+        select(func.count(ActionRequest.id)).where(
+            ActionRequest.crew_id.in_(workers),
+            ActionRequest.approved_by == "user",
+            ActionRequest.status == "completed",
+            ActionRequest.created_at >= datetime.fromisoformat(trial["since"]),
+        )
+    )
+    return (approved or 0) < int(trial.get("count", ASK_FIRST))
 
 
 def needs_reason(crew) -> str:
@@ -570,6 +720,38 @@ def build_policy_api(engine, runtime):
 
     def restart_crew(crew):
         """New access means new work: what the Crew was doing under the old settings is stopped."""
+        if crew.configuration_plan.get("composition"):
+            from sqlalchemy import select
+            from sqlalchemy.orm import object_session
+
+            from mavo.database import CrewRun, TaskRun
+
+            session = object_session(crew)
+            blocked = session.scalar(
+                select(TaskRun.id).where(
+                    TaskRun.crew_id == crew.id,
+                    TaskRun.status == "needs_you",
+                )
+            )
+            workers = {crew.id, *[a.worker_id for a in crew.agents if a.worker_id]}
+            active = session.scalar(
+                select(CrewRun.id).where(
+                    CrewRun.crew_id.in_(workers),
+                    CrewRun.status == "running",
+                )
+            )
+            if blocked and not active:
+                # A missing-capability grant reuses the same task and completed checkpoints.
+                # Do not change its generation or start a second scheduled cycle.
+                crew.runtime_state, crew.next_run_at = "needs_input", None
+                return
+            from mavo.crew_workers import stop_crew
+
+            # Revocation/narrowing during work fences every member immediately. Resuming is
+            # explicit; a new policy must not silently replay earlier successful writes.
+            stop_crew(session, crew)
+            runtime.cancel(crew.id)
+            return
         crew.runtime_generation += 1
         runtime.cancel(crew.id)
         crew.runtime_state = "waiting" if crew.is_running else "stopped"

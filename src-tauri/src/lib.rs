@@ -142,6 +142,9 @@ struct ReminderPayload {
     task_run_id: Option<String>,
     #[serde(default)]
     task_step_id: Option<String>,
+    // An agent's question: the answers it offers, as buttons on the alert.
+    #[serde(default)]
+    choices: Vec<String>,
 }
 
 struct ReminderOverlayState {
@@ -222,26 +225,137 @@ fn open_google_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+fn report_url(value: &str) -> Result<tauri::Url, String> {
+    if value.len() > 8192
+        || value
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return Err("Invalid report source URL".into());
+    }
+    let parsed = tauri::Url::parse(value).map_err(|_| "Invalid report source URL")?;
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let local = host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".lan")
+        || !host.contains('.')
+        || host.starts_with('[')
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| {
+                ip.is_private()
+                    || ip.is_loopback()
+                    || ip.is_link_local()
+                    || ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.is_broadcast()
+            })
+            .unwrap_or(false);
+    if !matches!(parsed.scheme(), "https" | "http")
+        || host.is_empty()
+        || local
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some_and(|p| p != 80 && p != 443)
+    {
+        return Err("Only public HTTP(S) report sources can be opened".into());
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod report_url_tests {
+    use super::report_url;
+
+    #[test]
+    fn public_source_links_keep_the_observed_path_and_query() {
+        let value = "https://www.bbc.com/news/article?at_medium=RSS&at_campaign=news";
+        assert_eq!(report_url(value).unwrap().as_str(), value);
+    }
+
+    #[test]
+    fn sources_cannot_open_local_files_commands_or_private_services() {
+        for value in [
+            "file:///C:/secret",
+            "javascript:alert(1)",
+            "http://127.1/",
+            "http://10.0.0.1/",
+            "https://localhost/",
+            "http://[::1]/",
+            "https://user:pass@example.com/",
+            "https://example.com:9000",
+            "https://example.com/\\evil",
+            "https://example.com/\n",
+        ] {
+            assert!(report_url(value).is_err(), "Accepted {value}");
+        }
+    }
+}
+
+/// This opens a source only after a deliberate report-link click, never from a model action.
+#[tauri::command]
+fn open_report_url(url: String) -> Result<(), String> {
+    let parsed = report_url(&url)?;
+    #[cfg(target_os = "windows")]
+    Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", parsed.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|_| "Could not open the default browser")?;
+    #[cfg(not(target_os = "windows"))]
+    return Err("Report source opening is currently supported on Windows".into());
+    Ok(())
+}
+
 #[tauri::command]
 async fn show_reminder_overlay(
     app: tauri::AppHandle,
     state: State<'_, ReminderOverlayState>,
     reminder: ReminderPayload,
 ) -> Result<(), String> {
-    *state
-        .pending
-        .lock()
-        .map_err(|_| "Reminder state is unavailable")? = Some(reminder.clone());
     let window = app
         .get_webview_window("status")
         .ok_or("Status window unavailable")?;
-    // A new update arrives as a one-line pill beside the icon, not a window.
-    resize_status(&app, true, true, true, false, false, &app.state::<StatusWindowState>())?;
+    // Show the readable card immediately without taking keyboard focus. The
+    // main window being open must not turn an arrival into an unnoticed dot.
+    resize_status(
+        &app,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        &app.state::<StatusWindowState>(),
+    )?;
     window.show().map_err(|error| error.to_string())?;
+    // A failed resize/show must not leave a phantom pending popup that makes
+    // the delivery consumer believe the update was successfully displayed.
+    let previous = state
+        .pending
+        .lock()
+        .map_err(|_| "Reminder state is unavailable")?
+        .replace(reminder.clone());
     // Do not steal keyboard focus from the user's current application.
-    window
-        .emit("reminder-updated", &reminder)
-        .map_err(|error| error.to_string())?;
+    if let Err(error) = window.emit("reminder-updated", &reminder) {
+        let mut pending = state
+            .pending
+            .lock()
+            .map_err(|_| "Reminder state is unavailable")?;
+        if pending
+            .as_ref()
+            .is_some_and(|value| value.id == reminder.id)
+        {
+            *pending = previous;
+        }
+        return Err(error.to_string());
+    }
     Ok(())
 }
 
@@ -303,6 +417,7 @@ fn status_expanded(
     peek: Option<bool>,
     missed: Option<bool>,
     fan: Option<bool>,
+    reader: Option<bool>,
     state: State<'_, StatusWindowState>,
     reminders: State<'_, ReminderOverlayState>,
 ) -> Result<(), String> {
@@ -318,6 +433,7 @@ fn status_expanded(
         peek.unwrap_or(false),
         missed.unwrap_or(false),
         fan.unwrap_or(false),
+        reader.unwrap_or(false),
         &state,
     )
 }
@@ -329,13 +445,14 @@ fn resize_status(
     peek: bool,
     missed: bool,
     fan: bool,
+    reader: bool,
     state: &StatusWindowState,
 ) -> Result<(), String> {
     let window = app
         .get_webview_window("status")
         .ok_or("Status window unavailable")?;
-    let size = window.outer_size().map_err(|e| e.to_string())?;
-    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let mut size = window.outer_size().map_err(|e| e.to_string())?;
+    let mut position = window.outer_position().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let mut anchor = state
         .anchor
@@ -344,15 +461,53 @@ fn resize_status(
     if expanded && anchor.is_none() {
         *anchor = Some(position);
     }
+    let mut reader_restore = state
+        .reader_restore
+        .lock()
+        .map_err(|_| "Notification position unavailable")?;
+    if expanded && has_message && reader {
+        // Explicit reading mode fills this monitor's usable area, not other
+        // monitors or the taskbar. Preserve the compact geometry for restore.
+        let monitor = window
+            .current_monitor()
+            .map_err(|e| e.to_string())?
+            .or(window.primary_monitor().map_err(|e| e.to_string())?)
+            .ok_or("No display is available for the notification")?;
+        reader_restore.get_or_insert((position, size));
+        let area = *monitor.work_area();
+        window.set_size(area.size).map_err(|e| e.to_string())?;
+        window
+            .set_position(area.position)
+            .map_err(|e| e.to_string())?;
+        // Focus only on explicit expansion so Escape works. Arriving alerts
+        // still never steal focus from the person's current application.
+        if let Err(error) = window.set_focus() {
+            eprintln!("Could not focus notification reader: {error}");
+        }
+        return Ok(());
+    }
+    if let Some((previous_position, previous_size)) = *reader_restore {
+        window.set_size(previous_size).map_err(|e| e.to_string())?;
+        window
+            .set_position(previous_position)
+            .map_err(|e| e.to_string())?;
+        position = previous_position;
+        size = previous_size;
+        *reader_restore = None;
+    }
     if expanded && fan && !has_message {
         // The Crew spread over the whole screen (a hundred agents need the room): the window
         // covers the work area, above the taskbar; the page draws the icon where it was.
-        if let Some(monitor) = window.current_monitor().map_err(|e| e.to_string())?.or(
-            window.primary_monitor().map_err(|e| e.to_string())?,
-        ) {
+        if let Some(monitor) = window
+            .current_monitor()
+            .map_err(|e| e.to_string())?
+            .or(window.primary_monitor().map_err(|e| e.to_string())?)
+        {
             let area = *monitor.work_area();
             window.set_size(area.size).map_err(|e| e.to_string())?;
-            window.set_position(area.position).map_err(|e| e.to_string())?;
+            window
+                .set_position(area.position)
+                .map_err(|e| e.to_string())?;
             return Ok(());
         }
     }
@@ -397,6 +552,7 @@ fn resize_status(
 #[derive(Default)]
 struct StatusWindowState {
     anchor: Mutex<Option<tauri::PhysicalPosition<i32>>>,
+    reader_restore: Mutex<Option<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>)>>,
 }
 
 fn fit_status_position(
@@ -405,14 +561,26 @@ fn fit_status_position(
     area: tauri::PhysicalRect<i32, u32>,
     margin: i32,
 ) -> tauri::PhysicalPosition<i32> {
-    let left = area.position.x.saturating_add(margin);
-    let top = area.position.y.saturating_add(margin);
+    // A full-area reader must not be nudged eight pixels off screen by the
+    // ordinary orb's safety margin when Windows emits resize/move events.
+    let margin_x = if size.width >= area.size.width {
+        0
+    } else {
+        margin
+    };
+    let margin_y = if size.height >= area.size.height {
+        0
+    } else {
+        margin
+    };
+    let left = area.position.x.saturating_add(margin_x);
+    let top = area.position.y.saturating_add(margin_y);
     let right =
-        (area.position.x as i64 + area.size.width as i64 - size.width as i64 - margin as i64)
+        (area.position.x as i64 + area.size.width as i64 - size.width as i64 - margin_x as i64)
             .max(left as i64)
             .min(i32::MAX as i64) as i32;
     let bottom =
-        (area.position.y as i64 + area.size.height as i64 - size.height as i64 - margin as i64)
+        (area.position.y as i64 + area.size.height as i64 - size.height as i64 - margin_y as i64)
             .max(top as i64)
             .min(i32::MAX as i64) as i32;
     tauri::PhysicalPosition::new(position.x.clamp(left, right), position.y.clamp(top, bottom))
@@ -438,6 +606,28 @@ fn keep_status_visible(window: &tauri::WebviewWindow) -> tauri::Result<()> {
 mod status_position_tests {
     use super::fit_status_position;
     use tauri::{PhysicalPosition, PhysicalRect, PhysicalSize};
+
+    #[test]
+    fn full_area_reader_stays_inside_primary_and_negative_coordinate_monitors() {
+        for position in [
+            PhysicalPosition::new(0, 0),
+            PhysicalPosition::new(-1920, -200),
+        ] {
+            let area = PhysicalRect {
+                position,
+                size: PhysicalSize::new(1920, 1040),
+            };
+            assert_eq!(
+                fit_status_position(
+                    PhysicalPosition::new(position.x + 8, position.y + 8),
+                    area.size,
+                    area,
+                    8
+                ),
+                position
+            );
+        }
+    }
 
     #[test]
     fn panel_fits_at_every_screen_edge_and_above_the_taskbar() {
@@ -665,6 +855,16 @@ fn start_backend(app: &tauri::AppHandle) -> Result<BackendState, String> {
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .env("MAVO_API_TOKEN", &token)
         .env("MAVO_DATA_DIR", &app_data)
+        // Local publisher supervision is a development convenience only. Release
+        // apps use the configured hosted service and never carry its shared key.
+        .env(
+            "MAVO_DEV_MANAGE_CORE",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -704,6 +904,7 @@ pub fn run() {
             backend_config,
             open_google_url,
             open_github_url,
+            open_report_url,
             show_reminder_overlay,
             pending_reminder,
             close_reminder_overlay,

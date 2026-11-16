@@ -1,4 +1,5 @@
 import type { CrewInstance } from "../types";
+import { exampleConnectionKeys } from '../lib/exampleConnections';
 
 /** One thing an agent reads (a resource) or can do (an action), as the map shows it. */
 export interface Wire { key: string; label: string; icon: string; allowed: boolean; kind: "resource" | "action" }
@@ -37,7 +38,7 @@ const LOCAL_READS: Record<string, [string, string, string]> = {
 };
 // Browser actions that change a page (clicks, typing): "Act on <site>". Opening and reading a
 // site is reading it, so that site is a resource.
-const ACTING = new Set(["browser.click", "browser.double_click", "browser.fill", "browser.select", "browser.press", "browser.drag", "browser.hover"]);
+const ACTING = new Set(["browser.click", "browser.double_click", "browser.fill", "browser.upload", "browser.select", "browser.press", "browser.drag", "browser.hover"]);
 const READING = new Set(["browser.open", "browser.read", "browser.navigate", "browser.search", "browser.scroll", "browser.wait"]);
 
 /** The operations behind one action node ("Change calendar" is create, update and delete). */
@@ -58,7 +59,7 @@ function grantFor(op: string): string[] {
 
 /** What a Crew reads and what it can do, from what it was given (permissions) and what it asked
  *  for (its requested actions, with their sites). Asked for but not given: shown, not allowed. */
-export function wiring(crew: Pick<CrewInstance, "permissions" | "configuration_plan">): { reads: Wire[]; does: Wire[] } {
+export function wiring(crew: Pick<CrewInstance, "permissions" | "configuration_plan"> & Partial<Pick<CrewInstance,"name"|"responsibilities">>): { reads: Wire[]; does: Wire[] } {
   const perms = new Set(crew.permissions ?? []);
   const requested = (crew.configuration_plan?.draft?.requested_actions ?? []) as { operation: string; domains?: string[] }[];
   const reads = new Map<string, Wire>();
@@ -98,6 +99,33 @@ export function wiring(crew: Pick<CrewInstance, "permissions" | "configuration_p
       if (sites.length) { does.delete("web.act"); sites.forEach(s => act({ key: "act:" + s, label: "Act on " + s, icon: "click", allowed })); }
       else act({ key: "web.act", label: "Act on websites", icon: "click", allowed });
     } else if (ACTIONS[op]) act({ key: ACTIONS[op][0], label: ACTIONS[op][1], icon: ACTIONS[op][2], allowed });
+  }
+  // Show proposed reads as pending, not as granted. Previously only requested actions appeared,
+  // so an unconfigured Crew could look disconnected even after its planner identified resources.
+  const draft=crew.configuration_plan?.draft;
+  const proposals=new Set(exampleConnectionKeys(crew));
+  for (const service of draft?.requested_google_resources??[]) proposals.add(`google.${service}`);
+  for (const capability of draft?.requested_google_capabilities??[]) {
+    const [service,mode]=capability.split(':');
+    if ((mode==='read'||mode==='body')&&service in GOOGLE) proposals.add(`google.${service}`);
+  }
+  for (const capability of draft?.requested_connector_capabilities??[]) {
+    if (capability.startsWith('github:')) proposals.add('github');
+    if (capability.startsWith('feeds:')) proposals.add('feeds');
+  }
+  if (draft?.requested_device_metrics) proposals.add('device');
+  if (draft?.requested_weather) proposals.add('weather');
+  if (draft?.requested_notifications) proposals.add('notify');
+  const hints:Record<string,[string,string]>={device:['This computer','monitor'],weather:['Weather','weather'],
+    github:['GitHub','code'],feeds:['News feeds','rss'],web:['Websites','globe'],files:['Folders','files']};
+  for (const key of proposals) {
+    // Existing granted wires win; a catalog suggestion can never make allowed=true.
+    if (key==='notify') { if (!does.has(key)) act({key,label:'Desktop alerts',icon:'bell',allowed:false}); }
+    else if (!reads.has(key)) {
+      const service=key.startsWith('google.')?key.slice(7):'';
+      const hint=GOOGLE[service]??hints[key];
+      if (hint) read({key,label:hint[0],icon:hint[1],allowed:false});
+    }
   }
   return { reads: [...reads.values()], does: [...does.values()] };
 }

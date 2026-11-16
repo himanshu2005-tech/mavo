@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import secrets
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
@@ -61,6 +62,7 @@ Operation = Literal[
     "browser.hover",
     "browser.drag",
     "browser.fill",
+    "browser.upload",
     "browser.select",
     "browser.press",
     "browser.scroll",
@@ -83,16 +85,29 @@ Operation = Literal[
     "files.list",
     "files.move",
     "files.backup",
+    "files.read",
+    "files.find",
+    "files.copy",
+    "files.write",
+    "files.delete",
     "project.create",
     "project.write",
     "project.read",
     "project.run",
     "helper.ask",
+    "user.remind",
 ]
 
 
 class Arguments(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class RemindUser(Arguments):
+    """Tell the person something: Mavo sends it to their desktop and/or Telegram, as they
+    chose for this agent."""
+
+    message: str = Field(min_length=1, max_length=4000)
 
 
 class SendMail(Arguments):
@@ -125,6 +140,10 @@ class MailId(Arguments):
 
 
 class EventCreate(Arguments):
+    """Puts an event on the person's own calendar. It invites no one and sends no email: never
+    say an attendee was invited (a reply said "you are invited as an attendee" when nobody
+    was)."""
+
     summary: str = Field(min_length=1, max_length=500)
     start: datetime
     end: datetime
@@ -169,6 +188,7 @@ MODELS = {
     **FILE_MODELS,
     **PROJECT_MODELS,
     "helper.ask": HelperAsk,
+    "user.remind": RemindUser,
     **CONNECTOR_MODELS,
     "gmail.send": SendMail,
     "gmail.draft": SendMail,
@@ -196,9 +216,15 @@ class ActionDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
     operation: Operation
     arguments: dict = Field(default_factory=dict)
+    # What the person sees while it runs, in plain words ("Opening the credits page").
+    run_text: str | None = Field(default=None, max_length=80)
 
     @model_validator(mode="after")
     def validate_arguments(self, info: ValidationInfo):
+        allowed = (info.context or {}).get("allowed")
+        if allowed is not None and self.operation not in allowed:
+            # Refused by permission, never run: its details are not worth failing the reply over.
+            return self
         # The context carries files a reply gave beside its JSON (see ProjectWrite).
         self.arguments = (
             MODELS[self.operation]
@@ -209,7 +235,9 @@ class ActionDraft(BaseModel):
 
 
 class ActionPolicyError(RuntimeError):
-    pass
+    def __init__(self, message, *, missing=None):
+        super().__init__(message)
+        self.missing = missing
 
 
 class ActionRejected(ActionPolicyError):
@@ -243,6 +271,8 @@ def view(action):
 
 
 class GoogleActions:
+    first_run_preview_protocol = 2
+
     def __init__(self, pool):
         self.pool, self.auth, self.factory = pool, pool.auth, pool.factory
         self.models = MODELS
@@ -253,10 +283,15 @@ class GoogleActions:
 
     def available(self, session, crew_id=None):
         crew = session.get(CrewInstance, crew_id) if crew_id else None
+        from mavo.crew_composition import execution_agent
+
+        agent = execution_agent(session, crew_id) if crew_id else None
         result = {}
         if self.rules.paused(session):
             return result
         for operation, model in MODELS.items():
+            if agent and agent.definition and operation not in agent.definition.get("actions", []):
+                continue
             local = operation.split(".")[0] in LOCAL_SERVICES
             grant = action_grant(operation)
             if not local:
@@ -271,6 +306,35 @@ class GoogleActions:
         return result
 
     def check_actor(self, session, action):
+        if action.crew_id:
+            from mavo.crew_composition import validate_worker
+
+            worker = session.get(CrewInstance, action.crew_id)
+            if worker:
+                try:
+                    validate_worker(session, worker)
+                    from mavo.crew_composition import execution_agent
+
+                    agent = execution_agent(session, worker.id)
+                    if (
+                        agent
+                        and agent.definition
+                        and action.operation not in agent.definition.get("actions", [])
+                    ):
+                        raise ValueError("This action is outside the agent's restricted operations")
+                    if agent and action.operation == "helper.ask":
+                        parent = session.get(CrewInstance, agent.crew_id)
+                        limits = (
+                            (parent.configuration_plan or {})
+                            .get("composition", {})
+                            .get("limits", {})
+                        )
+                        if limits.get("delegation_depth", 0) < 1:
+                            raise ValueError(
+                                "This Crew's delegation limit does not allow temporary helpers"
+                            )
+                except ValueError as exc:
+                    raise ActionPolicyError(str(exc)) from exc
         if action.operation not in MODELS:
             raise ActionPolicyError("This action is no longer supported.")
         local = action.operation.split(".")[0] in LOCAL_SERVICES
@@ -300,6 +364,23 @@ class GoogleActions:
                     "Repository is outside the connection's selected repositories"
                 )
         if self.rules:
+            rule = self.rules.read(session, action.operation, action.crew_id)
+            crew = session.get(CrewInstance, action.crew_id) if action.crew_id else None
+            if crew and (
+                not rule["enabled"] or action_grant(action.operation) not in crew.permissions
+            ):
+                from mavo.orchestration import MissingCapability
+
+                raise ActionPolicyError(
+                    action.operation + " is disabled for this Crew",
+                    missing=MissingCapability(
+                        capability=action_grant(action.operation),
+                        operation=action.operation,
+                        setup="actions",
+                        risk="sensitive",
+                        explanation="Review this Crew's exact action scope for " + action.operation,
+                    ),
+                )
             try:
                 self.rules.check(session, action)
             except (ValueError, OSError) as exc:
@@ -356,13 +437,17 @@ class GoogleActions:
                 return view(existing)
             binding = None
             if draft.operation in NEEDS_APPROVAL and self.desktop and self.rules:
+                from mavo.verification_preview import verification_parent
+
+                testing = verification_parent(session, crew_id)
                 # What a person approves is exactly these scripts: remember their hash now.
-                try:
-                    binding = self.desktop.projects.binding(
-                        draft.arguments, self.rule_for(session, draft.operation, crew_id)
-                    )
-                except ValueError as exc:
-                    raise ActionSlip(str(exc)) from None
+                if not testing:
+                    try:
+                        binding = self.desktop.projects.binding(
+                            draft.arguments, self.rule_for(session, draft.operation, crew_id)
+                        )
+                    except ValueError as exc:
+                        raise ActionSlip(str(exc)) from None
             row = ActionRequest(
                 crew_id=crew_id,
                 source="crew" if crew_id else "user",
@@ -463,6 +548,16 @@ class GoogleActions:
     async def request(
         self, service, capability, method, path, payload=None, headers=None, action=None
     ):
+        if action and method.upper() not in {"GET", "HEAD"}:
+            from mavo.verification_preview import verification_parent
+
+            with self.factory() as session:
+                try:
+                    testing = verification_parent(session, action.crew_id)
+                except ValueError as exc:
+                    raise ActionPolicyError(str(exc)) from None
+                if testing:
+                    raise ActionPolicyError("Setup previews cannot write to external services")
         if getattr(self, "session_guard", None) and not self.session_guard():
             raise ActionPolicyError("Sign in to Mavo before applying changes")
         token = await self.auth.access_token(service, capability)
@@ -485,7 +580,81 @@ class GoogleActions:
             )
         return response
 
+    async def thread_answered(self, args, action) -> str | None:
+        """The conversation a "Re: ..." email answers, when the agent left out its thread: the
+        latest email from that address with that subject. A reply to an interview invitation
+        went out as a separate new email, because no agent had given its thread id."""
+        subject = str(args.get("subject") or "")
+        found = re.match(r"\s*(?:re\s*:\s*)+(.+)", subject, re.I)
+        address = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", str(args.get("to") or ""))
+        if not found or not address:
+            return None
+        original = found.group(1).strip().replace('"', "")
+        query = f'from:{address.group(0)} subject:"{original}"'
+        try:
+            response = await self.request(
+                "gmail",
+                "read",
+                "GET",
+                "/users/me/messages?maxResults=1&q=" + quote(query, safe=""),
+                action=action,
+            )
+        except GoogleConnectionError:
+            return None
+        if response.is_error:
+            return None
+        messages = response.json().get("messages") or []
+        return messages[0].get("threadId") if messages else None
+
+    async def reply_headers(self, args, action) -> tuple[str | None, str | None, str | None]:
+        """(thread id, In-Reply-To, References) for a reply, as Gmail threads it. Mavo reads the
+        thread's last message for its Message-ID: a draft carried the Gmail thread id as its
+        In-Reply-To and landed outside the conversation it answered. A thread Gmail does not
+        know gives a plain new draft, never a failed one."""
+        given = args.get("in_reply_to") or None
+        if given and not (given.startswith("<") and "@" in given and given.endswith(">")):
+            given = None  # not a Message-ID (a thread or message id from Gmail's API)
+        thread = args.get("thread_id") or await self.thread_answered(args, action)
+        if not thread:
+            return None, given, None
+        try:
+            found = await self.request(
+                "gmail",
+                "read",
+                "GET",
+                "/users/me/threads/"
+                + quote(thread, safe="")
+                + "?format=metadata&metadataHeaders=Message-ID&metadataHeaders=References",
+                action=action,
+            )
+        except GoogleConnectionError:
+            return thread, given, None
+        if found.status_code == 404:
+            return None, given, None
+        if found.is_error:
+            return thread, given, None
+        messages = found.json().get("messages") or []
+        last = messages[-1] if messages else {}
+        names = {
+            str(h.get("name", "")).casefold(): str(h.get("value", ""))
+            for h in (last.get("payload") or {}).get("headers") or []
+        }
+        message_id = names.get("message-id") or given
+        if not message_id or any(c in message_id for c in "\r\n"):
+            return thread, None, None
+        earlier = " ".join(names.get("references", "").split())
+        references = f"{earlier} {message_id}".strip()[:2000]
+        return thread, message_id, references
+
     async def perform(self, action):
+        from mavo.verification_preview import READ_ACTIONS, verification_parent
+
+        with self.factory() as session:
+            if (
+                verification_parent(session, action.crew_id)
+                and action.operation not in READ_ACTIONS
+            ):
+                raise ActionPolicyError("Setup previews cannot execute changes")
         service, verb = action.operation.split(".")
         if action.operation == "helper.ask":
             with self.factory() as session:
@@ -549,13 +718,14 @@ class GoogleActions:
                     args["subject"],
                 )
                 message["Message-ID"] = f"<mavo-{action.id}@local.mavo>"
-                if args.get("in_reply_to"):
-                    message["In-Reply-To"] = args["in_reply_to"]
-                    message["References"] = args["in_reply_to"]
+                thread_id, replying_to, references = await self.reply_headers(args, action)
+                if replying_to:
+                    message["In-Reply-To"] = replying_to
+                    message["References"] = references or replying_to
                 message.set_content(args["body"])
                 data = {"raw": base64.urlsafe_b64encode(message.as_bytes()).decode()}
-                if args.get("thread_id"):
-                    data["threadId"] = args["thread_id"]
+                if thread_id:
+                    data["threadId"] = thread_id
                 path = "/users/me/messages/send" if verb == "send" else "/users/me/drafts"
                 if verb == "draft":
                     data = {"message": data}
@@ -664,13 +834,118 @@ class GoogleActions:
             "verification": "provider_acknowledged" if service == "gmail" else "read_back_verified",
         }
 
+    async def review_terminal(self, action_id):
+        """The second agent's look at a command line, kept with the action. With no model
+        connection to review it, it waits for the person."""
+        from mavo.database import CrewInstance, ModelRoute
+        from mavo.terminal_safety import review, save
+
+        with self.factory() as session:
+            row = session.get(ActionRequest, action_id)
+            crew = session.get(CrewInstance, row.crew_id) if row.crew_id else None
+            from mavo.crew_notes import owner
+
+            visible = owner(session, crew) if crew else None
+            job = (visible.responsibilities if visible else "") + (
+                "\nThis agent's part: " + crew.responsibilities
+                if crew and visible is not crew
+                else ""
+            )
+            route = session.get(ModelRoute, crew.route_id) if crew and crew.route_id else None
+            args = dict(row.arguments)
+        chat = getattr(self, "chat", None)
+        if chat is None or route is None:
+            verdict = {
+                "verdict": "ask",
+                "reason": "No model connection to check this command.",
+                "by": "rules",
+            }
+            from mavo.terminal_safety import hard_stop
+
+            if stop := hard_stop(args["shell"]):
+                verdict["reason"] = f"This command {stop}."
+        else:
+            verdict = await review(chat, route, job, args["folder"], args["shell"])
+        with self.factory() as session:
+            save(session, action_id, verdict)
+            row = session.get(ActionRequest, action_id)
+            shown = args["shell"] if len(args["shell"]) <= 160 else args["shell"][:157] + "…"
+            row.target_summary = (
+                f"Run `{shown}` in {args['folder']}"
+                + ("" if verdict["verdict"] == "allow" else f". Safety check: {verdict['reason']}")
+            )[:500]
+            session.commit()
+        return verdict
+
+    async def busy(self, row) -> str | None:
+        """Why a new or moved event's time is not free, from the calendar itself (in a setup
+        test with a sample, the sample's calendar); None when it is free or cannot be read."""
+        if row.operation not in {"calendar.create", "calendar.update"}:
+            return None
+        from mavo.calendar_conflicts import busy_reason, clash
+        from mavo.database import CrewInstance
+        from mavo.first_run import sample_for
+        from mavo.verification_preview import verification_parent
+
+        with self.factory() as session:
+            crew = session.get(CrewInstance, row.crew_id) if row.crew_id else None
+            sample = sample_for(session, crew) if crew else {}
+            try:
+                testing = bool(verification_parent(session, row.crew_id))
+            except ValueError:
+                testing = True
+        items = sample.get("calendar") if "calendar" in sample else None
+        if items is None and testing:
+            return None  # a setup test asks Google for nothing; its own sample decides
+        if items is None:
+            try:
+                items = (await self.pool.read("calendar")).get("items") or []
+            except Exception:  # noqa: BLE001 — unreadable: the person's own rules still decide
+                return None
+        args = row.arguments or {}
+        hit = clash(items, args.get("start"), args.get("end"), args.get("item_id"))
+        return busy_reason(hit) if hit else None
+
     async def maybe_execute(self, action_id):
         with self.factory() as session:
             row = session.get(ActionRequest, action_id)
             if not row:
                 raise ActionPolicyError("Action not found")
             self.check_actor(session, row)
-            if row.status != "pending" or not self.rules or not self.rules.automatic(session, row):
+            if row.status != "pending":
+                return view(row)
+        # Never a busy time, whichever agent chose it: refused with the reason, so it picks
+        # another (a booker took the 11:00 the sender offered first though it was busy).
+        if reason := await self.busy(row):
+            with self.factory() as session:
+                session.execute(
+                    update(ActionRequest)
+                    .where(ActionRequest.id == action_id, ActionRequest.status == "pending")
+                    .values(status="blocked", error=reason, finished_at=utcnow())
+                )
+                session.commit()
+                return view(session.get(ActionRequest, action_id))
+        with self.factory() as session:
+            row = session.get(ActionRequest, action_id)
+            if row.status != "pending":
+                return view(row)
+            from mavo.verification_preview import preview_action
+
+            preview = preview_action(self, session, row)
+            if preview is not None:
+                return preview
+            unreviewed = (
+                row.operation == "terminal.run"
+                and row.arguments.get("shell")
+                and row.approved_by != "user"
+                and self.rules is not None
+                and self.rules.terminal_verdict(session, row.id) is None
+            )
+        if unreviewed:
+            await self.review_terminal(action_id)
+        with self.factory() as session:
+            row = session.get(ActionRequest, action_id)
+            if not self.rules or not self.rules.automatic(session, row):
                 return view(row)
         try:
             return await self.execute(action_id)
@@ -689,13 +964,18 @@ class GoogleActions:
             row = session.get(ActionRequest, action_id)
             if not row:
                 raise ActionPolicyError("Action not found")
-            if row.status == "completed":
+            if row.status in {"completed", "previewed"}:
                 return view(row)
             if row.status != "pending":
                 raise ActionPolicyError("This action cannot be retried. Check its outcome first.")
             self.check_actor(session, row)
             if row.created_at.replace(tzinfo=utcnow().tzinfo) < utcnow() - timedelta(days=1):
                 raise ActionPolicyError("This approval expired. Create a new action.")
+            from mavo.verification_preview import preview_action
+
+            preview = preview_action(self, session, row)
+            if preview is not None:
+                return preview
             if not self.rules or not self.rules.automatic(session, row):
                 raise ActionPolicyError("This action is not allowed by its access settings")
             local = row.operation.split(".")[0] in LOCAL_SERVICES
@@ -756,11 +1036,28 @@ class GoogleActions:
             return view(row)
 
 
+def settle_alerts(session, action_id: str) -> None:
+    """Once the person answered a change, its "Waiting for your OK" alert goes: it kept coming
+    back after they had dealt with it."""
+    from mavo.database import ReminderEvent
+
+    session.execute(
+        update(ReminderEvent)
+        .where(
+            ReminderEvent.deduplication_key == f"approval:{action_id}",
+            ReminderEvent.status == "pending",
+        )
+        .values(status="dismissed", dismissed_at=utcnow())
+    )
+
+
 def build_actions_api(actions, get_session):
     router = APIRouter()
 
     @router.get("/actions")
     def listing():
+        from mavo.verification_preview import private_verification_owner
+
         with actions.factory() as session:
             session.execute(
                 update(ActionRequest)
@@ -776,6 +1073,7 @@ def build_actions_api(actions, get_session):
                 for a in session.scalars(
                     select(ActionRequest).order_by(ActionRequest.created_at.desc()).limit(100)
                 )
+                if not private_verification_owner(session, a.crew_id)
             ]
 
     @router.post("/actions", status_code=201)
@@ -792,6 +1090,41 @@ def build_actions_api(actions, get_session):
         approves these exact scripts (by their hash), once, and may mark the project trusted."""
         with actions.factory() as session:
             row = session.get(ActionRequest, action_id)
+            if row and row.operation == "terminal.run" and row.arguments.get("shell"):
+                # A command the safety check held for the person: they approve this exact
+                # command in this exact folder.
+                from mavo.terminal_safety import binding
+
+                if row.status != "pending" or row.approved_by == "user":
+                    raise HTTPException(409, "This request is no longer waiting for approval")
+                if payload is None or payload.sha256 != binding(row.arguments):
+                    raise HTTPException(409, "The command changed. Review it again.")
+                try:
+                    actions.check_actor(session, row)
+                except ActionPolicyError as exc:
+                    raise HTTPException(409, str(exc)) from None
+                row.approved_by = "user"
+                settle_alerts(session, action_id)  # answered: its alert goes
+                session.commit()
+                actions.start(actions.run_approved(action_id))
+                return {"status": "approved"}
+            if row and row.operation not in NEEDS_APPROVAL and row.status == "pending":
+                # A change held while a new crew asks before its first few (asks_first): the
+                # person's OK is all it needs; their rules and checks still apply as it runs.
+                # Without this, nothing could approve it and the crew waited for good.
+                from mavo.action_rules import asks_first
+
+                if row.approved_by == "user" or not asks_first(session, row):
+                    raise HTTPException(409, "This request is not waiting for your OK")
+                try:
+                    actions.check_actor(session, row)
+                except ActionPolicyError as exc:
+                    raise HTTPException(409, str(exc)) from None
+                row.approved_by = "user"
+                settle_alerts(session, action_id)
+                session.commit()
+                actions.start(actions.run_approved(action_id))
+                return {"status": "approved"}
             if not row or row.operation not in NEEDS_APPROVAL:
                 raise HTTPException(
                     410, "Per-action approval is retired. Configure access in Actions."
@@ -816,6 +1149,7 @@ def build_actions_api(actions, get_session):
             if payload.automation and actions.automations:
                 actions.automations.save(session, row, payload.automation, payload.sha256)
             row.approved_by = "user"
+            settle_alerts(session, action_id)  # answered: its alert goes
             session.commit()
         actions.start(actions.run_approved(action_id))
         return {"status": "approved"}
@@ -829,7 +1163,8 @@ def build_actions_api(actions, get_session):
                 .where(ActionRequest.id == action_id, ActionRequest.status == "pending")
                 .values(status="rejected", finished_at=utcnow())
             )
-            if changed.rowcount == 1 and row and row.operation in NEEDS_APPROVAL:
+            if changed.rowcount == 1 and row:
+                settle_alerts(session, action_id)
                 actions.wake_crew(session, row.crew_id)  # it learns the answer was no
             session.commit()
             if changed.rowcount != 1:
@@ -838,8 +1173,35 @@ def build_actions_api(actions, get_session):
 
     @router.get("/projects/approvals")
     def waiting_runs():
-        """Script runs waiting for the person, each with the scripts they would be approving."""
+        """Script runs and held commands waiting for the person, each shown in full."""
+        from mavo.terminal_safety import binding, saved
+
         with actions.factory() as session:
+            commands = []
+            for row in session.scalars(
+                select(ActionRequest)
+                .where(ActionRequest.operation == "terminal.run", ActionRequest.status == "pending")
+                .order_by(ActionRequest.created_at)
+            ):
+                verdict = saved(session, row.id)
+                if row.approved_by == "user" or not row.arguments.get("shell") or not verdict:
+                    continue  # not yet reviewed, or already approved and running
+                commands.append(
+                    {
+                        "id": row.id,
+                        "kind": "command",
+                        "crew_id": row.crew_id,
+                        "crew_name": row.crew_name,
+                        "created_at": row.created_at,
+                        "sha256": binding(row.arguments),
+                        "changed": False,
+                        "trusted": False,
+                        "project": "",
+                        "command": row.arguments["shell"],
+                        "folder": row.arguments["folder"],
+                        "reason": verdict.get("reason"),
+                    }
+                )
             rows = session.scalars(
                 select(ActionRequest)
                 .where(
@@ -874,7 +1236,7 @@ def build_actions_api(actions, get_session):
                         **shown,
                     }
                 )
-            return result
+            return commands + result
 
     @router.get("/projects")
     def project_list():

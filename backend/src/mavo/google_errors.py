@@ -11,7 +11,7 @@ MESSAGES = {
     ),
     "consent_denied": "Google access was not approved. Check the test-user account and try again.",
     "invalid_client": "Google rejected the client ID or secret. Check Desktop app credentials.",
-    "invalid_grant": "Google's sign-in link expired or was used. Start a new connection.",
+    "invalid_grant": "Google access expired. Reconnect Google to carry on.",
     "redirect_uri_mismatch": "Use a Google Desktop app client with loopback redirect support.",
     "invalid_scope": "Google rejected a requested permission. Check the app's Google scope setup.",
     "access_denied": "Google blocked access. Check test users and Google account policies.",

@@ -8,8 +8,11 @@ from tests.test_tasks import setup
 
 
 def test_an_agent_always_has_room_to_finish_what_it_starts():
+    from mavo.limits import RUN_MAX
+
     assert MIN_CALLS_PER_RUN == 2
-    assert [per_run_calls(CrewInstance(max_model_calls=n)) for n in (1, 2, 5)] == [2, 2, 5]
+    # A crew's own small number no longer limits a run: Mavo's one ceiling does.
+    assert [per_run_calls(CrewInstance(max_model_calls=n)) for n in (1, 2, 5)] == [RUN_MAX] * 3
 
 
 def test_the_limit_messages_are_plain_and_carry_the_fix():
@@ -132,7 +135,8 @@ class KeepsAsking(Router):
 
 
 @pytest.mark.asyncio
-async def test_a_run_that_needs_more_steps_carries_on_until_the_persons_allowance(factory):
+async def test_a_run_that_needs_more_steps_carries_on_until_the_ceiling(factory, monkeypatch):
+    monkeypatch.setattr("mavo.limits.RUN_MAX", 4)  # Mavo's run ceiling, small for the test
     add_crew(
         factory,
         permissions=["model:invoke", "weather:read"],
@@ -151,19 +155,15 @@ async def test_a_run_that_needs_more_steps_carries_on_until_the_persons_allowanc
     await runtime.work("crew")
     with factory() as session:
         crew = session.get(CrewInstance, "crew")
-        # Its own two calls used, 4 allowed: it carries on in a fresh run, nobody is asked.
+        # Its own two calls used, ceiling 4: it carries on in a fresh run, nobody is asked.
         assert crew.runtime_state == "waiting" and crew.question is None and crew.limit is None
         assert crew.observation["automation_steps"] == 2
     await runtime.work("crew")
     with factory() as session:
         crew = session.get(CrewInstance, "crew")
         assert sum(r.model_calls for r in session.scalars(select(CrewRun))) == 4
-        # Now the person's allowance (4) is really used: said plainly, with a fix that helps.
-        assert crew.runtime_state == "needs_input" and crew.limit == {
-            "kind": "run",
-            "current": 4,
-            "suggested": 6,
-        }
+        # At the ceiling it finishes with what it found: no number for the person to raise.
+        assert crew.runtime_state == "waiting" and crew.limit is None and crew.question is None
     assert len(router.calls) == 4
 
 

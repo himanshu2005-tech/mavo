@@ -20,10 +20,57 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import AliasChoices, Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from mavo.coordinator_contract import GatewayTurn, coordinator_prompt, parse_decision
+from mavo.coordinator_contract import (
+    GatewayTurn,
+    clarification_from_invalid,
+    coordinator_prompt,
+    draft_refinement_hint,
+    parse_decision,
+)
+from mavo.core_errors import CoreHTTPError, core_error_response
 from mavo.credentials import DpapiCredentialStore
+from mavo.workflow_write import WorkflowRequest, workflow_messages
 
 logger = logging.getLogger("mavo.publisher")
+
+# Only publisher-owned validation messages may enter diagnostic logs/storage.
+# Do not persist model output, validation inputs or arbitrary exception strings.
+VALIDATION_REASONS = {
+    "Daily reminders deliver text only; use reviews for AI tools",
+    "Daily reminder triggers cannot mix with other trigger types",
+    "Multiple daily AI review times are not supported; use one review time",
+    "Daily reminder triggers require Schedule Crew",
+    "Crew requests more than the supported action count",
+    "Agent requested an unsupported capability",
+    "Agent requested an unsupported action",
+    "Agent action set is unsupported or exceeds its operation limit",
+    "Agent capability set exceeds its limit",
+    "Agent keys must be unique and within the Crew limit",
+    "Lead must belong to this Crew",
+    "Agent dependency does not exist or references itself",
+    "Review a configuration change separately from executing work",
+    "A task runs now: it cannot also delegate, change a Crew or ask a question",
+    "Use either one proposal or a batch, not both",
+    "Ask questions first; propose a Crew batch once they are answered",
+    "Batch proposals create new Crew; refine existing Crew one at a time",
+    "Delegation needs an instruction and cannot also create a Crew",
+}
+
+
+def validation_issues(error):
+    if not isinstance(error, ValidationError):
+        return []
+    result = []
+    for issue in error.errors(include_input=False)[:8]:
+        reason = issue["msg"].removeprefix("Value error, ")
+        result.append(
+            {
+                "path": list(issue["loc"]),
+                "type": issue["type"],
+                "reason": reason if reason in VALIDATION_REASONS else None,
+            }
+        )
+    return result
 
 
 class GatewaySettings(BaseSettings):
@@ -36,14 +83,23 @@ class GatewaySettings(BaseSettings):
     )
     data_dir: Path = Path("publisher/data")
     firebase_project_id: str = Field(min_length=6, max_length=64)
-    api_key: SecretStr | None = Field(default=None, repr=False, exclude=True)
+    # Mavo Core's own model key. MAVO_CORE_API_KEY is the name in publisher/.env; read only
+    # under the prefixed name, the key there was ignored for an older stored one.
+    api_key: SecretStr | None = Field(
+        default=None,
+        repr=False,
+        exclude=True,
+        validation_alias=AliasChoices("MAVO_PUBLISHER_API_KEY", "MAVO_CORE_API_KEY", "api_key"),
+    )
     model: str = "minimax/minimax-m3.1-flash"
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
     # 0 means no limit (the default while Mavo is being built); set a number to cap turns.
     user_daily_limit: int = Field(default=0, ge=0, le=10000)
     global_daily_limit: int = Field(default=0, ge=0, le=100000)
     user_minute_limit: int = Field(default=0, ge=0, le=1000)
-    max_output_tokens: int = Field(default=4096, ge=512, le=8192)
+    # Room for a whole crew design: each agent's instructions now say what it does in its edge
+    # cases, and a design cut off at 4096 tokens was refused as "truncated".
+    max_output_tokens: int = Field(default=8192, ge=512, le=16000)
     max_concurrency: int = Field(default=4, ge=1, le=32)
     google_client_id: str | None = Field(
         default=None,
@@ -129,6 +185,38 @@ class FirebaseVerifier:
             raise HTTPException(503, "Account verification is temporarily unavailable.") from None
 
 
+PROVIDER_URL = "https://api.airouter.in/v1/chat/completions"
+streams: set = set()  # streamed turns, kept until they end even if the app stops listening
+
+
+async def streamed(client, headers: dict, body: dict, on_text) -> tuple[str, str | None]:
+    """One provider reply, streamed: the "reply" field's text goes to on_text as it arrives."""
+    from mavo.reply_stream import Relay
+
+    relay, finish = Relay(on_text), None
+    async with client.stream(
+        "POST", PROVIDER_URL, headers=headers, json={**body, "stream": True}
+    ) as response:
+        if response.status_code >= 400:
+            await response.aread()
+            response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                choice = (json.loads(data).get("choices") or [{}])[0]
+            except (ValueError, AttributeError, IndexError):
+                continue
+            finish = choice.get("finish_reason") or finish
+            content = (choice.get("delta") or {}).get("content")
+            if content:
+                relay.feed(content)
+    return relay.raw, finish
+
+
 def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     database = settings.data_dir / "gateway.db"
@@ -162,6 +250,7 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
         lifespan=lifespan,
     )
     app.state.verifier = identity
+    app.add_exception_handler(CoreHTTPError, core_error_response)
     from mavo.publisher_oauth import install_google_token_broker
 
     install_google_token_broker(app, settings, database, transport)
@@ -179,12 +268,138 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
 
     @app.post("/v1/core/turn")
     async def turn(payload: GatewayTurn, authorization: str = Header(default="")):
+        return await handle(payload, authorization)
+
+    @app.post("/v1/core/workflow")
+    async def workflow(payload: WorkflowRequest, authorization: str = Header(default="")):
+        """Mavo Core writes an agent's workflow (workflow_write.py): the app checks it, tests
+        it on its scenarios, and asks again with what was wrong. The prompt is built here."""
         if not authorization.startswith("Bearer ") or len(authorization) > 12000:
-            raise HTTPException(401, "Mavo account sign-in is required.")
-        uid = hashlib.sha256((await identity.verify(authorization[7:])).encode()).hexdigest()
+            raise CoreHTTPError(401, "core_sign_in_required", payload.request_id)
+        try:
+            subject = await identity.verify(authorization[7:])
+        except HTTPException as exc:
+            raise CoreHTTPError(
+                exc.status_code,
+                "core_sign_in_required" if exc.status_code == 401 else "core_identity_unavailable",
+                payload.request_id,
+            ) from None
+        uid = hashlib.sha256(subject.encode()).hexdigest()
         credential = key()
         if not credential:
-            raise HTTPException(503, "Mavo Core is not configured by the publisher yet.")
+            raise CoreHTTPError(503, "core_not_configured", payload.request_id)
+        now = time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        with sqlite3.connect(database, timeout=10) as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM turns WHERE day=? AND uid=?", (day, uid)
+            ).fetchone()[0]
+            recent = db.execute(
+                "SELECT COUNT(*) FROM turns WHERE uid=? AND created>?", (uid, now - 60)
+            ).fetchone()[0]
+            if (settings.user_daily_limit and count >= settings.user_daily_limit) or (
+                settings.user_minute_limit and recent >= settings.user_minute_limit
+            ):
+                raise CoreHTTPError(429, "core_usage_limit", payload.request_id)
+            # counted with the person's turns; never answered twice for one request id
+            if db.execute("SELECT 1 FROM turns WHERE id=?", (payload.request_id,)).fetchone():
+                raise CoreHTTPError(409, "core_request_conflict", payload.request_id)
+            db.execute(
+                "INSERT INTO turns VALUES (?,?,?,?,?,?,?,?)",
+                (payload.request_id, uid, "workflow", day, "complete", None, now + 600, now),
+            )
+            db.commit()
+        body = {
+            "model": settings.model,
+            "messages": workflow_messages(payload),
+            "max_tokens": 16000,  # a whole path and its scenarios
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": settings.reasoning_effort,
+        }
+        headers = {"Authorization": "Bearer " + credential}
+        try:
+            async with asyncio.timeout(290), semaphore:
+                async with httpx.AsyncClient(
+                    transport=transport, timeout=httpx.Timeout(285, connect=15)
+                ) as client:
+                    response = await client.post(PROVIDER_URL, headers=headers, json=body)
+                    response.raise_for_status()
+                    choice = response.json()["choices"][0]
+        except TimeoutError:
+            raise CoreHTTPError(504, "core_timeout", payload.request_id) from None
+        except httpx.HTTPStatusError as exc:
+            # The provider's own reason, for the publisher's log; never sent to the app.
+            logger.warning(
+                "Workflow request %s: provider answered %s: %s",
+                payload.request_id,
+                exc.response.status_code,
+                exc.response.text[:300],
+            )
+            raise CoreHTTPError(502, "core_gateway_failed", payload.request_id) from None
+        except (httpx.HTTPError, KeyError, TypeError, IndexError, ValueError) as exc:
+            logger.warning("Workflow request %s failed: %r", payload.request_id, exc)
+            raise CoreHTTPError(502, "core_bad_response", payload.request_id) from None
+        raw = (choice.get("message") or {}).get("content")
+        if choice.get("finish_reason") == "length":
+            raise CoreHTTPError(502, "core_truncated_response", payload.request_id)
+        if not isinstance(raw, str) or not raw.strip():
+            raise CoreHTTPError(502, "core_empty_response", payload.request_id)
+        return {"text": raw, "model": settings.model}
+
+    @app.post("/v1/core/turn/stream")
+    async def turn_stream(payload: GatewayTurn, authorization: str = Header(default="")):
+        """The same turn, streamed: {type: reply, text} while the model writes the reply, then
+        {type: done, result} (what /v1/core/turn returns) or {type: error, status, error}."""
+        from fastapi.responses import StreamingResponse
+
+        from mavo.reply_stream import sse
+
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def work():
+            try:
+                result = await handle(
+                    payload,
+                    authorization,
+                    lambda text: queue.put_nowait({"type": "reply", "text": text}),
+                )
+                queue.put_nowait({"type": "done", "result": result})
+            except CoreHTTPError as exc:
+                queue.put_nowait({"type": "error", "status": exc.status_code, "error": exc.problem})
+            except Exception:
+                logger.exception("Streamed coordinator turn failed")
+                failure = CoreHTTPError(502, "core_gateway_failed", payload.request_id)
+                queue.put_nowait({"type": "error", "status": 502, "error": failure.problem})
+
+        job = asyncio.create_task(work())
+        streams.add(job)
+        job.add_done_callback(streams.discard)
+
+        async def events():
+            while True:
+                event = await queue.get()
+                yield sse(event)
+                if event["type"] != "reply":
+                    break
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    async def handle(payload: GatewayTurn, authorization: str, on_text=None):
+        if not authorization.startswith("Bearer ") or len(authorization) > 12000:
+            raise CoreHTTPError(401, "core_sign_in_required", payload.request_id)
+        try:
+            subject = await identity.verify(authorization[7:])
+        except HTTPException as exc:
+            raise CoreHTTPError(
+                exc.status_code,
+                "core_sign_in_required" if exc.status_code == 401 else "core_identity_unavailable",
+                payload.request_id,
+            ) from None
+        uid = hashlib.sha256(subject.encode()).hexdigest()
+        credential = key()
+        if not credential:
+            raise CoreHTTPError(503, "core_not_configured", payload.request_id)
         fingerprint = hashlib.sha256(payload.model_dump_json().encode()).hexdigest()
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -196,13 +411,17 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
             ).fetchone()
             if old:
                 if old[0] != uid or old[1] != fingerprint:
-                    raise HTTPException(409, "This request ID belongs to another turn.")
+                    raise CoreHTTPError(409, "core_request_conflict", payload.request_id)
                 if old[2] == "complete" and old[4] > now:
                     return json.loads(old[3])
-                raise HTTPException(
-                    409,
-                    "This turn is already reserved. Use a new request after checking its outcome.",
-                )
+                if old[2] == "failed":
+                    saved = json.loads(old[3]) if old[3] else {}
+                    raise CoreHTTPError(
+                        409,
+                        saved.get("error", {}).get("code", "core_gateway_failed"),
+                        payload.request_id,
+                    )
+                raise CoreHTTPError(409, "core_request_pending", payload.request_id)
             count = db.execute(
                 "SELECT COUNT(*) FROM turns WHERE day=? AND uid=?", (day, uid)
             ).fetchone()[0]
@@ -219,9 +438,7 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
                 or over(total, settings.global_daily_limit)
                 or over(recent, settings.user_minute_limit)
             ):
-                raise HTTPException(
-                    429, "Mavo Core's usage limit has been reached. Try again later."
-                )
+                raise CoreHTTPError(429, "core_usage_limit", payload.request_id)
             db.execute(
                 "INSERT INTO turns VALUES (?,?,?,?,?,?,?,?)",
                 (payload.request_id, uid, fingerprint, day, "working", None, now + 600, now),
@@ -238,33 +455,56 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
                 async with httpx.AsyncClient(
                     transport=transport, timeout=httpx.Timeout(185, connect=15)
                 ) as client:
-                    # One repair, like a Crew's own model gets: a reply that does not match the
-                    # response schema is shown what was wrong and asked to correct it.
-                    for attempt in range(2):
-                        response = await client.post(
-                            "https://api.airouter.in/v1/chat/completions",
-                            headers={
-                                "Authorization": "Bearer " + credential,
-                                "Idempotency-Key": hashlib.sha256(
-                                    (uid + payload.request_id + str(attempt)).encode()
-                                ).hexdigest(),
-                            },
-                            json={
-                                "model": settings.model,
-                                "messages": messages,
-                                "max_tokens": settings.max_output_tokens,
-                                "temperature": 0.2,
-                                "response_format": {"type": "json_object"},
-                                "reasoning_effort": settings.reasoning_effort,
-                            },
-                        )
-                        response.raise_for_status()
-                        raw = response.json()["choices"][0]["message"]["content"]
+                    # Two repairs, each shown exactly what was wrong: with one, a design whose
+                    # format was fixed still lacked a reviewer, and the chat said Core could not
+                    # answer for a plan one step from done.
+                    for attempt in range(3):
+                        headers = {
+                            "Authorization": "Bearer " + credential,
+                            "Idempotency-Key": hashlib.sha256(
+                                (uid + payload.request_id + str(attempt)).encode()
+                            ).hexdigest(),
+                        }
+                        body = {
+                            "model": settings.model,
+                            "messages": messages,
+                            "max_tokens": settings.max_output_tokens,
+                            "temperature": 0.2,
+                            "response_format": {"type": "json_object"},
+                            "reasoning_effort": settings.reasoning_effort,
+                        }
+                        if on_text and not attempt:
+                            # The first answer streams to the chat; a repair does not.
+                            raw, finish = await streamed(client, headers, body, on_text)
+                        else:
+                            response = await client.post(PROVIDER_URL, headers=headers, json=body)
+                            response.raise_for_status()
+                            envelope = response.json()
+                            try:
+                                choice = envelope["choices"][0]
+                                raw = choice["message"].get("content")
+                                finish = choice.get("finish_reason")
+                            except (KeyError, TypeError, IndexError, AttributeError):
+                                raise CoreHTTPError(
+                                    502, "core_bad_response", payload.request_id
+                                ) from None
+                        if finish == "length":
+                            raise CoreHTTPError(502, "core_truncated_response", payload.request_id)
+                        if not isinstance(raw, str) or not raw.strip():
+                            raise CoreHTTPError(502, "core_empty_response", payload.request_id)
                         try:
                             decision = parse_decision(raw)
                             break
                         except (ValidationError, ValueError) as invalid:
-                            if attempt:
+                            if attempt == 2:
+                                decision = clarification_from_invalid(raw, payload.context)
+                                if decision is not None:
+                                    logger.warning(
+                                        "Rejected setup operations; retained validated "
+                                        "clarification reference=%s",
+                                        payload.request_id,
+                                    )
+                                    break
                                 raise
                             logger.warning("Coordinator reply invalid; asking for a correction")
                             messages = [
@@ -274,7 +514,8 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
                                     "role": "user",
                                     "content": "That reply was not valid for the response "
                                     f"schema ({describe(invalid)}). Reply again with ONLY the "
-                                    "corrected JSON object.",
+                                    "corrected JSON object.\n"
+                                    + draft_refinement_hint(payload.context),
                                 },
                             ]
             if decision.delegate_to and decision.delegate_to not in {
@@ -307,31 +548,61 @@ def create_gateway(settings: GatewaySettings, transport=None, verifier=None):
                 )
                 db.commit()
             return result
-        except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, TimeoutError) as exc:
+        except (
+            CoreHTTPError,
+            httpx.HTTPError,
+            ValueError,
+            KeyError,
+            TypeError,
+            IndexError,
+            TimeoutError,
+        ) as exc:
             if isinstance(exc, ValidationError):
                 logger.warning(
                     "Coordinator response schema rejected: %s",
-                    [
-                        (e["loc"], e["type"], e["msg"][:200])
-                        for e in exc.errors(include_input=False)
-                    ],
+                    validation_issues(exc),
                 )
             elif isinstance(exc, httpx.HTTPStatusError):
                 logger.warning("Coordinator provider HTTP %s", exc.response.status_code)
             else:
-                logger.warning(
-                    "Coordinator turn failed (%s): %s", type(exc).__name__, str(exc)[:200]
-                )
+                logger.warning("Coordinator turn failed (%s)", type(exc).__name__)
+            if isinstance(exc, CoreHTTPError):
+                failure = exc
+            elif isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+                failure = CoreHTTPError(504, "core_timeout", payload.request_id)
+            elif isinstance(exc, httpx.HTTPStatusError):
+                upstream = exc.response.status_code
+                code = {
+                    400: "core_provider_request",
+                    422: "core_provider_request",
+                    401: "core_provider_key",
+                    403: "core_provider_key",
+                    402: "core_provider_credits",
+                    404: "core_model_unavailable",
+                    429: "core_provider_rate_limit",
+                }.get(upstream, "core_provider_unavailable")
+                failure = CoreHTTPError(429 if upstream == 429 else 503, code, payload.request_id)
+            elif isinstance(exc, httpx.HTTPError):
+                failure = CoreHTTPError(503, "core_provider_unavailable", payload.request_id)
+            else:
+                failure = CoreHTTPError(502, "core_invalid_response", payload.request_id)
+            logger.warning(
+                "Coordinator failure code=%s reference=%s",
+                failure.problem["code"],
+                payload.request_id,
+            )
             with sqlite3.connect(database) as db:
-                db.execute("UPDATE turns SET state='failed' WHERE id=?", (payload.request_id,))
+                db.execute(
+                    "UPDATE turns SET state='failed',response=? WHERE id=?",
+                    (
+                        json.dumps(
+                            {"error": failure.problem, "validation_issues": validation_issues(exc)}
+                        ),
+                        payload.request_id,
+                    ),
+                )
                 db.commit()
-            if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
-                raise HTTPException(
-                    504, "Mavo Core's model took too long. Your saved Crew is unchanged. Try again."
-                ) from None
-            raise HTTPException(
-                502, "Mavo Core could not produce a valid response. Your agents are unaffected."
-            ) from None
+            raise failure from None
 
     return app
 

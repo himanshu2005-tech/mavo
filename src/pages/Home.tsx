@@ -1,8 +1,12 @@
-import { Boxes, CalendarClock, Cloud, Cpu, History, ListChecks, MessageCircle, PanelRightClose, Search, Settings, X, Zap, type LucideIcon } from "lucide-react";
+import { BookOpen, Boxes, Brain as BrainIcon, CalendarClock, Cloud, Cpu, History, ListChecks, Map as MapIcon, MessageCircle, MessageSquare, PanelRightClose, Search, Settings, X, Zap, type LucideIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "motion/react";
 import { AgentGraph, agentState, useGraphModel, type Brain, type Selection } from "../components/AgentGraph";
 import { needsReason } from "../components/CrewQuickList";
 import { AgentPanel, MePanel, NodePanel } from "../components/GraphPanels";
+import { MemberPanel } from '../components/CrewMembers';
+import { AgentTraffic, useAgentMessages } from '../components/AgentTraffic';
+import {connectionInventory} from '../lib/connectionInventory';
 import { Brand } from "../components/Brand";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { PageHeader } from "../components/PageHeader";
@@ -12,10 +16,16 @@ import { identityColor, identityStyle } from "../lib/identityColors";
 import { routeAvailability, usesModel } from "../lib/modelMap";
 import { OPEN_CREW, takeOpenCrew } from "../lib/openCrew";
 import { useAppStore } from "../store/app";
-import type { CrewInstance, MemoryFact, NavId, TaskRun } from "../types";
+import type { CrewInstance, MemoryFact, NavId, TaskRun,PoolResource } from "../types";
 import { taskOnMap, visibleTasks, type TaskOnMap } from "../lib/taskTeams";
+import { watchRun } from "../lib/runOutcome";
+
+
 import { TaskRunCard } from "../components/TaskRunCard";
+import { Rooms } from "../components/Rooms";
 import { ActionsPage } from "./ActionsPage";
+import { LibraryPage } from "./LibraryPage";
+import { KnowledgePage } from "./KnowledgePage";
 import { ChatPage } from "./ChatPage";
 import { AgentInbox } from "../components/AgentInbox";
 import { ActivityView } from "./EmptyPages";
@@ -29,10 +39,38 @@ export function Home({ previewTasks }: { previewTasks?: TaskRun[] } = {}) {
   const { crew, setupDrafts, page, chatOpen, focusAgent, statusError,execution,executionError } = useAppStore();
   const setPage = useAppStore(s => s.setPage);
   const [selection, setSelection] = useState<Selection>(null);
+  // Rooms (a list of your agents and a timeline for each) or the map, the overview. Remembered.
+  const [view, setViewState] = useState<"rooms" | "map">(() => { try { return localStorage.getItem("mavo-view") === "map" ? "map" : "rooms"; } catch { return "rooms"; } });
+  const setView = (next: "rooms" | "map") => { setViewState(next); try { localStorage.setItem("mavo-view", next); } catch { /* for now only */ } };
+  const messages=useAgentMessages();
+  const [poolResources,setPoolResources]=useState<PoolResource[]>([]);
+  const [connectionsLoading,setConnectionsLoading]=useState(true);
+  const [connectionsError,setConnectionsError]=useState<string|null>(null);
+  useEffect(()=>{
+    let live=true,inFlight=false;
+    const epoch=useAppStore.getState().workspaceEpoch;
+    const refresh=async()=>{
+      if(inFlight||document.hidden)return;inFlight=true;
+      const current=()=>live&&epoch===useAppStore.getState().workspaceEpoch;
+      const results=await Promise.allSettled([api.routes(),api.pool()]);
+      if(current()){
+        if(results[0].status==='fulfilled')useAppStore.getState().setRoutes(results[0].value);
+        if(results[1].status==='fulfilled')setPoolResources(results[1].value.resources??[]);
+        setConnectionsError(results.some(r=>r.status==='rejected')?'Could not refresh connections. Saved entries may be out of date.':null);
+        setConnectionsLoading(false);
+      }
+      inFlight=false;
+    };
+    void refresh();const timer=window.setInterval(()=>void refresh(),10000);
+    const focus=()=>void refresh();window.addEventListener('focus',focus);
+    return()=>{live=false;window.clearInterval(timer);window.removeEventListener('focus',focus);};
+  },[page]);
+  const inventory=useMemo(()=>connectionInventory(poolResources),[poolResources]);
   const [query, setQuery] = useState("");
   const [me, setMe] = useState("You");
   const [memory, setMemory] = useState<MemoryFact[]>([]);
   const [runError, setRunError] = useState<string | null>(null);
+  const [runNote, setRunNote] = useState<string | null>(null);
   // One-time tasks (a build, a research job) as temporary teams on the map: looked at often while
   // one works, now and then otherwise.
   const [taskRuns, setTaskRuns] = useState<TaskRun[]>([]);
@@ -49,11 +87,15 @@ export function Home({ previewTasks }: { previewTasks?: TaskRun[] } = {}) {
   }, [previewTasks]);
   const tasks = useMemo(() => visibleTasks(taskRuns).map(taskOnMap), [taskRuns]);
   // "Run now" on an agent's clock: the same as Check now in its panel.
+  // It then says how the run ended ("checked: nothing new", or what it did), so it never looks
+  // like nothing happened.
   const runNow = async (id: string) => {
+    const agent = crew.find(c => c.id === id);
     try { useAppStore.getState().upsertCrew(await api.checkCrew(id)); setRunError(null); }
-    catch (reason) { setRunError(reason instanceof Error ? reason.message : "Could not run it."); window.setTimeout(() => setRunError(null), 6000); }
+    catch (reason) { setRunError(reason instanceof Error ? reason.message : "Could not run it."); window.setTimeout(() => setRunError(null), 6000); return; }
+    void watchRun(id, agent?.name ?? "The agent", agent?.trigger_type, setRunNote);
   };
-  const model = useGraphModel(crew, setupDrafts);
+  const model = useGraphModel(crew, setupDrafts,inventory);
   const routes = useAppStore(s => s.routes);
   const providers = useAppStore(s => s.status?.providers);
   const workspaceEpoch = useAppStore(s => s.workspaceEpoch);
@@ -129,7 +171,9 @@ export function Home({ previewTasks }: { previewTasks?: TaskRun[] } = {}) {
   const waiting = model.ordered.filter(c => c.status !== "draft" && agentState(c) === "needs");
 
   const agent = selection?.kind === "agent" ? model.ordered.find(c => c.id === selection.id) : undefined;
-  const node = selection?.kind === "resource" || selection?.kind === "action" ? model.outer.find(n => n.key === selection.key) : undefined;
+  const memberCrew=selection?.kind==='member'?model.ordered.find(c=>c.id===selection.crewId):undefined;
+  const member=selection?.kind==='member'?memberCrew?.agents?.find(a=>a.id===selection.id):undefined;
+  const node = selection?.kind === "resource" || selection?.kind === "action" ? model.outer.find(n => n.key === selection.key&&n.kind===selection.kind) : undefined;
   const close = () => setSelection(null);
   const taskShown = selection?.kind === "task" ? tasks.find(t => t.run.id === selection.id) : undefined;
   // Mavo's models, with whether each can be reached now (Ollama not running, a key missing).
@@ -137,62 +181,71 @@ export function Home({ previewTasks }: { previewTasks?: TaskRun[] } = {}) {
   const panel = selection?.kind === "me" ? <MePanel me={me} memory={memory} agents={crew.length} onClose={close}
       onRemember={async text => setMemory(await api.addMemory(text))} onForget={async id => setMemory(await api.forgetMemory(id))} />
     : agent ? <AgentPanel crew={agent} onClose={close} />
-    : selection?.kind === "task" && taskShown ? <TaskPanel task={taskShown} onClose={close} />
+    : member&&memberCrew?<MemberPanel crew={memberCrew} agent={member} onClose={close}/>
+    : selection?.kind === "task" && taskShown ? <TaskPanel task={taskShown} onClose={close} onDeleted={id => { setTaskRuns(runs => runs.filter(r => r.id !== id)); close(); }} />
     : brainShown ? <RoutePanel key={workspaceEpoch + brainShown.id + brainShown.signature} route={brainShown} all={brains} crews={model.ordered} onTest={routeChecked} onPick={id => setSelection({ kind: "agent", id })} onClose={close} />
+    : selection?.kind==='handoff'?<section className="p-5"><button className="btn-quiet" onClick={close}>Close</button><h3 className="mb-3">Dependency & delivery</h3><p className="text-sm text-zinc-400 mb-3">Work passes between these agents under each agent’s existing access.</p><AgentTraffic messages={messages.filter(m=>[`${m.sender.replace(/^crew:/,'')}|${m.recipient.replace(/^crew:/,'')}`,`${m.recipient.replace(/^crew:/,'')}|${m.sender.replace(/^crew:/,'')}`].includes(selection.key))}/></section>
     : node ? <NodePanel node={node} crews={model.ordered} onPick={id => setSelection({ kind: "agent", id })} onClose={close} />
     : null;
 
   return <div className="home">
     <header className="home-bar">
       <Brand />
+      {/* Chat or map, in words, always in the same place: the way back was one small icon. */}
+      <div className="view-switch" role="tablist" aria-label="Chat or map">
+        <button role="tab" aria-selected={view === "rooms"} onClick={() => setView("rooms")}>{view === "rooms" && <motion.span layoutId="view-pill" className="view-pill" transition={{ type: "spring", stiffness: 520, damping: 40 }} />}<MessageSquare size={14} /><span>Chat</span></button>
+        <button role="tab" aria-selected={view === "map"} onClick={() => setView("map")}>{view === "map" && <motion.span layoutId="view-pill" className="view-pill" transition={{ type: "spring", stiffness: 520, damping: 40 }} />}<MapIcon size={14} /><span>Map</span></button>
+      </div>
       <div className="home-search"><Search size={13} aria-hidden="true" /><input aria-label="Find an agent, account or action" placeholder="Find an agent, account or action" value={query} onChange={e => { setQuery(e.target.value); jump.current = -1; }}
-          onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); goToNextHit(); } }} />
+          onKeyDown={e => { if (e.key === "Enter" && view === "map") { e.preventDefault(); goToNextHit(); } }} />
         {query && <><span className="home-search-count">{hitCount ? `${hitCount} found · Enter` : "None"}</span><button className="btn-quiet !p-0.5" aria-label="Clear search" onClick={() => setQuery("")}><X size={12} /></button></>}</div>
       <div className="flex-1" />
-      {waiting.length > 0 && <button className="bar-needs" onClick={() => setSelection({ kind: "agent", id: waiting[0].id })}
+      {waiting.length > 0 && <button className="bar-needs" onClick={() => view === "rooms" ? useAppStore.getState().openAgent(waiting[0].id) : setSelection({ kind: "agent", id: waiting[0].id })}
         title={waiting.map(c => `${c.name}: ${needsReason(c)}`).join("\n")}>
-        <i />{waiting.length === 1 ? `${waiting[0].name} needs you` : `${waiting.length} agents need you`}</button>}
+        {waiting.length === 1 ? `${waiting[0].name} needs you` : `${waiting.length} agents need you`}</button>}
       <StatusPill />
+      <BarButton icon={BookOpen} label="Library" onClick={() => setPage("library")} />
+      <BarButton icon={BrainIcon} label="Knowledge" onClick={() => setPage("knowledge")} />
       <BarButton icon={CalendarClock} label="What's next" onClick={() => setPage("timeline")} />
       <BarButton icon={History} label="What happened" onClick={() => setPage("activity")} />
       <BarButton icon={Settings} label="Settings" onClick={() => setPage("settings")} />
-      <BarButton icon={MessageCircle} label={chatOpen ? "Hide chat" : "Chat"} pressed={chatOpen} onClick={() => useAppStore.getState().setChatOpen(!chatOpen)} />
+      {view === "map" && <BarButton icon={MessageCircle} label={chatOpen ? "Hide chat" : "Chat"} pressed={chatOpen} onClick={() => useAppStore.getState().setChatOpen(!chatOpen)} />}
     </header>
     {(statusError || runError || executionError) && <p role="alert" className="home-alert">{statusError || runError || executionError}</p>}
-    <div className="home-body">
+    {runNote && !(statusError || runError || executionError) && <p role="status" className="home-alert home-note">{runNote}</p>}
+    {view === "rooms" ? <ErrorBoundary><Rooms query={query} onOverview={() => setView("map")} /></ErrorBoundary> : <div className="home-body">
       <main className="home-stage" aria-label="Your agents">
-        <ErrorBoundary><AgentGraph crews={crew} drafts={setupDrafts} me={me} memory={memory} selection={selection} hits={hits} inset={panel ? 424 : 0} onSelect={setSelection} onRun={runNow} tasks={tasks} routes={brains} execution={execution}
+        <ErrorBoundary><AgentGraph crews={crew} drafts={setupDrafts} me={me} memory={memory} selection={selection} hits={hits} inset={panel ? 424 : 0} onSelect={setSelection} onRun={runNow} tasks={tasks} routes={brains} execution={execution} messages={messages} inventory={inventory} connectionsLoading={connectionsLoading} connectionsError={connectionsError}
           onNew={() => useAppStore.getState().startInChat("Make an agent that ")} /></ErrorBoundary>
         {!crew.length && !setupDrafts.length && <div className="home-hint"><b>Make your first agent</b><span>Tell Mavo in the chat what to handle: "summarise my important mail every morning", "remind me to drink water every hour". It appears here, connected to what it uses.</span></div>}
         {panel && <aside className="graph-side" aria-label="Details"><ErrorBoundary key={JSON.stringify(selection)}>{panel}</ErrorBoundary></aside>}
       </main>
       {chatOpen && <aside className="chat-dock" aria-label="Chat"><ChatDock /></aside>}
-    </div>
+    </div>}
     {page !== "home" && <WorkspaceSheet tab={page} onTab={setPage} onClose={() => setPage("home")} />}
   </div>;
 }
 
-/** The chat dock's two sides: Chat, where your agents talk with you (and you answer them), and
- *  Build, Mavo's core, where agents and teams are made and changed. */
+/** General chat is the primary surface. Keep the older inbox available for existing workflows. */
 function ChatDock() {
   const tab = useAppStore(s => s.chatTab);
   const waiting = useAppStore(s => s.crew.filter(c => c.held || (c.question && c.status !== "draft")).length);
   const set = useAppStore.getState().setChatTab;
+  const hide = () => useAppStore.getState().setChatOpen(false);
+  const tabs = <div className="dock-tabs" role="tablist" aria-label="Chat or updates">
+    <button role="tab" aria-selected={tab === "chat"} onClick={() => set("chat")}>Chat</button>
+    <button role="tab" aria-selected={tab === "inbox"} onClick={() => set("inbox")}>Updates{waiting > 0 && <i className="dock-count">{waiting}</i>}</button>
+  </div>;
+  if (tab !== "inbox") return <ErrorBoundary key="chat"><ChatPage docked tabs={tabs} onClose={hide} /></ErrorBoundary>;
   return <div className="chat-dock-inner">
-    <div className="dock-tabs">
-      <div className="dmenu-seg" role="tablist" aria-label="Chat or build">
-        <button role="tab" aria-selected={tab === "chat"} aria-pressed={tab === "chat"} onClick={() => set("chat")}>Chat{waiting > 0 && <i className="dock-count">{waiting}</i>}</button>
-        <button role="tab" aria-selected={tab === "build"} aria-pressed={tab === "build"} onClick={() => set("build")}>Build</button>
-      </div>
-      <span className="dock-tab-hint">{tab === "chat" ? "Your agents and you" : "Make and change agents"}</span>
-      <button className="btn-quiet !p-1.5" aria-label="Hide chat" title="Hide chat" onClick={() => useAppStore.getState().setChatOpen(false)}><PanelRightClose size={15} /></button>
-    </div>
-    <ErrorBoundary key={tab}>{tab === "chat" ? <AgentInbox /> : <ChatPage docked />}</ErrorBoundary>
+    <header className="chat-dock-bar">{tabs}<div className="flex-1" />
+      <button className="btn-quiet !p-1.5" aria-label="Hide chat" title="Hide chat" onClick={hide}><PanelRightClose size={15} /></button></header>
+    <ErrorBoundary key="inbox"><AgentInbox /></ErrorBoundary>
   </div>;
 }
 
-/** One of Mavo's models: what it is, whether it can be reached, and the agents that think with
- *  it, each movable to another model in one step. */
+/** One of Mavo's models: what it is, a test, and the agents that use it (each can be moved to
+ *  another model). */
 export function RoutePanel({ route, all, crews, onPick, onClose, onTest }: { route: Brain; all: Brain[]; crews: CrewInstance[]; onPick: (id: string) => void; onClose: () => void; onTest?: (route: Brain, connected: boolean) => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -215,41 +268,40 @@ export function RoutePanel({ route, all, crews, onPick, onClose, onTest }: { rou
     catch { setTest({ model: route.model, ok: false }); onTest?.(route, false); }
     finally { setBusy(null); }
   }
+  const tested = test?.model === route.model ? test : null;
+  const line = tested ? (tested.ok ? "It replied. Working." : "It didn't reply. Check it in Settings.")
+    : route.connected === false ? (local ? "Ollama isn't running, or this model isn't installed." : "Can't be reached. Check its key in Settings.")
+    : null;
   return <>
     <div className="panel-head"><span className="map-icon lg graph-route-icon" data-local={local} style={{...identityStyle(identityColor(`route:${route.id}`)),color:'var(--identity)',background:'color-mix(in srgb,var(--identity) 12%,transparent)'}}>{local ? <Cpu size={18} /> : <Cloud size={18} />}</span>
       <div className="min-w-0 flex-1"><h3>{route.name}</h3>
-        <div className="graph-sub">Model provider · {route.model} · {local ? "runs on this PC, free" : "in the cloud, uses your credits"}</div></div>
+        <div className="graph-sub">{route.model} · {local ? "on this PC" : "cloud"}</div></div>
       <button className="btn-quiet !p-1.5" aria-label="Close" onClick={onClose}><X size={15} /></button></div>
-    {route.connected === false && <p className="notice">{local ? "Ollama or this model is unavailable. Start Ollama and check the installed model in Settings." : `${route.name} can't be reached right now. Check its key in Settings.`}</p>}
-    <p className="route-how" role="status">{test?.model === route.model
-      ? test.ok ? "Model replied successfully." : "Model test failed. Check its configuration in Settings."
-      : "Inference not tested. A connection test sends one short model request and may use credits."}</p>
-    <button className="btn-secondary" disabled={!!busy} onClick={() => void check()}>{busy === "test" ? "Testing…" : "Test connection"}</button>
-    <p className="route-how">{local
-      ? "Agents use this computer. Cloud fallback is off by default. Choosing a fallback allows that provider to receive this agent's task and permitted data, using your credits. Automatic fallback is skipped if this run has already started any tools."
-      : "Agents here think in the cloud: stronger for long writing, builds and team leads."}</p>
-    <section>
-      <h4 className="graph-h">Agents · {users.length}</h4>
-      <ul className="route-agents">{users.map(c => <li key={c.id}>
-        <button className="route-agent" onClick={() => onPick(c.id)}><i className="route-agent-color" style={identityStyle(identityColor(`crew:${c.id}`))} aria-hidden="true"/>{c.name}{c.route_id !== route.id && <span className="route-fell">Fallback only</span>}{c.fallback && <span className="route-fell">{c.fallback.status === "completed" ? "Used fallback" : "Fallback " + (c.fallback.status ?? "recorded")}</span>}</button>
-        {all.length > 1 && <select aria-label={`Model for ${c.name}`} value={c.route_id ?? ""} disabled={!!busy} onChange={e => void save(c, { route_id: e.target.value })}>
-          {all.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}</select>}
-        {all.find(b => b.id === c.route_id)?.provider === "ollama" && <label className="route-fallback">Cloud fallback
-          <select aria-label={`Cloud fallback for ${c.name}`} value={c.fallback_route_id ?? ""} disabled={!!busy}
+    <div className="route-simple">
+      {line && <p className="route-line" role="status" data-bad={!tested?.ok}>{line}</p>}
+      <button className="btn-secondary justify-self-start" disabled={!!busy} onClick={() => void check()}>{busy === "test" ? "Testing…" : "Test"}</button>
+      <section>
+        <h4 className="graph-h">Used by {users.length}</h4>
+        {!users.length && <p className="route-line">No agents yet.</p>}
+        <ul>{users.map(c => <li key={c.id}>
+          <button onClick={() => onPick(c.id)}>{c.name}{c.route_id !== route.id && <span className="route-fell">backup</span>}</button>
+          {all.length > 1 && <select className="field !w-auto" aria-label={`Model for ${c.name}`} value={c.route_id ?? ""} disabled={!!busy} onChange={e => void save(c, { route_id: e.target.value })}>
+            {all.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}</select>}
+          {all.find(b => b.id === c.route_id)?.provider === "ollama" && all.some(b => b.provider !== "ollama") && <select className="field !w-auto" aria-label={`Cloud fallback for ${c.name}`} title="If this PC's model fails, use…" value={c.fallback_route_id ?? ""} disabled={!!busy}
             onChange={e => void save(c, { fallback_route_id: e.target.value || null })}>
-            <option value="">Off — keep data local</option>
-            {all.filter(b => b.provider !== "ollama").map(b => <option key={b.id} value={b.id}>{b.name} · {b.model}</option>)}
-          </select>
-        </label>}
-      </li>)}</ul>
-    </section>
-    {error && <p role="alert" className="access-hint">{error}</p>}
+            <option value="">No backup</option>
+            {all.filter(b => b.provider !== "ollama").map(b => <option key={b.id} value={b.id}>Backup: {b.name}</option>)}
+          </select>}
+        </li>)}</ul>
+      </section>
+      {error && <p role="alert" className="access-hint">{error}</p>}
+    </div>
   </>;
 }
 
 /** A one-time task's panel: the same live card as in chat (steps, how it thought, Stop), and the
  *  way back to the chat it came from. */
-function TaskPanel({ task, onClose }: { task: TaskOnMap; onClose: () => void }) {
+function TaskPanel({ task, onClose, onDeleted }: { task: TaskOnMap; onClose: () => void; onDeleted: (id: string) => void }) {
   const open = () => {
     const store = useAppStore.getState();
     if (task.run.conversation_id) store.setActiveConversation(task.run.conversation_id);
@@ -260,7 +312,7 @@ function TaskPanel({ task, onClose }: { task: TaskOnMap; onClose: () => void }) 
       <div className="min-w-0 flex-1"><h3>{task.run.title.replace(/^build:\s*/i, "")}</h3>
         <div className="graph-sub">One-time task · {task.members.length ? `a team of ${task.members.length}` : "steps"} · {task.done} of {task.total} done</div></div>
       <button className="btn-quiet !p-1.5" aria-label="Close" onClick={onClose}><X size={15} /></button></div>
-    <TaskRunCard run={task.run} />
+    <TaskRunCard run={task.run} onDeleted={onDeleted} />
     {task.run.conversation_id && <button className="btn-quiet self-start" onClick={open}><MessageCircle size={14} />Open its chat</button>}
   </>;
 }
@@ -270,6 +322,8 @@ function BarButton({ icon: Icon, label, onClick, pressed }: { icon: LucideIcon; 
 }
 
 const TABS: { id: Exclude<NavId, "home">; label: string; icon: LucideIcon }[] = [
+  { id: "library", label: "Library", icon: BookOpen },
+  { id: "knowledge", label: "Knowledge", icon: BrainIcon },
   { id: "settings", label: "Settings", icon: Settings },
   { id: "resources", label: "Accounts & resources", icon: Boxes },
   { id: "actions", label: "Action rules", icon: Zap },
@@ -284,7 +338,7 @@ function WorkspaceSheet({ tab, onTab, onClose }: { tab: NavId; onTab: (t: NavId)
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  const body = tab === "settings" ? <SettingsPage /> : tab === "resources" ? <ResourcesPage /> : tab === "actions" ? <ActionsPage />
+  const body = tab === "library" ? <LibraryPage /> : tab === "knowledge" ? <KnowledgePage /> : tab === "settings" ? <SettingsPage /> : tab === "resources" ? <ResourcesPage /> : tab === "actions" ? <ActionsPage />
     : tab === "timeline" ? <><PageHeader eyebrow="Agents" title="What's next" description="What your agents will do, in order." /><div className="page-content"><div className="narrow"><TimelineView /></div></div></>
     : <><PageHeader eyebrow="Agents" title="What happened" description="What your agents have done." /><div className="page-content"><div className="narrow"><ActivityView /></div></div></>;
   return <div className="workspace-backdrop" onClick={onClose}>

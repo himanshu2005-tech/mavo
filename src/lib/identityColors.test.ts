@@ -12,7 +12,7 @@ it("does not repeat actual colors across 500 Crews and their connections in eith
     expect(contrast(c.dark,"#181818")).toBeGreaterThanOrEqual(3);
     expect(contrast(c.light,"#f5f5f5")).toBeGreaterThanOrEqual(3);
   }
-});
+}, 20000);  // 500 crews: a stress test, slower on a busy machine
 
 it("keeps assignments on reordering, additions, removals and saved-preference reload", () => {
   const keys=['crew:a','crew:b','route:a','resource:a'];

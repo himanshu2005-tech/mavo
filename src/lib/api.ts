@@ -10,6 +10,21 @@ interface BackendConfig {
 
 let cachedConfig: BackendConfig | null = null;
 
+export interface CoreProblem {
+  code: string;
+  message: string;
+  action: string;
+  retryable: boolean;
+  request_id: string | null;
+}
+
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number, public readonly problem?: CoreProblem) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 async function backendConfig(): Promise<BackendConfig> {
   if (cachedConfig) return cachedConfig;
   try {
@@ -30,8 +45,11 @@ async function backendConfig(): Promise<BackendConfig> {
  * is bounded by the backend, everything else is quick. */
 export function requestLimit(path: string): number {
   if (path.startsWith('/runtime/activity')) return 4000;
+  if (path === '/reminders/due' || path === '/auth/firebase') return 4000;
   if (path === "/core/turn") return 215_000;
+  if (path.split('?')[0] === "/core/status") return 10_000;
   if (/^\/crew\/[^/]+\/trial$/.test(path)) return 300_000;
+  if (/^\/crew\/[^/]+\/access$/.test(path)) return 300_000;
   if (path === "/browser/probe") return 75_000;
   return 135_000;
 }
@@ -48,37 +66,85 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   };
   let response: Response | undefined;
   let networkError: unknown;
-  const attempts = path.startsWith('/runtime/activity')?1:!init?.method || init.method === "GET" ? 20 : 1;
+  const attempts = path.startsWith('/runtime/activity') || path === '/reminders/due' || path === '/auth/firebase'
+    ? 1 : !init?.method || init.method === "GET" ? 20 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       response = await fetch(`${config.base_url}/api/v1${path}`, { ...options, signal: AbortSignal.timeout(requestLimit(path)) });
       break;
     } catch (error) {
       networkError = error;
-      await new Promise((resolve) => window.setTimeout(resolve, 150));
+      // A timed-out GET must not repeat its entire timeout twenty times.
+      if(error instanceof DOMException&&(error.name==='TimeoutError'||error.name==='AbortError'))break;
+      if(attempt+1<attempts)await new Promise((resolve) => window.setTimeout(resolve, 150));
     }
   }
   if (!response) {
+    if(path==='/auth/firebase') throw new ApiError('Mavo’s local service is not reachable yet.',0);
+    if(path==='/core/turn') throw new ApiError(
+      'Mavo could not confirm the outcome of this message. Check the conversation and Activity before sending it again.', 0,
+      {code:'core_delivery_unknown',message:'Mavo lost contact with Core before receiving a confirmed answer.',action:'Your message is kept below. Check the conversation and Activity before sending again; work may still be processing.',retryable:false,request_id:null});
     // The browser's own wording for an expired timer is "signal timed out": say what happened.
     if (networkError instanceof DOMException && (networkError.name === "TimeoutError" || networkError.name === "AbortError")) throw new Error("This is taking longer than expected.");
     throw new Error(networkError instanceof Error ? networkError.message : "Mavo Core did not start.");
   }
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
+    let problem: CoreProblem | undefined;
     try {
-      const body = (await response.json()) as { detail?: string | { msg: string; loc: (string | number)[] }[] };
+      const body = (await response.json()) as { detail?: string | { msg: string; loc: (string | number)[] }[]; error?: CoreProblem };
+      if(body.error&&typeof body.error.code==='string'&&typeof body.error.message==='string'&&typeof body.error.action==='string'&&typeof body.error.retryable==='boolean'&&(body.error.request_id===null||typeof body.error.request_id==='string')) problem=body.error;
       if (typeof body.detail === "string") detail = body.detail;
       else if (Array.isArray(body.detail)) detail = body.detail.map((item) => `${item.loc.slice(1).join(".")}: ${item.msg}`).join("; ");
     } catch {
       // The status code remains a useful, non-sensitive fallback.
     }
-    throw new Error(detail);
+    throw new ApiError(detail,response.status,problem);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
+/** One chat turn, its reply streamed: onReply gets the text so far while Mavo writes it. Same
+ *  result and errors as /core/turn; a backend without streaming falls back to it. */
+async function streamTurn(body: Record<string, unknown>, onReply: (text: string) => void): Promise<import('../types').CoordinatorResponse> {
+  const config = await backendConfig();
+  let response: Response;
+  try {
+    response = await fetch(`${config.base_url}/api/v1/core/turn/stream`, {
+      method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(requestLimit("/core/turn")),
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${config.token}` },
+    });
+  } catch {
+    throw new ApiError('Mavo could not confirm the outcome of this message. Check the conversation and Activity before sending it again.', 0,
+      {code:'core_delivery_unknown',message:'Mavo lost contact with Core before receiving a confirmed answer.',action:'Your message is kept below. Check the conversation and Activity before sending again; work may still be processing.',retryable:false,request_id:null});
+  }
+  if (response.status === 404 || !response.body) return request<import('../types').CoordinatorResponse>("/core/turn", { method: "POST", body: JSON.stringify(body) });
+  if (!response.ok) throw new ApiError(`Request failed (${response.status})`, response.status);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    let cut: number;
+    while ((cut = buffer.indexOf("\n\n")) >= 0) {
+      const line = buffer.slice(0, cut).trim();
+      buffer = buffer.slice(cut + 2);
+      if (!line.startsWith("data:")) continue;
+      const event = JSON.parse(line.slice(5)) as { type: string; text?: string; result?: import('../types').CoordinatorResponse; status?: number; detail?: string; error?: CoreProblem };
+      if (event.type === "reply" && event.text) onReply(event.text);
+      else if (event.type === "done" && event.result) return event.result;
+      else if (event.type === "error") throw new ApiError(event.detail ?? (event.error ? `${event.error.message} ${event.error.action}` : "Mavo could not finish this reply."), event.status ?? 500, event.error);
+    }
+    if (done) break;
+  }
+  throw new ApiError("The reply stopped before it finished. Check the conversation before sending again.", 0);
+}
+
 export const api = {
+  onboarding:()=>request<import('./onboarding').OnboardingState>('/onboarding'),
+  advanceOnboarding:(action:'next'|'back'|'skip',revision:number)=>request<import('./onboarding').OnboardingState>('/onboarding',{method:'PUT',body:JSON.stringify({action,revision})}),
   runtimeActivity:(after?:number)=>request<import('./executionSignals').RuntimeSnapshot>(`/runtime/activity${after===undefined?'':`?after=${after}`}`),
   trialCrew:(id:string)=>request<import('../components/SampleRun').TrialResult>(`/crew/${id}/trial`,{method:"POST"}),
   startTrial:(id:string)=>request<import('../components/SampleRun').TrialStatus>(`/crew/${id}/trial/start`,{method:"POST"}),
@@ -121,13 +187,22 @@ export const api = {
   automations: () => request<import('../types').AutomationInfo[]>('/automations'),
   runAutomation: (name:string) => request<{status:string;output?:string;problem?:string}>(`/automations/${encodeURIComponent(name)}/run`, {method: 'POST'}),
   removeAutomation: (name:string) => request<void>(`/automations/${encodeURIComponent(name)}`, {method: 'DELETE'}),
+  /** OK a change a crew holds for the person (its first changes, when they chose to be asked). */
+  approveChange: (id:string) => request<{status:string}>(`/actions/${encodeURIComponent(id)}/approve`, {method: 'POST'}),
   rejectAction: (id:string) => request<{status:string}>(`/actions/${encodeURIComponent(id)}/reject`, {method: 'POST'}),
   projects: () => request<{folder:string|null;error?:string;projects:import('../types').ProjectInfo[]}>('/projects'),
   trustProject: (name:string, trusted:boolean) => request<{project:string;trusted:boolean}>(`/projects/${encodeURIComponent(name)}/trust`, {method: 'PUT', body: JSON.stringify({trusted})}),
   tasks: (conversationId?:string) => request<import('../types').TaskRun[]>('/tasks'+(conversationId?`?conversation_id=${encodeURIComponent(conversationId)}`:'')),
+  /** The keys that run an agent at once ("Win+F9"); null clears them. */
+  setHotkey: (crewId:string, hotkey:string|null) => request<CrewInstance>(`/crew/${encodeURIComponent(crewId)}/hotkey`, { method: "POST", body: JSON.stringify({ hotkey }) }),
+  /** Replay a step's browser turn in Playwright's trace viewer, on this computer. */
+  openTrace: (runId:string, stepId:string) => request<void>(`/tasks/${encodeURIComponent(runId)}/traces/${encodeURIComponent(stepId)}/open`, { method: "POST" }),
+  /** One agent's own runs, newest first: its room's history. */
+  crewTasks: (crewId:string) => request<import('../types').TaskRun[]>(`/tasks?limit=30&crew_id=${encodeURIComponent(crewId)}`),
   task: (id:string) => request<import('../types').TaskRun>(`/tasks/${encodeURIComponent(id)}`),
   stopTask: (id:string) => request<import('../types').TaskRun>(`/tasks/${encodeURIComponent(id)}/stop`, {method: 'POST'}),
   retryTask: (id:string) => request<import('../types').TaskRun>(`/tasks/${encodeURIComponent(id)}/retry`, {method: 'POST'}),
+  deleteTask: (id:string) => request<void>(`/tasks/${encodeURIComponent(id)}`, {method: 'DELETE'}),
   answerTask: (id:string, answer:string, step_id?:string) => request<import('../types').TaskRun>(`/tasks/${encodeURIComponent(id)}/answer`, {method: 'POST', body: JSON.stringify({answer, step_id})}),
   pauseActions: () => request('/actions/pause', {method: 'POST'}),
   resumeActions: () => request('/actions/resume', {method: 'POST'}),
@@ -139,20 +214,62 @@ export const api = {
   createCoreConversation: () => request<Conversation>("/core/conversations",{method:"POST"}),
   renameConversation: (id:string,title:string) => request<Conversation>(`/conversations/${encodeURIComponent(id)}`,{method:"PATCH",body:JSON.stringify({title})}),
   crewDrafts: () => request<CrewInstance[]>("/crew-drafts"),
-  coreStatus: () => request<import('../types').CoreStatus>("/core/status"),
-  coordinatorTurn: (message: string, sessionId = "main", crewId?: string, requestId = crypto.randomUUID(), conversationId?:string) => request<import('../types').CoordinatorResponse>("/core/turn", {method:"POST",body:JSON.stringify({message,session_id:sessionId,crew_id:crewId??null,request_id:requestId,conversation_id:conversationId??null})}),
-  setCrewAccess: (id:string, payload:{capabilities:GoogleCapability[];connector_capabilities?:string[];actions:Record<string,import('../components/ActionAccessEditor').ActionRule>;notifications:boolean;device_metrics:boolean;temp_cleanup?:boolean;weather?:boolean;route_id:string|null}) => request<CrewInstance>(`/crew/${id}/access`,{method:"POST",body:JSON.stringify({...payload,actions:Object.fromEntries(Object.entries(payload.actions).map(([operation,rule])=>[operation,actionRuleInput(rule)]))})}),
+  coreStatus: (refresh = false) => request<import('../types').CoreStatus>(`/core/status${refresh ? '?refresh=true' : ''}`),
+  coordinatorTurnStream: (onReply:(text:string)=>void, message: string, sessionId = "main", crewId?: string, requestId = crypto.randomUUID(), conversationId?:string, mentionedCrewIds?:string[],mentionedAgentIds?:string[],attachments?:string[]) => streamTurn({message,session_id:sessionId,crew_id:crewId??null,request_id:requestId,conversation_id:conversationId??null,mentioned_crew_ids:mentionedCrewIds??[],mentioned_agent_ids:mentionedAgentIds??[],attachments:attachments??[]},onReply),
+  coordinatorTurn: (message: string, sessionId = "main", crewId?: string, requestId = crypto.randomUUID(), conversationId?:string, mentionedCrewIds?:string[],mentionedAgentIds?:string[],attachments?:string[]) => request<import('../types').CoordinatorResponse>("/core/turn", {method:"POST",body:JSON.stringify({message,session_id:sessionId,crew_id:crewId??null,request_id:requestId,conversation_id:conversationId??null,mentioned_crew_ids:mentionedCrewIds??[],mentioned_agent_ids:mentionedAgentIds??[],attachments:attachments??[]})}),
+  orchestrationEvents:(conversationId?:string)=>request<import('./orchestration').ConversationActivity[]>(`/orchestration/events${conversationId?`?conversation_id=${encodeURIComponent(conversationId)}`:''}`),
+  agentMessages:(crewId?:string)=>request<import('./orchestration').AgentMessage[]>(`/orchestration/messages${crewId?`?crew_id=${encodeURIComponent(crewId)}`:''}`),
+  answerActivity:(id:string,revision:number,answer:string,decision:'answer'|'grant'|'decline'='answer')=>request(`/orchestration/events/${id}/answer`,{method:'POST',body:JSON.stringify({revision,answer,decision})}),
+  applyConfiguration:(id:string)=>request<import('./orchestration').ConfigEdit>(`/configuration/${id}/apply`,{method:'POST'}),
+  rollbackConfiguration:(id:string)=>request<import('./orchestration').ConfigEdit>(`/configuration/${id}/rollback`,{method:'POST'}),
+  planningRoute:()=>request<{route_id:string|null}>('/orchestration/planner'),
+  verifyTaskCheckpoint:(runId:string,stepId:string,output:string)=>request<import('../types').TaskRun>(`/tasks/${runId}/checkpoint`,{method:'POST',body:JSON.stringify({step_id:stepId,verified_output:output})}),
+  setPlanningRoute:(routeId:string|null)=>request<{route_id:string|null}>('/orchestration/planner',{method:'PUT',body:JSON.stringify({route_id:routeId})}),
+  allowCrew: (id:string, payload:{capabilities:GoogleCapability[];notifications?:boolean}) => request<CrewInstance>(`/crew/${encodeURIComponent(id)}/allow`,{method:"POST",body:JSON.stringify(payload)}),
+  setCrewAccess: (id:string, payload:{capabilities:GoogleCapability[];connector_capabilities?:string[];actions:Record<string,import('../components/ActionAccessEditor').ActionRule>;notifications:boolean;device_metrics:boolean;temp_cleanup?:boolean;weather?:boolean;route_id:string|null;skip_test?:boolean;test_level?:'quick'|'standard'|'thorough'}) => request<CrewInstance>(`/crew/${id}/access`,{method:"POST",body:JSON.stringify({...payload,actions:Object.fromEntries(Object.entries(payload.actions).map(([operation,rule])=>[operation,actionRuleInput(rule)]))})}),
+  /** Turn on a path that passed most of its tests, after seeing the cases it may get wrong. */
+  acceptWorkflow:(id:string)=>request<CrewInstance>(`/crew/${encodeURIComponent(id)}/workflow/accept`,{method:'POST'}),
+  /** The hours, days and meeting length a crew's agent works with. */
+  setDeskSettings:(id:string,settings:{start?:string;end?:string;days?:string[];duration_minutes?:number})=>request<CrewInstance>(`/crew/${encodeURIComponent(id)}/desk`,{method:'POST',body:JSON.stringify(settings)}),
+  /** Mavo Core writes the draft's whole path, in the background. */
+  draftWorkflow:(id:string)=>request<CrewInstance>(`/crew/${encodeURIComponent(id)}/workflow`,{method:'POST'}),
+  setAgentModel:(id:string,key:string,route_id:string|null)=>request<CrewInstance>(`/crew/${id}/agents/${encodeURIComponent(key)}/model`,{method:'POST',body:JSON.stringify({route_id})}),
+  activateCrewPreview:(id:string,verification_id:string,generation:number)=>request<CrewInstance>(`/crew/${id}/activate-preview`,{method:'POST',body:JSON.stringify({verification_id,generation})}),
   openProject: (name:string, what:"app"|"folder") => request<void>(`/projects/${encodeURIComponent(name)}/open`,{method:"POST",body:JSON.stringify({what})}),
   mavoAgents: () => request<import('../types').MavoAgent[]>("/mavo-agents"),
   crewAsks: (id:string) => request<import('../types').CrewAsk[]>(`/crew/${encodeURIComponent(id)}/asks`),
   askCrew: (id:string,question:string) => request<import('../types').CrewAsk>(`/crew/${encodeURIComponent(id)}/asks`,{method:"POST",body:JSON.stringify({question})}),
+  attention: () => request<{ digest_minutes: number; enabled: boolean }>("/attention"),
+  saveAttention: (body: { digest_minutes?: number; enabled?: boolean }) => request<{ digest_minutes: number; enabled: boolean }>("/attention", { method: "PUT", body: JSON.stringify(body) }),
+  setDelivery: (id:string, delivery:"auto"|"now"|"summary") => request<{ crew_id: string; delivery: string }>(`/crew/${encodeURIComponent(id)}/delivery`, { method: "PUT", body: JSON.stringify({ delivery }) }),
+  forgetNote: (id:string,index:number) => request<CrewInstance>(`/crew/${encodeURIComponent(id)}/notes/${index}`,{method:"DELETE"}),
   forgetPreference: (id:string,index:number) => request<CrewInstance>(`/crew/${encodeURIComponent(id)}/preferences/${index}`,{method:"DELETE"}),
   memory: () => request<import('../types').MemoryFact[]>("/memory"),
   addMemory: (text:string) => request<import('../types').MemoryFact[]>("/memory",{method:"POST",body:JSON.stringify({text})}),
   forgetMemory: (id:string) => request<import('../types').MemoryFact[]>(`/memory/${encodeURIComponent(id)}`,{method:"DELETE"}),
+  recipe: (crewId:string) => request<import('../types').RecipeView>(`/crew/${encodeURIComponent(crewId)}/recipe`),
+  replanRecipe: (crewId:string) => request<import('../types').RecipeView>(`/crew/${encodeURIComponent(crewId)}/recipe/replan`,{method:"POST"}),
+  editMemory: (id:string,text:string) => request<import('../types').MemoryFact[]>(`/memory/${encodeURIComponent(id)}`,{method:"PATCH",body:JSON.stringify({text})}),
+  files: () => request<import('../types').SavedFile[]>("/files"),
+  saveFile: (name:string,data:string) => request<import('../types').SavedFile>("/files",{method:"POST",body:JSON.stringify({name,data})}),
+  deleteFile: (id:string) => request<void>(`/files/${encodeURIComponent(id)}`,{method:"DELETE"}),
+  /** A saved file's bytes, to open or save it. */
+  fileBlob: async (id:string) => {
+    const config = await backendConfig();
+    const response = await fetch(`${config.base_url}/api/v1/files/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${config.token}` } });
+    if (!response.ok) throw new ApiError("That file could not be opened.", response.status);
+    return response.blob();
+  },
   clearAsks: (id:string) => request<void>(`/crew/${encodeURIComponent(id)}/asks`,{method:"DELETE"}),
   replyCrew: (id:string,message:string) => request<CrewInstance>(`/crew/${id}/reply`,{method:"POST",body:JSON.stringify({message})}),
   dismissProposal: (id: string) => request<void>(`/core/proposals/${id}/dismiss`, { method: "POST" }),
+  telegram: () => request<import('../types').TelegramStatus>("/telegram"),
+  connectTelegram: (token: string) => request<import('../types').TelegramStatus>("/telegram/token", { method: "PUT", body: JSON.stringify({ token }) }),
+  telegramAlerts: (on: boolean) => request<import('../types').TelegramStatus>("/telegram/alerts", { method: "PUT", body: JSON.stringify({ on }) }),
+  newTelegramCode: () => request<import('../types').TelegramStatus>("/telegram/code", { method: "POST" }),
+  crewTelegram: (id: string, on: boolean) => request<CrewInstance>(`/crew/${encodeURIComponent(id)}/telegram`, { method: "POST", body: JSON.stringify({ on }) }),
+  testTelegram: () => request<{ sent: boolean }>("/telegram/test", { method: "POST" }),
+  disconnectTelegram: () => request<void>("/telegram", { method: "DELETE" }),
   googleStatus: () => request<GoogleStatus>("/auth/google"),
   configureGoogle: (clientId: string, secret?: string) => request<GoogleStatus>("/auth/google/client", { method: "PUT", body: JSON.stringify({ client_id: clientId, ...(secret ? { client_secret: secret } : {}) }) }),
   signInGoogle: (resources: GoogleResource[]) => request<{ authorization_url: string }>("/auth/google/start", { method: "POST", body: JSON.stringify({ resources }) }),
@@ -189,6 +306,7 @@ export const api = {
   stopCrew: (id: string) => request<CrewInstance>(`/crew/${id}/stop`, { method: "POST" }),
   /** Approve work held for you, or send it back to the agent that made it, with a note. */
   answerHandover: (id: string, approve: boolean, note = "") => request<CrewInstance>(`/crew/${id}/handover`, { method: "POST", body: JSON.stringify({ approve, note }) }),
+  crewRunNow: (id: string) => request<import('../types').CrewAsk>(`/crew/${encodeURIComponent(id)}/run-now`, { method: "POST" }),
   checkCrew: (id: string) => request<CrewInstance>(`/crew/${id}/check`, { method: "POST" }),
   chat: (message: string, routeId: string, conversationId?: string) =>
     request<ChatResponse>("/chat", {
@@ -213,6 +331,8 @@ export const api = {
   weather: (location: string) => request<WeatherSnapshot>(`/resources/weather?location=${encodeURIComponent(location)}`),
   dueReminders: () => request<Reminder[]>("/reminders/due"),
   reminderHistory: () => request<Reminder[]>("/reminders"),
+  /** The person's answer to an agent's question: that item carries on with it. */
+  answerReminder: (id: string, answer: string) => request<void>(`/reminders/${encodeURIComponent(id)}/answer`, { method: "POST", body: JSON.stringify({ answer }) }),
   dismissReminder: (id: string) => request<void>(`/reminders/${id}/dismiss`, { method: "POST" })
 };
 

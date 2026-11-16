@@ -324,7 +324,26 @@ def describe(session, runtime):
 
 def brief(session, runtime):
     """Small, secret-free view handed to the planning model."""
-    return [
+    telegram = getattr(runtime, "telegram", None)
+    sent = []
+    if telegram is not None:
+        try:
+            status = telegram.status()
+        except Exception:  # noqa: BLE001 - Telegram unknown, so not offered as connected
+            status = {}
+        # Alerts to the person's own bot: whether it is linked, and whether every agent's
+        # alerts already go there (else an agent can be asked to send its own).
+        sent = [
+            {
+                "id": "telegram",
+                "name": "Telegram",
+                "connected": bool(status.get("linked")),
+                "level": "all alerts" if status.get("alerts") else "chosen agents",
+                "readable": False,
+                "actions": [],
+            }
+        ]
+    return sent + [
         {
             "id": item["id"],
             "name": item["name"],

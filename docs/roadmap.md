@@ -1,5 +1,23 @@
 # Roadmap
 
+## Crew Architecture V2
+
+Integrated: Crew-owned logical agents, compatible single-worker migration, validated composition,
+bounded dependency execution, member/cycle/day call ceilings, durable agent messages, read-only
+review/fix, private worker retention, scoped composition edits, member mentions and expandable maps.
+Source evidence is checked against actual reads rather than page-opening success. Exact provider
+token/currency metering, expiring task grants, arbitrary dynamic lead topology and real-source
+internship eligibility/deduplication validation remain release work. See [V2](crew-architecture-v2.md).
+
+## Unified orchestration integration
+
+Implemented around existing executors: durable handoff delivery, correlated general-chat
+activity/questions, ID-backed mentions, typed permission cards, event-driven map handoffs,
+versioned instruction/interval/route changes and checkpoint-preserving task retries. See
+[orchestration.md](orchestration.md) for tested behavior and outstanding work, including grant
+durations, exact token/cost accounting, broader conversational policy changes and live-provider
+scenario validation. This is not a claim that every advanced orchestration requirement is done.
+
 ## Milestone 1 — desktop foundation
 
 Implemented: Tauri/React shell, managed FastAPI sidecar, authenticated loopback API, SQLite/Alembic persistence, model routes, DPAPI credentials, chat, logging, and tests. User-requested features brought forward include 15 Crew types, Run/Stop workers, checkpoints, budgets, crash recovery, Activity, reminders, Computer metrics, description-first Crew proposals, policy-controlled Google actions, and required Firebase Google login. General Signals rules and complete account synchronization remain unfinished.

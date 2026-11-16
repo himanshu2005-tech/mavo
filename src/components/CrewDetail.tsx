@@ -1,13 +1,17 @@
+import { plainError } from "../lib/shownText";
 import { invoke } from "@tauri-apps/api/core";
 import { Bell, LoaderCircle, Pencil, Play, RotateCw, Square, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { CrewReplyBox } from "./CrewReplyBox";
+import { LiveCycle } from "./LiveCycle";
+import { watchRun } from "../lib/runOutcome";
 import { CrewAsk } from "./CrewAsk";
 import { CrewGrants } from "./CrewGrants";
+import { WaitingChanges } from "./WaitingChanges";
+import { QuestionAnswer } from "./AlertAnswer";
 import { CrewSetupCard } from "./CrewSetupCard";
 import { Report } from "./Report";
-import { endLine, triggerLine } from "./CrewCard";
-import { SampleRun } from "./SampleRun";
+import { endLine, needsPerson, triggerLine } from "./CrewCard";
 import { DeleteCrewDialog } from "./DeleteCrewDialog";
 import { CrewAccountPermissions } from "./CrewAccountPermissions";
 import { runClock } from "../lib/runClock";
@@ -24,10 +28,11 @@ const eventResources: Partial<Record<TriggerType, GoogleResource>> = { gmail_mes
 
 /** One agent, in the panel beside the graph: what it is doing, what it found, asking it, and
  *  changing it. `access` is its switches (what it reads and can do), drawn by the graph. */
-export function CrewDetail({ crew, access }: { crew: CrewInstance; access?: ReactNode }) {
+export function CrewDetail({ crew, access, more, settingsOnly = false }: { crew: CrewInstance; access?: ReactNode; more?: ReactNode; settingsOnly?: boolean }) {
   const routes = useAppStore(s => s.routes);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checkNote, setCheckNote] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [deleting, setDeleting] = useState(false);
   async function toggle() {
@@ -44,7 +49,12 @@ export function CrewDetail({ crew, access }: { crew: CrewInstance; access?: Reac
   }
   async function check() {
     setBusy(true); setError(null);
-    try { useAppStore.getState().upsertCrew(await api.checkCrew(crew.id)); }
+    try {
+      useAppStore.getState().upsertCrew(await api.checkCrew(crew.id));
+      // It says how the check ended ("looked: no new mail", or what it did); "Check now" used to
+      // change nothing on the panel when there was nothing new.
+      void watchRun(crew.id, crew.name, crew.trigger_type, setCheckNote);
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not check it."); }
     finally { setBusy(false); }
   }
@@ -55,31 +65,47 @@ export function CrewDetail({ crew, access }: { crew: CrewInstance; access?: Reac
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Open the desktop app to preview reminders."); }
   }
   const draft = crew.status === "draft";
+  const settings = <div className="mt-4 space-y-5">
+        {more}
+        {access}
+        <p className="whitespace-pre-wrap text-[13px] leading-6 text-zinc-400">{crew.responsibilities}</p>
+        <div className="mt-4 border-y border-line py-1"><Detail label="Connection" value={routes.find((r) => r.id === crew.route_id)?.name ?? "Choose one in Edit"} /><Detail label="When" value={triggerNames[crew.trigger_type]} />{crew.trigger_type === "daily" && <Detail label="Times" value={crew.daily_triggers?.length ? crew.daily_triggers.filter(t => t.enabled).map(t => formatTime(t.time) + (t.weekdays.length < 7 ? " (" + t.weekdays.map(d => "MTWTFSS"[d]).join("") + ")" : "")).join(" · ") : crew.schedule_time ? formatTime(crew.schedule_time) : "Set a time in Edit"} />}{crew.trigger_type !== "daily" && <Detail label="Model calls today" value={String(crew.daily_calls_used)} />}{crew.is_running && crew.next_run_at && <Detail label="Next check" value={localTimestamp(crew.next_run_at)} />}</div>
+        <div className="mt-4 flex flex-wrap gap-1"><button className="btn-quiet" onClick={() => setEditing(true)}><Pencil size={13} />Edit</button><button className="btn-quiet" onClick={() => { sessionStorage.setItem("mavo-action-actor", crew.id); useAppStore.getState().setPage("actions"); }}>All action rules</button><button className="btn-quiet btn-stop" disabled={busy} onClick={() => setDeleting(true)}><Trash2 size={13} />Delete</button></div>
+        <CrewHistory crew={crew} />
+      </div>;
   const signIn = /sign in|human check/i.test(crew.question || crew.last_runtime_error || "");
+  // Its room shows the rest (what it did, what it needs, the box to talk to it): beside it, only
+  // its settings, open, with nothing shown twice.
+  if (settingsOnly) return <div className="crew-detail-panel">{settings}
+    {editing && <CrewForm existing={crew} onClose={() => setEditing(false)} onSaved={() => setEditing(false)} />}
+    {deleting && <DeleteCrewDialog crew={crew} onClose={() => setDeleting(false)} />}
+  </div>;
   return <div className="crew-detail-panel">
+    {/* One row: when it runs next, and the two things to do with it. */}
     <div className="flex items-center justify-between gap-3">
-      <p className="min-w-0 text-[12.5px] leading-5 text-zinc-400">{[triggerLine(crew), endLine(crew.configuration_plan)].filter(Boolean).join(" · ")}</p>
-      {!draft && <button className={crew.is_running ? "btn-secondary btn-stop !py-1.5" : "btn-primary !py-1.5"} disabled={busy} onClick={() => void toggle()}>{busy ? <LoaderCircle size={13} className="animate-spin" /> : crew.is_running ? <Square size={12} /> : <Play size={12} />}{crew.is_running ? "Stop" : "Start"}</button>}
+      <p className="min-w-0 text-[12.5px] leading-5 text-zinc-400">{draft ? [triggerLine(crew), endLine(crew.configuration_plan)].filter(Boolean).join(" · ") : <NextRun crew={crew} />}</p>
+      {!draft && <div className="flex shrink-0 gap-1">
+        {crew.is_running && crew.trigger_type !== "daily" && <button className="btn-quiet !py-1.5" disabled={busy || crew.runtime_state === "working"} onClick={() => void check()}><RotateCw size={13} className={crew.runtime_state === "working" ? "animate-spin" : ""} />Check now</button>}
+        {crew.trigger_type === "daily" && <button className="btn-quiet !py-1.5" onClick={() => void preview()}><Bell size={13} />Preview</button>}
+        <button className={crew.is_running ? "btn-secondary !py-1.5" : "btn-primary !py-1.5"} disabled={busy} onClick={() => void toggle()}>{busy ? <LoaderCircle size={13} className="animate-spin" /> : crew.is_running ? <Square size={12} /> : <Play size={12} />}{crew.is_running ? "Stop" : "Start"}</button>
+      </div>}
     </div>
-    {!draft && <NextRun crew={crew} />}
     {!draft && crew.skipped_run && <p className="skipped-run">Skipped {new Date(crew.skipped_run.day + "T12:00:00").toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}'s run: Mavo wasn't running at {crew.schedule_time ?? "its time"}. It ran again at its next time instead of twice in a row.</p>}
     {error && <div role="alert" className="notice error-notice">{error}</div>}
     {draft && crew.configuration_plan?.draft && <CrewSetupCard key={crew.id + JSON.stringify(crew.configuration_plan)} crew={crew} onRefine={id => useAppStore.getState().refineInChat(id)} />}
     {crew.configuration_plan?.finished && <div className="notice" role="status">Done: {crew.configuration_plan.finished.why}. Start it again any time.</div>}
     {crew.held && <HandoverCard crew={crew} />}
     {!crew.held && limitOf(crew) && <LimitCard crew={crew} />}
-    {!crew.held && !limitOf(crew) && (crew.question || crew.last_runtime_error) && <div className="notice" role="status">{crew.question || crew.last_runtime_error}{signIn && <div className="mt-3 flex gap-2"><button className="btn-secondary" onClick={() => useAppStore.getState().setPage("resources")}>Open browser to sign in</button><button className="btn-primary" disabled={busy} onClick={() => void toggle()}>Resume</button></div>}<CrewGrants crew={crew} /></div>}
-    {access}
-    {!draft && <CrewOutput crew={crew} onCheck={crew.is_running && crew.trigger_type !== "daily" ? () => void check() : undefined} checking={crew.runtime_state === "working" || busy} onPreview={crew.trigger_type === "daily" ? () => void preview() : undefined} />}
-    {crew.is_running && /https?:\/\//.test(crew.responsibilities) && <SampleRun key={crew.id} crewId={crew.id} />}
-    {!draft && <details className="setup-more"><summary>Details</summary>
-      <div className="mt-4">
-        <p className="whitespace-pre-wrap text-[13px] leading-6 text-zinc-400">{crew.responsibilities}</p>
-        <div className="mt-4 border-y border-line py-1"><Detail label="Connection" value={routes.find((r) => r.id === crew.route_id)?.name ?? "Choose one in Edit"} /><Detail label="When" value={triggerNames[crew.trigger_type]} />{crew.trigger_type === "daily" && <Detail label="Times" value={crew.daily_triggers?.length ? crew.daily_triggers.filter(t => t.enabled).map(t => formatTime(t.time) + (t.weekdays.length < 7 ? " (" + t.weekdays.map(d => "MTWTFSS"[d]).join("") + ")" : "")).join(" · ") : crew.schedule_time ? formatTime(crew.schedule_time) : "Set a time in Edit"} />}{crew.trigger_type !== "daily" && <Detail label="Model calls today" value={`${crew.daily_calls_used} of ${crew.daily_call_limit}`} />}{crew.is_running && crew.next_run_at && <Detail label="Next check" value={localTimestamp(crew.next_run_at)} />}</div>
-        <div className="mt-4 flex flex-wrap gap-1"><button className="btn-quiet" onClick={() => setEditing(true)}><Pencil size={13} />Edit</button><button className="btn-quiet" onClick={() => { sessionStorage.setItem("mavo-action-actor", crew.id); useAppStore.getState().setPage("actions"); }}>All action rules</button><button className="btn-quiet btn-stop" disabled={busy} onClick={() => setDeleting(true)}><Trash2 size={13} />Delete</button></div>
-        <CrewHistory crew={crew} />
-      </div>
-    </details>}
+    {!crew.held && !limitOf(crew) && !crew.question && crew.last_runtime_error && !needsPerson(crew) && <p className="quiet-status">{crew.last_runtime_error}</p>}
+    {!crew.held && !limitOf(crew) && (crew.question || needsPerson(crew)) && <div className="notice" role="status">{crew.question || crew.last_runtime_error}{signIn && <div className="mt-3 flex gap-2"><button className="btn-secondary" onClick={() => useAppStore.getState().setPage("resources")}>Open browser to sign in</button><button className="btn-primary" disabled={busy} onClick={() => void toggle()}>Resume</button></div>}<CrewGrants crew={crew} /><WaitingChanges crewId={crew.id} onAnswered={() => void api.crew().then(all => useAppStore.getState().setCrew(all)).catch(() => undefined)} /></div>}
+    {/* Its agent's questions: answered right here too, not only on their desktop alert. */}
+    {!draft && !!crew.asks?.length && <section className="agent-asks" aria-label="It asks you">{crew.asks.map(ask =>
+      <div key={ask.id} className="agent-ask"><p>{ask.question}</p>
+        <QuestionAnswer id={ask.id} choices={ask.choices} onAnswered={() => void api.crew().then(all => useAppStore.getState().setCrew(all)).catch(() => undefined)} /></div>)}
+    </section>}
+    {!draft && checkNote && <p className="check-note" role="status">{checkNote}</p>}
+    {!draft && <CrewOutput crew={crew} />}
+    {!draft && <details className="setup-more"><summary>Settings</summary>{settings}</details>}
     {draft && <div><button className="btn-quiet btn-stop" onClick={() => setDeleting(true)}><Trash2 size={13} />Discard draft</button></div>}
     {editing && <CrewForm existing={crew} onClose={() => setEditing(false)} onSaved={() => setEditing(false)} />}
     {deleting && <DeleteCrewDialog crew={crew} onClose={() => setDeleting(false)} />}
@@ -94,27 +120,49 @@ function NextRun({ crew }: { crew: CrewInstance }) {
   useEffect(() => { const t = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(t); }, []);
   const clock = runClock(crew, now);
   if (!clock) return null;
-  return <div className="next-run" aria-label={`Next run ${clock.label}`}>
-    <div className="next-run-line"><span>Next run <b>{clock.label}</b></span><span>{crew.next_run_at && clock.left > 0 ? clockTime(crew.next_run_at) : ""}</span></div>
-    <div className="next-run-bar"><i style={{ width: `${clock.progress * 100}%` }} /></div>
-  </div>;
+  const at = crew.next_run_at && clock.left > 0 && !clock.label.includes(clockTime(crew.next_run_at)) ? ` · ${clockTime(crew.next_run_at)}` : "";
+  return <span aria-label={`Next run ${clock.label}`}>Next run {clock.label}{at}</span>;
 }
 
-function CrewOutput({ crew, onCheck, checking, onPreview }: { crew: CrewInstance; onCheck?: () => void; checking: boolean; onPreview?: () => void }) {
-  const empty = crew.trigger_type === "daily" ? "Reminders appear on your desktop at the scheduled time." : crew.is_running ? "Waiting for the first result." : "No work yet. Press Run.";
-  return <section aria-label="Latest report">
-    <div className="mb-3 flex items-center justify-between gap-3"><h3 className="text-[13px] font-semibold text-zinc-300">Latest report</h3>
-      <div className="flex gap-1">{onCheck && <button className="btn-quiet" disabled={checking} onClick={onCheck}><RotateCw size={13} className={checking ? "animate-spin" : ""} />Check now</button>}{onPreview && <button className="btn-quiet" onClick={onPreview}><Bell size={13} />Preview</button>}</div></div>
-    {crew.checkpoint ? <Report text={crew.checkpoint} /> : <p className="text-[13px] text-zinc-500">{empty}</p>}
+export function CrewOutput({ crew, ask = true }: { crew: CrewInstance; ask?: boolean }) {
+  // Waiting on access is not a failed run: what it needs, and its buttons, show beside this.
+  const empty = crew.runtime_state === "needs_setup" ? "Nothing yet. It starts once it has what it needs."
+    : crew.last_runtime_error ? `The latest run did not produce a verified report: ${plainError(crew.last_runtime_error.split(/\r?\n/)[0])}` : crew.trigger_type === "daily" ? "Reminders appear on your desktop at the scheduled time." : crew.is_running ? "Waiting for the first result." : "No work yet. Press Run.";
+  // While it runs, its steps take the report's place: a single agent's run is one step.
+  const cycle = crew.cycle ?? (crew.is_running && crew.runtime_state === "working"
+    ? { run_id: "", status: "running", started_at: crew.last_run_at ?? new Date().toISOString(), steps: [{ title: "Working on its job", status: "running" }], current: 0, done: 0, total: 1, question: null }
+    : null);
+  return <section aria-label={cycle ? "Doing this now" : "Latest report"}>
+    {!cycle && <h3 className="mb-2 text-[12px] font-medium text-zinc-500">Latest</h3>}
+    {cycle ? <LiveCycle crew={{ ...crew, cycle }} /> : crew.checkpoint ? <>{crew.last_runtime_error && <p className="mb-2 text-[12px] text-zinc-500">Previous successful report · the latest run failed.</p>}<Report text={crew.checkpoint} /></> : <p className="text-[13px] text-zinc-500">{empty}</p>}
     {crew.question && !crew.held && !limitOf(crew) && <CrewReplyBox crew={crew} />}
-    {crew.trigger_type !== "daily" && !crew.question && <div className="mt-6"><h3 className="mb-3 text-[13px] font-semibold text-zinc-300">Ask</h3>
+    {ask && crew.trigger_type !== "daily" && !crew.question && <div className="mt-5">
+      <Notes crew={crew} />
       <Preferences crew={crew} />
       <CrewAsk key={crew.id} crewId={crew.id} name={crew.name} onPreference={() => void api.crew().then(all => useAppStore.getState().setCrew(all)).catch(() => undefined)} /></div>}
   </section>;
 }
 
+/** What the person told this agent for now ("a meeting at 1 PM today"): used in its runs until
+ *  the day it ends, then gone. Not a change to its job. Each can be taken back. */
+export function Notes({ crew }: { crew: CrewInstance }) {
+  const today = new Date().toLocaleDateString("en-CA");
+  const list = (crew.configuration_plan?.notes ?? []).filter(n => n.until >= today);
+  const [busy, setBusy] = useState<number | null>(null);
+  if (!list.length) return null;
+  async function forget(index: number) {
+    setBusy(index);
+    try { useAppStore.getState().upsertCrew(await api.forgetNote(crew.id, index)); } catch { /* stays */ } finally { setBusy(null); }
+  }
+  const until = (day: string) => day === today ? "today" : "until " + new Date(day + "T12:00").toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+  return <div className="notes-now" aria-label="What it knows for now">
+    <span className="notes-now-label">For now</span>
+    {list.map((n, i) => <span key={n.said + i} className="pref note">{n.text}<em>{until(n.until)}</em><button aria-label={`Forget: ${n.text}`} disabled={busy === i} onClick={() => void forget(i)}><X size={11} /></button></span>)}
+  </div>;
+}
+
 /** What the person told this Crew to do from now on. Each can be taken back. */
-function Preferences({ crew }: { crew: CrewInstance }) {
+export function Preferences({ crew }: { crew: CrewInstance }) {
   const list = crew.configuration_plan?.preferences ?? [];
   const [busy, setBusy] = useState<number | null>(null);
   if (!list.length) return null;
@@ -126,7 +174,7 @@ function Preferences({ crew }: { crew: CrewInstance }) {
     <span key={p.at + i} className="pref">{p.text}<button aria-label={`Forget: ${p.text}`} disabled={busy === i} onClick={() => void forget(i)}><X size={11} /></button></span>)}</div>;
 }
 
-function CrewHistory({ crew }: { crew: CrewInstance }) {
+export function CrewHistory({ crew }: { crew: CrewInstance }) {
   const [runs, setRuns] = useState<CrewRun[]>([]);
   useEffect(() => { let active = true; api.crewRuns(crew.id).then((r) => { if (active) setRuns(r); }).catch(() => undefined); return () => { active = false; }; }, [crew.id, crew.last_run_at, crew.runtime_state]);
   if (!runs.length) return null;
@@ -178,7 +226,7 @@ function CrewForm({ existing, onClose, onSaved }: { existing: CrewInstance | nul
     {error && <div className="notice error-notice mb-4" role="alert">{error}</div>}
     <div className="space-y-4"><Field label="Name"><input className="form-control" autoFocus required maxLength={80} placeholder="Crew name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field><div className="grid grid-cols-2 gap-4"><Field label="Type"><select className="form-control" disabled={!!existing} value={form.template_id} onChange={(e) => { const t = templates.find((t) => t.id === e.target.value); setForm({ ...form, template_id: e.target.value, review_interval_minutes: t?.default_interval_minutes ?? 30, schedule_time: null, allow_device_metrics: false, trigger_type: e.target.value === "schedule" ? "daily" : e.target.value === "communication" ? "gmail_message" : "interval", google_resources: [] }); }}>{templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select></Field><Field label="Model route"><select className="form-control" required value={form.route_id} onChange={(e) => setForm({ ...form, route_id: e.target.value })}><option value="" disabled>Select a route</option>{routes.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}</select></Field></div><p className="text-[11px] leading-5 text-zinc-500">{template?.behavior}</p><Field label="Instructions"><textarea className="form-control resize-y" rows={4} required maxLength={4000} placeholder="Describe what this Crew should do." value={form.responsibilities} onChange={(e) => setForm({ ...form, responsibilities: e.target.value })} /></Field>
     <Field label="When should this Crew work?"><select aria-label="Crew trigger" className="form-control" value={form.trigger_type} onChange={(e) => setForm({ ...form, trigger_type: e.target.value as TriggerType, schedule_time: e.target.value === "daily" ? form.schedule_time : null })}>{Object.entries(triggerNames).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></Field>
-    {form.trigger_type === "daily" ? <div className="grid grid-cols-[.8fr_1.5fr] gap-4"><Field label="Daily time"><input type="time" className="form-control" value={form.schedule_time ?? ""} onChange={(e) => setForm({ ...form, schedule_time: e.target.value || null })} /><span className="mt-1 block text-[10px] text-zinc-500">Windows local time</span></Field><Field label="Reminder message"><input className="form-control" maxLength={1000} placeholder="Uses your instructions if empty" value={form.reminder_text ?? ""} onChange={(e) => setForm({ ...form, reminder_text: e.target.value })} /></Field></div> : <div className="grid grid-cols-2 gap-4">{form.trigger_type === "interval" && <Field label="Check every (minutes)"><input className="form-control" type="number" min={5} max={10080} required value={form.review_interval_minutes} onChange={(e) => setForm({ ...form, review_interval_minutes: Number(e.target.value) })} /></Field>}<Field label="AI calls per run"><input className="form-control" type="number" min={2} max={50} required value={form.max_model_calls} onChange={(e) => setForm({ ...form, max_model_calls: Number(e.target.value) })} /><span className="mt-1 block text-[10px] text-zinc-500">Each step it thinks through is one call. At least 2: one to decide, one to finish.</span></Field><Field label="AI calls per day"><input className="form-control" type="number" min={Math.max(2, form.max_model_calls ?? 2)} max={100} required value={form.daily_call_limit} onChange={(e) => setForm({ ...form, daily_call_limit: Number(e.target.value) })} /><span className="mt-1 block text-[10px] text-zinc-500">Out of calls, it waits until tomorrow by itself.</span></Field></div>}
+    {form.trigger_type === "daily" ? <div className="grid grid-cols-[.8fr_1.5fr] gap-4"><Field label="Daily time"><input type="time" className="form-control" value={form.schedule_time ?? ""} onChange={(e) => setForm({ ...form, schedule_time: e.target.value || null })} /><span className="mt-1 block text-[10px] text-zinc-500">Windows local time</span></Field><Field label="Reminder message"><input className="form-control" maxLength={1000} placeholder="Uses your instructions if empty" value={form.reminder_text ?? ""} onChange={(e) => setForm({ ...form, reminder_text: e.target.value })} /></Field></div> : <div className="grid grid-cols-2 gap-4">{form.trigger_type === "interval" && <Field label="Check every (minutes)"><input className="form-control" type="number" min={5} max={10080} required value={form.review_interval_minutes} onChange={(e) => setForm({ ...form, review_interval_minutes: Number(e.target.value) })} /></Field>}</div>}
     {form.trigger_type === "gmail_message" && <div className="grid grid-cols-2 gap-4"><Field label="Sender contains (optional)"><input className="form-control" value={form.mail_sender ?? ""} maxLength={160} onChange={(e) => setForm({ ...form, mail_sender: e.target.value || null })} placeholder="admissions@college.edu" /></Field><Field label="Subject contains (optional)"><input className="form-control" value={form.mail_subject ?? ""} maxLength={160} onChange={(e) => setForm({ ...form, mail_subject: e.target.value || null })} placeholder="deadline" /></Field></div>}
     <CrewAccountPermissions googleValue={form.google_capabilities??[]} connectorValue={form.connector_capabilities??[]} onChange={(caps,connectors)=>setForm({...form,google_capabilities:caps,google_resources:caps.filter(c=>c.endsWith(":read")).map(c=>c.split(":")[0]) as GoogleResource[],connector_capabilities:connectors})}/>
     {form.template_id === "computer" && <label className="flex items-start gap-3 rounded-lg border border-line bg-panel p-3 text-xs"><input type="checkbox" checked={form.allow_device_metrics} onChange={(e) => setForm({ ...form, allow_device_metrics: e.target.checked })} className="mt-0.5 accent-[#007aff]" /><span><span className="font-medium text-zinc-200">Allow device metrics</span><span className="mt-1 block text-[11px] leading-5 text-zinc-500">Read CPU, memory, battery, and system-drive usage. Does not read files or change settings. Device checks use no model calls.</span></span></label>}

@@ -20,7 +20,17 @@
 
 ---
 
-Mavo is a Windows desktop application for turning recurring responsibilities into persistent AI agents called **Crew**. Describe what you want, refine the proposed setup, grant specific access, and let a Crew run on its schedule or supported events.
+Mavo is a Windows desktop application for turning recurring responsibilities into persistent **Crew**, each containing one or more specialist agents. Describe what you want, refine the proposed setup, grant specific access, and let a Crew run on its schedule or supported events.
+
+[Crew Architecture V2](docs/crew-architecture-v2.md) adds Crew-owned agent identities, bounded
+dependency execution, durable member handoffs, expandable member graphs and `@Crew/Agent` mentions.
+It reuses existing runtimes and preserves legacy Crew. This remains a developer preview; the V2
+guide distinguishes tested behavior from live-provider verification and outstanding release work.
+
+On first sign-in, a guided setup walks through **Welcome → Providers → Resources** before
+opening the workspace. Add named model routes, connect only the resources you need, or
+explicitly skip optional setup. Progress resumes on this device; nothing is connected or
+granted automatically.
 
 The goal is not simply to answer messages. It is to make agent-based automation understandable: what an agent can read, which model it uses, when it runs, and what actually happened.
 
@@ -50,7 +60,13 @@ The goal is not simply to answer messages. It is to make agent-based automation 
 1. **Describe** a responsibility in Chat or Create Crew.
 2. **Clarify** the proposed setup and answer its questions.
 3. **Review** the model route, resources, actions, and execution limits.
-4. **Verify and add** the Crew, then inspect, run, pause, refine, or delete it.
+4. **Test & add** the Crew. Supported read-only work runs once before activation; measured
+   per-agent model calls get a three-call buffer within approved limits. Failed or unsafe-to-test
+   workflows stay drafts. Then inspect, run, pause, refine, or delete it.
+
+See [first-run coverage and limitations](docs/first-run-verification.md). A passed sample is not
+a guarantee about every future task or provider response, and automatic tests never send mail,
+run terminal commands or perform other consequential actions just to verify setup.
 
 Incomplete setups remain drafts. They are not silently published as active agents.
 
@@ -64,6 +80,9 @@ Incomplete setups remain drafts. They are not silently published as active agent
 - Deterministic Schedule Crew reminders and permission-checked Computer Crew monitoring.
 - Multiple persistent MAVO CORE conversations and description-first Crew planning.
 - Desktop tray presence and an attached notification panel for reminders and agent updates.
+
+See [desktop alert delivery](docs/desktop-alerts.md) for timing, mute, unread updates,
+restart recovery and verification steps.
 
 Template availability does **not** imply that every specialty has a complete external integration.
 
@@ -81,6 +100,17 @@ Google and GitHub connections require publisher application setup and user conse
 See [integration setup](docs/plugins/SETUP.md), [connecting accounts](docs/connecting-accounts.md), and [automation examples](docs/automation-examples.md).
 
 ## Architecture
+
+General chat now brings Core planning, ID-backed Crew mentions, durable task updates and
+reviewable configuration changes together. Existing Crew pipelines and one-time teams share
+durable handoff infrastructure while keeping their own lifecycles. See the
+[orchestration guide](docs/orchestration.md) for the implemented scope, safety boundaries and
+remaining work; this is not an assertion of unrestricted production autonomy.
+
+Feed reports use [reference-bound source reporting](docs/source-reporting.md): the
+model selects fetched items, Mavo preserves original source links, and an unsupported
+sibling result does not discard the supported stories. Permission and freshness
+checks remain application-enforced.
 
 Mavo uses a **modular monolith**, not a separate model process for every agent.
 
@@ -168,23 +198,24 @@ Follow the guides for:
 - [Google connectors](docs/google-setup.md): register the Desktop OAuth application if Google services are needed.
 - [GitHub connection](docs/github-app-setup.md): register the publisher GitHub App if repository access is needed.
 
-For local coordinator development, save its AIRouter key through the hidden prompt and start it in a separate terminal:
+For local coordinator development, save its AIRouter key once through the hidden prompt:
 
 ```powershell
 ./scripts/publisher.ps1 -SetKey
-./scripts/publisher.ps1
 ```
 
 The development gateway binds to `127.0.0.1:8741`. Keep `MAVO_CORE_GATEWAY_URL` pointed at that local address in the root `.env`.
+The development desktop starts and supervises this service automatically. A separate
+publisher terminal is no longer required; `publisher.ps1` is still available for standalone server development.
 
 Do not commit real `.env` files, Firebase deployment configuration, credentials, or application databases. Public desktop users should never be asked for the publisher's shared key.
 
 ### 3. Start Mavo
 
-In another terminal:
+Use this single command:
 
 ```powershell
-./scripts/dev.ps1
+./scripts/start-mavo.ps1
 ```
 
 Sign in, add an agent model route in **Settings**, and describe your first Crew. Local Ollama routes need no cloud API key; cloud routes use the user's own provider credentials and credits.
@@ -192,7 +223,7 @@ Sign in, add an agent model route in **Settings**, and describe your first Crew.
 If a previous development instance still owns the executable:
 
 ```powershell
-./scripts/dev.ps1 -Restart
+./scripts/start-mavo.ps1 -Restart
 ```
 
 Restart interrupts active work. Closing the window can leave Mavo in the tray; use **Quit** to exit completely.

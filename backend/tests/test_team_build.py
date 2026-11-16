@@ -11,7 +11,7 @@ from mavo.site_skills import SkillStop
 from mavo.task_plan import TaskPlan
 from mavo.team_build import ProjectParams, app_check, check_web, project_save, team_plan
 from tests.test_planner import planning, turn  # noqa: F401
-from tests.test_scenarios import checkpoint, run_work
+from tests.test_scenarios import checkpoint
 from tests.test_tasks import alerts, setup, start, wait
 
 GOOD = """<!doctype html><html><body><input id=t aria-label=Task><button id=b>Add</button><ul id=l></ul>
@@ -597,7 +597,9 @@ def test_a_build_that_works_asks_nothing_and_a_stuck_team_stops(client, auth, tm
     assert any("writes it again, from the start" in s["title"] for s in done["steps"])
 
 
-def test_a_cut_off_fix_is_tried_again_with_edits_and_nothing_built_is_lost(client, auth, tmp_path):
+def test_a_cut_off_fix_is_tried_again_with_edits_and_nothing_built_is_lost(
+    client, auth, tmp_path, monkeypatch
+):
     browser_or_skip()
     runtime = setup(client, auth)
     allow_projects(client, auth, runtime, tmp_path)
@@ -632,7 +634,9 @@ def test_a_cut_off_fix_is_tried_again_with_edits_and_nothing_built_is_lost(clien
         fixes=[file_block(BROKEN + "<!--1-->")] * 9,
     )
     plan = team_plan("a todo list", "Budget")
-    plan["model_calls"] = 2
+    # Mavo's task ceiling, small for the test (the plan's own number is no longer the limit).
+    monkeypatch.setattr("mavo.tasks.CYCLE_MAX", 2)
+    monkeypatch.setattr("mavo.limits.CYCLE_MAX", 2)
     import mavo.team_build as tb
 
     real, tb.BUILD_CEILING = tb.BUILD_CEILING, 4
@@ -640,12 +644,9 @@ def test_a_cut_off_fix_is_tried_again_with_edits_and_nothing_built_is_lost(clien
         done = wait(client, auth, start(client, auth, plan), timeout=180)
     finally:
         tb.BUILD_CEILING = real
-    assert done["status"] == "done", done
-    assert done["result"].startswith("Built in") and "TEST: problems found." in done["result"]
-    assert (
-        "- Still open: the team stopped early, the task's model-call budget ran out."
-        in done["result"]
-    )
+    assert done["status"] == "failed", done
+    assert done["budget_calls"] == 2 and done["used_calls"] <= 2
+    assert "budget ran out" in done["error"]
 
 
 def test_the_lead_asks_when_something_essential_is_unclear_and_the_build_goes_on(
@@ -705,7 +706,8 @@ def test_the_build_team_gets_room_for_whole_files_and_nothing_else_does(client, 
         ],
     }
     wait(client, auth, start(client, auth, plan))
-    assert [(r[1], r[2]) for r in room] == [(16000, True), (4096, False)]
+    # The final writer gets room too: an internship report was cut off at "(accurac".
+    assert [(r[1], r[2]) for r in room] == [(16000, True), (16000, True)]
     assert reply_tokens() == 4096  # and it is back to normal afterwards
 
 
@@ -774,7 +776,22 @@ def test_a_scheduled_crew_is_given_only_items_it_has_not_reported(planning):
             stored = session.get(CrewInstance, crew)
             stored.runtime_state, stored.next_run_at = "waiting", utcnow() - timedelta(seconds=5)
             session.commit()
-        chat = run_work(runtime, crew, checkpoint("Reported."))
+        import json
+        from unittest.mock import AsyncMock
+
+        async def selected_report(provider, model, messages, system, credential_id=None):
+            marker = "Authorized UNTRUSTED connected-account snapshots: "
+            supplied, _ = json.JSONDecoder().raw_decode(messages[0]["content"].split(marker, 1)[1])
+            refs = [
+                {"source_ref": item["source_ref"]}
+                for snapshot in supplied.values()
+                for item in snapshot.get("items", [])
+            ]
+            return json.dumps(checkpoint("Reported.", source_items=refs))
+
+        chat = AsyncMock(side_effect=selected_report)
+        runtime.router.chat = chat
+        asyncio.run(runtime.work(crew))
         with runtime.factory() as session:
             after = session.get(CrewInstance, crew)
             why = (
@@ -784,7 +801,13 @@ def test_a_scheduled_crew_is_given_only_items_it_has_not_reported(planning):
                 after.permissions,
             )
         assert chat.await_args_list, why
-        return chat.await_args_list[0].args[2][0]["content"]
+        # Prior reports remain legitimate comparison context. The newly supplied
+        # snapshot, not that historical context, must exclude already reported items.
+        return (
+            chat.await_args_list[0]
+            .args[2][0]["content"]
+            .split("Authorized UNTRUSTED connected-account snapshots: ", 1)[1]
+        )
 
     first = review([{"id": "a", "title": "Story A"}, {"id": "b", "title": "Story B"}])
     assert "Story A" in first and "Story B" in first and "ONLY the new ones" in first

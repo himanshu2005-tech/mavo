@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import html
 import json
 import re
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import quote
 
 import httpx
@@ -17,6 +16,7 @@ from mavo.database import GoogleAccount, ResourceEvent
 from mavo.google_auth import GoogleAuth, GoogleConnectionError
 from mavo.google_permissions import GOOGLE_SERVICES
 from mavo.resources.google_extended import SERVICES, fetch_metadata, reserve_read
+from mavo.resources.mail_text import message_text
 
 EVENT_RESOURCES = {
     "gmail_message": "gmail",
@@ -25,6 +25,17 @@ EVENT_RESOURCES = {
 }
 
 
+def valid_items(data, name):
+    rows = data.get("items", [])
+    if not isinstance(rows, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]
+        for item in rows
+    ):
+        raise GoogleConnectionError(f"Google returned invalid {name} items")
+    return rows
+
+
+CALENDAR_DAYS = 30  # how far ahead a calendar read goes; further is read when asked for
 YT_FEED = "https://www.youtube.com/feeds/videos.xml"
 YT_CHANNEL = re.compile(r"UC[A-Za-z0-9_-]{22}")
 YT_VIDEO = re.compile(r"[A-Za-z0-9_-]{11}")
@@ -55,6 +66,10 @@ def parse_feed(text, channel_title=""):
             }
         )
     return videos
+
+
+class GmailHistoryExpired(GoogleConnectionError):
+    """Gmail keeps its change history about a week: older markers are gone. Not a setup problem."""
 
 
 class GoogleResourcePool:
@@ -163,8 +178,8 @@ class GoogleResourcePool:
                     "Google permission is missing or revoked. Check Settings and enabled APIs."
                 ) from exc
             if exc.response.status_code == 404 and resource == "gmail" and "/history" in path:
-                raise GoogleConnectionError(
-                    "Gmail history expired. Disconnect and reconnect to establish a new baseline."
+                raise GmailHistoryExpired(
+                    "Gmail's change history moved on; starting a fresh one."
                 ) from exc
             raise GoogleConnectionError(
                 f"Google {resource} request failed ({exc.response.status_code})"
@@ -180,10 +195,23 @@ class GoogleResourcePool:
             "/users/me/messages/" + quote(message_id, safe=""),
             {"format": "metadata", "metadataHeaders": ["From", "Subject", "Date", "Message-ID"]},
         )
-        headers = {
-            h.get("name", "").casefold(): h.get("value", "")
-            for h in item.get("payload", {}).get("headers", [])
-        }
+        payload = item.get("payload", {})
+        rows = payload.get("headers", []) if isinstance(payload, dict) else None
+        labels = item.get("labelIds", [])
+        if (
+            item.get("id") != message_id
+            or not isinstance(rows, list)
+            or any(
+                not isinstance(h, dict)
+                or not isinstance(h.get("name"), str)
+                or not isinstance(h.get("value"), str)
+                for h in rows
+            )
+            or not isinstance(labels, list)
+            or any(not isinstance(label, str) for label in labels)
+        ):
+            raise GoogleConnectionError("Google returned invalid inbox headers")
+        headers = {h["name"].casefold(): h["value"] for h in rows}
         return {
             "id": item["id"],
             "thread_id": item.get("threadId"),
@@ -192,7 +220,7 @@ class GoogleResourcePool:
             "subject": headers.get("subject", "")[:1000],
             "date": headers.get("date", "")[:100],
             "internal_date": item.get("internalDate", ""),
-            "labels": item.get("labelIds", []),
+            "labels": labels,
         }
 
     async def message_body(self, message_id):
@@ -202,27 +230,16 @@ class GoogleResourcePool:
             {"format": "full"},
             capability="body",
         )
-        parts, text = [item.get("payload", {})], []
-        visited = 0
-        while parts and len(text) < 20 and visited < 100:
-            visited += 1
-            part = parts.pop()
-            parts.extend(part.get("parts", [])[:30])
-            data = part.get("body", {}).get("data")
-            if part.get("mimeType") == "text/plain" and isinstance(data, str):
-                try:
-                    text.append(
-                        base64.urlsafe_b64decode((data[:90000] + "===").encode()).decode(
-                            "utf-8", errors="replace"
-                        )[:16000]
-                    )
-                except (ValueError, UnicodeError):
-                    raise GoogleConnectionError("Google returned an unreadable message") from None
+        text, body_format = message_text(item.get("payload", {}))
+        if item.get("id") != message_id:
+            raise GoogleConnectionError("Google returned a different message than requested")
         return {
             "id": item["id"],
             "thread_id": item.get("threadId"),
-            "body": "\n".join(text)[:24000]
-            or "No plain-text body available. Attachments and remote content are not loaded.",
+            "body": text
+            or "No readable body available. Attachments and remote content are not loaded.",
+            "body_format": body_format,
+            "body_available": bool(text),
         }
 
     async def fetch_gmail(self, cursor):
@@ -240,6 +257,29 @@ class GoogleResourcePool:
 
             items = await asyncio.gather(*(read(item) for item in listing.get("messages", [])))
             return items, {"history_id": str(profile["historyId"])}, events
+        try:
+            return await self._gmail_since(cursor)
+        except GmailHistoryExpired:
+            # Mavo was off longer than Gmail keeps history: start again from the inbox as it is
+            # now, and treat what arrived since the last look as new, so nothing waits on a
+            # reconnect and nothing seen before is reported twice.
+            fresh, baseline, _ = await self.fetch_gmail({})
+            if not cursor.get("snapshot"):
+                # Nothing to compare against: start afresh without calling old mail new.
+                return fresh, baseline, []
+            seen = {item.get("id") for item in cursor.get("snapshot", [])}
+            newest = max(
+                (int(i.get("internal_date") or 0) for i in cursor.get("snapshot", [])), default=0
+            )
+            events = [
+                (item["id"], item)
+                for item in reversed(fresh)
+                if item["id"] not in seen and int(item.get("internal_date") or 0) > newest
+            ]
+            return fresh, baseline, events
+
+    async def _gmail_since(self, cursor):
+        events = []
         history_id = str(cursor["history_id"])
         page = None
         items = list(cursor.get("snapshot", []))
@@ -275,13 +315,14 @@ class GoogleResourcePool:
             history_id = str(history[-1]["id"])
         return items, {"history_id": history_id}, events
 
-    async def fetch_calendar(self):
+    async def fetch_calendar(self, start: datetime | None = None, end: datetime | None = None):
+        """Events from now to CALENDAR_DAYS ahead, or between the two times given."""
         items = []
         page = None
         for _ in range(5):
             params = {
-                "timeMin": datetime.now(UTC).isoformat(),
-                "timeMax": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+                "timeMin": (start or datetime.now(UTC)).isoformat(),
+                "timeMax": (end or datetime.now(UTC) + timedelta(days=CALENDAR_DAYS)).isoformat(),
                 "singleEvents": "true",
                 "orderBy": "startTime",
                 "maxResults": 100,
@@ -289,28 +330,80 @@ class GoogleResourcePool:
             if page:
                 params["pageToken"] = page
             data = await self.get("calendar", "/calendars/primary/events", params)
-            for item in data.get("items", []):
+            rows = valid_items(data, "Calendar")
+            for item in rows:
                 items.append(
-                    {
-                        key: item.get(key)
-                        for key in (
-                            "id",
-                            "etag",
-                            "summary",
-                            "status",
-                            "start",
-                            "end",
-                            "updated",
-                            "location",
-                        )
-                    }
+                    with_days(
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "id",
+                                "etag",
+                                "summary",
+                                "status",
+                                "start",
+                                "end",
+                                "updated",
+                                "location",
+                            )
+                        }
+                    )
                 )
             page = data.get("nextPageToken")
             if not page:
-                return items
+                return items + await self.other_calendars(params)
         raise GoogleConnectionError(
             "More than 500 events in the selected window. Narrow calendar support is required."
         )
+
+    async def other_calendars(self, window):
+        """The person's other calendars that are switched on in Google Calendar (holidays,
+        shared or subscribed ones), so "is tomorrow a holiday?" has an answer. Each event says
+        which calendar it is from and is read-only to Mavo; one that fails is left out."""
+        try:
+            listing = await self.get("calendar", "/users/me/calendarList", {"maxResults": 50})
+        except GoogleConnectionError:
+            return []
+        extra = []
+        for cal in [
+            c
+            for c in listing.get("items", [])
+            if isinstance(c, dict)
+            and c.get("selected")
+            and not c.get("primary")
+            and isinstance(c.get("id"), str)
+        ][:6]:
+            params = {k: v for k, v in window.items() if k != "pageToken"} | {"maxResults": 50}
+            try:
+                data = await self.get(
+                    "calendar", "/calendars/" + quote(cal["id"], safe="") + "/events", params
+                )
+                rows = valid_items(data, "Calendar")
+            except GoogleConnectionError:
+                continue
+            for item in rows:
+                extra.append(
+                    with_days(
+                        {
+                            **{
+                                key: item.get(key)
+                                for key in (
+                                    "id",
+                                    "etag",
+                                    "summary",
+                                    "status",
+                                    "start",
+                                    "end",
+                                    "updated",
+                                    "location",
+                                )
+                            },
+                            "calendar": str(cal.get("summary") or "Other calendar")[:80],
+                            "read_only": True,
+                        }
+                    )
+                )
+        return extra
 
     async def fetch_tasks(self):
         items = []
@@ -325,7 +418,7 @@ class GoogleResourcePool:
                     key: item.get(key)
                     for key in ("id", "etag", "title", "notes", "status", "due", "updated")
                 }
-                for item in data.get("items", [])
+                for item in valid_items(data, "Tasks")
             )
             page = data.get("nextPageToken")
             if not page:
@@ -400,6 +493,19 @@ class GoogleResourcePool:
                     }
                 )
         return videos
+
+    async def calendar_between(self, start: datetime, end: datetime) -> list[dict]:
+        """The person's events between two times, read now: for a meeting asked further ahead
+        than a calendar read covers. Nothing is cached or remembered from it."""
+        await self.auth.access_token("calendar")
+        with self.factory() as session:
+            if not session.get(GoogleAccount, "google"):
+                raise GoogleConnectionError("Sign in to Google in Settings first")
+        items = await self.fetch_calendar(start, end)
+        return [
+            {key: value[:2000] if isinstance(value, str) else value for key, value in item.items()}
+            for item in items
+        ]
 
     async def read(self, resource):
         if resource not in self.locks:
@@ -511,3 +617,21 @@ class GoogleResourcePool:
             ttl = 900 if resource in {"contacts", "youtube"} else 300 if resource == "drive" else 60
             self.cache[resource] = (time.monotonic() + ttl, subject, epoch, result)
             return result
+
+
+def with_days(item: dict) -> dict:
+    """An all-day event says which days it covers, plainly. Google gives its end as the day
+    AFTER it ends ("end: 2026-11-16" for a holiday on the 15th); a reviewer read that as the
+    holiday running into the 16th and refused a free 10 am slot on it."""
+    start = (item.get("start") or {}).get("date") if isinstance(item.get("start"), dict) else None
+    end = (item.get("end") or {}).get("date") if isinstance(item.get("end"), dict) else None
+    if not start:
+        return item
+    try:
+        first = date.fromisoformat(start)
+        last = date.fromisoformat(end) - timedelta(days=1) if end else first
+    except ValueError:
+        return item
+    last = max(first, last)
+    days = first.isoformat() if last == first else f"{first.isoformat()} to {last.isoformat()}"
+    return {**item, "all_day_on": days + " (all day; free outside these dates)"}

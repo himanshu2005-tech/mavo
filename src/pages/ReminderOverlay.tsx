@@ -23,6 +23,19 @@ export function ReminderOverlay() {
     return () => { active = false; void unlisten.then((cleanup) => cleanup()); document.documentElement.classList.remove("overlay-root"); window.speechSynthesis?.cancel(); };
   }, []);
 
+  // A change waiting for the person's OK: its alert answers it (closing it was taken for a yes).
+  const actionId = reminder?.kind === "approval" && reminder.task_step_id?.startsWith("action:") ? reminder.task_step_id.slice(7) : null;
+  async function answer(approve: boolean) {
+    if (!reminder || !actionId) return;
+    try {
+      await (approve ? api.approveChange(actionId) : api.rejectAction(actionId));
+      await api.dismissReminder(reminder.id).catch(() => undefined);
+      await invoke("close_reminder_overlay");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not answer it. Open Actions.");
+    }
+  }
+
   async function dismiss() {
     if (!reminder) return;
     try {
@@ -36,11 +49,11 @@ export function ReminderOverlay() {
 
   return <div className="h-screen bg-ink p-3 text-zinc-200"><div className="relative flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-panel p-5 shadow-2xl">
 
-    <div className="flex items-center gap-3"><div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-mint/15 text-mint"><BellRing size={19} /></div><div className="min-w-0"><div className="text-[11px] text-zinc-500">{reminder?.preview ? "Reminder preview" : reminder?.kind === "crew_update" ? "Crew update" : "Mavo reminder"}</div><h1 className="mt-0.5 truncate text-sm font-medium text-white">{reminder?.crew_name ?? "Loading…"}</h1></div></div>
+    <div className="flex items-center gap-3"><div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-mint/15 text-mint"><BellRing size={19} /></div><div className="min-w-0"><div className="text-[11px] text-zinc-500">{reminder?.preview ? "Reminder preview" : actionId ? "Needs your OK" : reminder?.kind === "crew_update" ? "Crew update" : "Mavo reminder"}</div><h1 className="mt-0.5 truncate text-sm font-medium text-white">{reminder?.crew_name ?? "Loading…"}</h1></div></div>
     <p className="message-content mt-4 max-h-24 overflow-y-auto text-sm leading-5 text-zinc-300">{reminder?.message ?? error ?? "Preparing your reminder…"}</p>
     {error && reminder && <p className="mt-1 text-[10px] text-rose-300">{error}</p>}
     {voice === "unavailable" && <p className="mt-2 text-[10px] text-amber-200">Voice could not start. Try Read aloud or check Windows voices.</p>}
-    <div className="mt-auto flex items-center justify-between"><button disabled={!reminder} onClick={() => reminder && speak(reminder.message, setVoice)} className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-[10px] text-zinc-500 hover:bg-white/5 hover:text-zinc-200"><Volume2 size={13} /> {voice === "speaking" ? "Reading aloud…" : "Read aloud"}</button><button disabled={!reminder} onClick={() => void dismiss()} className="btn-primary">Dismiss</button></div>
+    <div className="mt-auto flex items-center justify-between"><button disabled={!reminder} onClick={() => reminder && speak(reminder.message, setVoice)} className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-[10px] text-zinc-500 hover:bg-white/5 hover:text-zinc-200"><Volume2 size={13} /> {voice === "speaking" ? "Reading aloud…" : "Read aloud"}</button>{actionId ? <span className="flex gap-2"><button onClick={() => void answer(false)} className="btn-secondary">Deny</button><button onClick={() => void answer(true)} className="btn-primary">Approve</button></span> : <button disabled={!reminder} onClick={() => void dismiss()} className="btn-primary">Dismiss</button>}</div>
   </div></div>;
 }
 

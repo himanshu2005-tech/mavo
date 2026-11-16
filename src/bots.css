@@ -1,0 +1,152 @@
+/* ───────────────────────────── Agent bots (components/AgentBot.tsx) ─────────────────────────────
+   One small bot per agent, drawn in the agent's identity colour (currentColor). It blinks while it
+   waits, looks around and types while it works, shows an amber light when it needs the person,
+   and sleeps when stopped. */
+
+.agent-bot { width: 100%; height: 100%; display: block; overflow: visible; }
+.agent-bot .bot-head > * { fill: color-mix(in srgb, currentColor 16%, transparent); stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
+.agent-bot .bot-eyes > *, .agent-bot .bot-mouth > *, .agent-bot .bot-dots > * { fill: currentColor; }
+.agent-bot .bot-line { fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.agent-bot .bot-tip, .agent-bot .bot-ear { fill: currentColor; }
+.agent-bot .bot-visor { fill: currentColor; opacity: .85; }
+.agent-bot .bot-glint { fill: var(--surface); opacity: .8; }
+
+/* Waiting for its next run: an occasional blink, each bot at its own moment. */
+.agent-bot .bot-eyes { transform-box: fill-box; transform-origin: center; }
+.agent-bot:is([data-state=ready],[data-state=idle]) .bot-eyes { animation: bot-blink 6.4s ease-in-out infinite; animation-delay: var(--blink-delay, 0s); }
+@keyframes bot-blink { 0%, 93%, 100% { transform: scaleY(1); } 96% { transform: scaleY(.12); } }
+
+/* Working: it looks from side to side, and types. */
+.agent-bot[data-state=working] .bot-eyes { animation: bot-look 2.4s ease-in-out infinite; }
+@keyframes bot-look { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-1.3px); } 75% { transform: translateX(1.3px); } }
+.agent-bot .bot-dots > * { transform-box: fill-box; transform-origin: center; animation: bot-type 1.1s ease-in-out infinite; animation-delay: var(--d, 0s); }
+@keyframes bot-type { 0%, 60%, 100% { transform: translateY(0); opacity: .45; } 30% { transform: translateY(-1.4px); opacity: 1; } }
+
+/* Needs the person: its light turns amber and pulses. */
+.agent-bot .bot-tip.is-needs { fill: var(--c-amber); stroke: var(--surface, #000); stroke-width: .9; paint-order: stroke; transform-box: fill-box; transform-origin: center; transform: scale(1.35); animation: bot-call 1.6s ease-in-out infinite; }
+.agent-bot[data-state=needs] .bot-head > * { stroke-dasharray: none; }
+.agent-bot[data-state=needs] .bot-eyes > * { fill: var(--c-amber); }
+@keyframes bot-call { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+/* Stopped: asleep and quiet. */
+.agent-bot[data-state=stopped] { opacity: .55; }
+.agent-bot[data-state=stopped] .bot-head > * { fill: transparent; }
+
+@media (prefers-reduced-motion: reduce) { .agent-bot * { animation: none !important; } }
+
+/* Where a bot stands in for an agent's initials. */
+.map-face.has-bot { padding: 3px; }
+.map-face.lg.has-bot { padding: 4px; }
+.map-face.sm.has-bot { padding: 2.5px; }
+.library-list .library-bot { display: block; width: 34px; height: 34px; flex: none; padding: 4px; border-radius: 6px; color: var(--identity, var(--accent)); background: color-mix(in srgb, var(--identity, var(--accent)) 10%, transparent); }
+.dlist-bot { display: inline-block; width: 16px; height: 16px; flex: none; color: var(--identity, var(--muted)); vertical-align: -3px; }
+
+/* Mavo itself, thinking in the chat: its own bot, typing. */
+.thinking .thinking-bot { display: block; width: 26px; height: 26px; color: var(--accent); }
+
+/* Your crews, living behind the chat: each bot wanders on its own path at its own pace, bobbing
+   as it goes. Busy ones bustle, one that needs you hops and glows, stopped ones doze in place.
+   Decoration only: under the conversation, never in the way of a click. */
+.chat-stage > :not(.agent-life) { position: relative; z-index: 1; }
+/* Its bar and its box sit above the conversation: their menus (the chat list, @mentions) open
+   over it. As specific as the rule above, or that rule wins and the conversation covers them. */
+.chat-stage > header:not(.agent-life) { z-index: 3; }
+.chat-stage > form:not(.agent-life) { z-index: 2; }
+.agent-life { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 0; }
+.life-bot { position: absolute; left: var(--x0); top: var(--y0); width: 28px; height: 28px; color: var(--identity, var(--accent)); opacity: .5;
+  animation: life-roam var(--roam, 60s) ease-in-out var(--late, 0s) infinite alternate; transition: opacity .6s; }
+.life-body { display: block; width: 100%; height: 100%; animation: life-bob 3.2s ease-in-out infinite; }
+.life-body > * { width: 100%; height: 100%; }
+@keyframes life-roam {
+  0% { left: var(--x0); top: var(--y0); }
+  33% { left: var(--x1); top: var(--y1); }
+  66% { left: var(--x2); top: var(--y2); }
+  100% { left: var(--x3); top: var(--y3); }
+}
+/* Its shadow on the ground, smaller as it bobs up. */
+.life-bot::after { content: ""; position: absolute; left: 50%; bottom: -5px; width: 18px; height: 4px; margin-left: -9px; border-radius: 50%;
+  background: currentColor; opacity: .25; filter: blur(2px); animation: life-shadow 3.2s ease-in-out infinite; }
+.life-bot[data-state=working]::after { animation-duration: 1.3s; }
+@keyframes life-shadow { 0%, 100% { transform: scaleX(1); } 50% { transform: scaleX(.65); opacity: .15; } }
+@keyframes life-bob { 0%, 100% { transform: translateY(0) rotate(-3deg); } 50% { transform: translateY(-5px) rotate(3deg); } }
+.life-bot[data-state=working] { opacity: .7; animation-duration: calc(var(--roam, 60s) * .55); }
+.life-bot[data-state=working] .life-body { animation-duration: 1.3s; }
+.life-bot[data-state=needs] { opacity: .9; animation-play-state: paused; filter: drop-shadow(0 0 6px var(--c-amber)); }
+.life-bot[data-state=needs] .life-body { animation: life-hop .9s ease-in-out infinite; }
+@keyframes life-hop { 0%, 100% { transform: translateY(0); } 40% { transform: translateY(-9px); } 60% { transform: translateY(-9px) rotate(6deg); } }
+.life-bot[data-state=stopped] { opacity: .25; animation-play-state: paused; }
+.life-bot[data-state=stopped] .life-body { animation-duration: 6s; }
+/* A long chat: the bots step back so reading comes first. */
+.chat-stage:has(.message-content) .life-bot { opacity: .28; }
+.chat-stage:has(.message-content) .life-bot[data-state=working] { opacity: .42; }
+.chat-stage:has(.message-content) .life-bot[data-state=needs] { opacity: .7; }
+
+/* Mavo saying hello on a new chat. */
+.chat-hello { display: block; width: 40px; height: 40px; margin: 0 auto 10px; color: var(--accent); animation: hello 2.6s ease-in-out infinite; transform-origin: 50% 90%; }
+.chat-hello > * { width: 100%; height: 100%; }
+@keyframes hello { 0%, 60%, 100% { transform: rotate(0); } 70% { transform: rotate(-9deg); } 80% { transform: rotate(8deg); } 90% { transform: rotate(-4deg); } }
+
+/* Thinking: its bot, and three dots that bounce in Mavo's colours. */
+.thinking { align-items: center; gap: 8px; }
+.thinking-dots { display: inline-flex; gap: 5px; }
+.thinking .thinking-dots i { width: 7px; height: 7px; border-radius: 50%; animation: dot-bounce 1.1s ease-in-out infinite; }
+.thinking .thinking-dots i:nth-child(2) { animation-delay: .14s; }
+.thinking .thinking-dots i:nth-child(3) { animation-delay: .28s; }
+@keyframes dot-bounce { 0%, 70%, 100% { transform: translateY(0) scale(.85); opacity: .5; } 35% { transform: translateY(-6px) scale(1); opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .life-bot, .life-body, .life-bot::after, .chat-hello, .thinking .thinking-dots i { animation: none !important; }
+}
+
+
+/* ───────────── Agent orbs: each agent's colours swirling in glass (replaces the robot faces) ───────────── */
+.agent-orb { width: 100%; height: 100%; display: block; overflow: visible; }
+.agent-orb .orb-rim { fill: none; stroke: #fff; stroke-opacity: .16; stroke-width: .8; }
+.agent-orb .orb-swirl { transform-box: view-box; transform-origin: 20px 20px; animation: agentorb-turn var(--agentorb-turn, 14s) linear var(--orb-delay, 0s) infinite; }
+.agent-orb .orb-swirl > * { transform-box: view-box; transform-origin: 20px 20px; }
+.agent-orb .orb-a { animation: agentorb-drift-a 7s ease-in-out var(--orb-delay, 0s) infinite alternate; }
+.agent-orb .orb-b { animation: agentorb-drift-b 9s ease-in-out var(--orb-delay, 0s) infinite alternate; }
+.agent-orb .orb-c { animation: agentorb-drift-c 8s ease-in-out var(--orb-delay, 0s) infinite alternate; }
+@keyframes agentorb-turn { to { transform: rotate(360deg); } }
+@keyframes agentorb-drift-a { from { transform: translate(0, 0) scale(1); } to { transform: translate(3px, 2px) scale(1.12); } }
+@keyframes agentorb-drift-b { from { transform: translate(0, 0) scale(1.05); } to { transform: translate(-3px, 1px) scale(.92); } }
+@keyframes agentorb-drift-c { from { transform: translate(0, 0) scale(.95); } to { transform: translate(1px, -3px) scale(1.1); } }
+/* Waiting: a slow breath. */
+.agent-orb:is([data-state=ready],[data-state=idle],[data-state=done]) { animation: agentorb-breathe 5.5s ease-in-out var(--orb-delay, 0s) infinite; }
+@keyframes agentorb-breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+/* Working: quick, brighter, its colours racing. */
+.agent-orb[data-state=working] .orb-swirl { animation-duration: 2.6s; }
+.agent-orb[data-state=working] .orb-swirl > * { animation-duration: 1.6s; }
+.agent-orb[data-state=working] { animation: agentorb-busy 1.4s ease-in-out infinite; }
+.agent-orb[data-state=working] .orb-swirl > :is(.orb-a,.orb-b,.orb-c) { opacity: 1; }
+.agent-orb[data-state=working] .orb-base { opacity: .55; }
+@keyframes agentorb-busy { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+/* Needs you: an amber glow rises through it. */
+.agent-orb .orb-call { fill: #ffb547; animation: agentorb-call 1.8s ease-in-out infinite; transform-box: view-box; transform-origin: 20px 20px; }
+@keyframes agentorb-call { 0%, 100% { opacity: .25; transform: scale(.7); } 50% { opacity: .9; transform: scale(1.05); } }
+/* Stopped: grey and still. */
+.agent-orb[data-state=stopped] { filter: grayscale(1) brightness(.85); opacity: .7; }
+.agent-orb[data-state=stopped] * { animation: none !important; }
+@media (prefers-reduced-motion: reduce) { .agent-orb, .agent-orb * { animation: none !important; } }
+/* An orb is round, with nothing behind it. */
+:root .map-face.has-bot, :root[data-theme=light] .map-face.has-bot, :root[data-theme=dark] .map-face.has-bot { padding: 0 !important; border-radius: 50% !important; background: none !important; box-shadow: none !important; overflow: visible; }
+.library-list .library-bot { padding: 0; border-radius: 50%; background: none; }
+.thinking .thinking-bot { width: 24px; height: 24px; }
+
+/* Mavo's own orb: aurora ribbons turning slowly inside dark glass, each its own way. */
+.mavo-orb .mavo-ribbons > * { transform-box: view-box; transform-origin: 20px 20px; }
+.mavo-orb .mavo-r1 { animation: mavo-r1 11s ease-in-out infinite alternate; }
+.mavo-orb .mavo-r2 { animation: mavo-r2 14s ease-in-out infinite alternate; }
+.mavo-orb .mavo-r3 { animation: mavo-r3 9s ease-in-out infinite alternate; }
+@keyframes mavo-r1 { from { transform: rotate(-20deg) scale(1); } to { transform: rotate(160deg) scale(1.1); } }
+@keyframes mavo-r2 { from { transform: rotate(30deg) scale(1.05); } to { transform: rotate(-150deg) scale(.95); } }
+@keyframes mavo-r3 { from { transform: rotate(0deg); } to { transform: rotate(220deg) scale(1.08); } }
+.mavo-orb .mavo-halo { opacity: .55; transform-box: view-box; transform-origin: 20px 20px; animation: mavo-halo 5s ease-in-out infinite; }
+@keyframes mavo-halo { 0%, 100% { opacity: .35; } 50% { opacity: .75; } }
+.mavo-orb[data-state=working] .mavo-ribbons > * { animation-duration: 2.4s, 2.4s; }
+.mavo-orb[data-state=working] .mavo-halo { animation-duration: 1.4s; }
+.mavo-orb[data-state=stopped] { filter: grayscale(1); opacity: .7; }
+@media (prefers-reduced-motion: reduce) { .mavo-orb * { animation: none !important; } }
+.mavo-orb .mavo-core { transform-box: view-box; transform-origin: 20px 22px; animation: mavo-core 6s ease-in-out infinite; }
+@keyframes mavo-core { 0%, 100% { opacity: .7; transform: scale(.92); } 50% { opacity: 1; transform: scale(1.08); } }
+.mavo-orb[data-state=working] .mavo-core { animation-duration: 1.6s; }

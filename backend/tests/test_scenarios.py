@@ -207,6 +207,7 @@ def test_trip_chain_hands_the_forecast_to_the_next_crew(planning):
     client.put("/api/v1/pool/weather", headers=auth, json={"level": "read"})
     runtime.planner.next_reconcile = 0
     runtime.planner.reconcile_pending()
+    verify(client, auth, watch, weather=True, notifications=True)
     watch = next(
         c for c in client.get("/api/v1/crew", headers=auth).json() if c["name"] == "Trip watch"
     )
@@ -403,7 +404,12 @@ def test_planner_failures_leave_no_half_built_crew_and_the_chat_recovers(plannin
     first = client.post(
         "/api/v1/core/turn", headers=auth, json={"message": "hi", "request_id": str(uuid4())}
     )
-    assert first.status_code == 502 and "Nothing was changed" in first.json()["detail"]
+    # Unknown outcomes must use the safe diagnostic contract, not promise that
+    # nothing changed merely because the reply failed. Verify actual drafts below.
+    assert first.status_code == 502
+    assert first.json()["error"]["code"] == "core_internal_error"
+    assert "Check Activity" in first.json()["detail"]
+    assert "gateway down" not in first.json()["detail"]
     assert client.get("/api/v1/crew-drafts", headers=auth).json() == []
     coordinator.complete = AsyncMock(return_value=(CoordinatorDecision(reply="Back."), "m"))
     assert turn(planning, "hi again")["reply"] == "Back."

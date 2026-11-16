@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { api, requestLimit, resetApiForTests } from "./api";
+import { api, ApiError, requestLimit, resetApiForTests } from "./api";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({ base_url: "http://127.0.0.1:8321", token: "test-only-token" })) }));
 
@@ -49,5 +49,47 @@ describe("authenticated API boundary", () => {
     const [url, options] = fetchMock.mock.calls[0];
     expect(url).toBe("http://127.0.0.1:8321/api/v1/auth/google/cancel");
     expect(options.method).toBe("POST");
+  });
+  it('preserves structured Core failures and never automatically repeats inference',async()=>{
+    const problem={code:'core_provider_credits',message:'Insufficient Core credits.',action:'Publisher top-up required.',retryable:false,request_id:'reference'};
+    const fetchMock=vi.fn().mockResolvedValue(new Response(JSON.stringify({detail:problem.message,error:problem}),{status:503}));
+    vi.stubGlobal('fetch',fetchMock);
+    try{await api.coordinatorTurn('Hello');expect.unreachable();}catch(error){expect(error).toBeInstanceOf(ApiError);expect((error as ApiError).problem).toEqual(problem);}
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('does not claim nothing changed when a chat response is lost',async()=>{
+    const fetchMock=vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(api.coordinatorTurn('Do a task')).rejects.toMatchObject({problem:{code:'core_delivery_unknown',retryable:false}});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('bounds Core status checks and does not repeat an expired GET timeout',async()=>{
+    expect(requestLimit('/core/status')).toBe(10_000);
+    const fetchMock=vi.fn().mockRejectedValue(new DOMException('timeout','TimeoutError'));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(api.coreStatus()).rejects.toThrow('taking longer than expected');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('bounds desktop polling failures so the next check can retry promptly',async()=>{
+    expect(requestLimit('/reminders/due')).toBe(4000);
+    expect(requestLimit('/auth/firebase')).toBe(4000);
+    const fetchMock=vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(api.dueReminders()).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('classifies account startup network failures without echoing browser fetch errors',async()=>{
+    const fetchMock=vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch',fetchMock);
+    await expect(api.firebaseStatus()).rejects.toMatchObject({status:0,message:'Mavo’s local service is not reachable yet.'});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+  it('forces a fresh Core health check without invoking a model',async()=>{
+    expect(requestLimit('/core/status?refresh=true')).toBe(10_000);
+    const fetchMock=vi.fn().mockResolvedValue(new Response(JSON.stringify({configured:true,connected:true})));
+    vi.stubGlobal('fetch',fetchMock);
+    await api.coreStatus(true);
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:8321/api/v1/core/status?refresh=true');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

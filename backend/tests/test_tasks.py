@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from mavo.database import CrewInstance, TaskRun
 from mavo.schemas import CoordinatorDecision
-from mavo.task_plan import TaskPlan, levels
+from mavo.task_plan import TaskPlan, levels, validate_planning_graph
 from tests.test_planner import planning, turn  # noqa: F401
 from tests.test_scenarios import decide
 
@@ -48,9 +48,11 @@ def test_a_plan_is_checked_and_small_slips_are_put_right_not_refused():
         ["a"],
     ]  # a loop: in order
     assert fixed(step("a"), final="nope").final == "a"  # the last step is the result
-    assert [s.id for s in fixed(*[step(f"s{n}") for n in range(12)]).steps] == [
-        f"s{n}" for n in range(8)
-    ]
+    # Read back, a plan keeps every step (Mavo adds some of its own); the planner's limit of
+    # eight is checked where a plan comes in, and a longer one goes back to be shortened.
+    assert len(fixed(*[step(f"s{n}") for n in range(12)]).steps) == 12
+    with pytest.raises(ValueError, match="between one and eight"):
+        validate_planning_graph(plan(*[step(f"s{n}") for n in range(12)]))
     assert (
         fixed(step("a"), model_calls=999).model_calls == 40
         and fixed(step("a"), model_calls=0).model_calls == 2
@@ -271,7 +273,10 @@ def test_steps_that_do_not_need_each_other_run_together(client, auth):
     assert "[a]" in seen["helper_prompts"][-1][1] and "[c]" in seen["helper_prompts"][-1][1]
 
 
-def test_a_task_never_spends_more_than_the_budget_it_chose(client, auth):
+def test_a_task_never_spends_more_than_the_ceiling(client, auth, monkeypatch):
+    # The plan's own number is not the limit any more; Mavo's task ceiling is (small for the test).
+    monkeypatch.setattr("mavo.tasks.CYCLE_MAX", 2)
+    monkeypatch.setattr("mavo.limits.CYCLE_MAX", 2)
     runtime = setup(client, auth)
     scripted(runtime)
     run_id = start(
@@ -313,9 +318,9 @@ def test_a_step_that_fails_stops_only_what_depends_on_it(client, auth):
         ),
     )
     done = wait(client, auth, run_id)
-    assert (
-        done["status"] == "done" and done["result"] == "fine"
-    )  # the final step did not need the failed one
+    # The final step did not need the failed one; what did not finish is still said.
+    assert done["status"] == "done" and done["result"].startswith("fine")
+    assert done["result"].endswith("Not completed:\n- Step bad: the model is down")
     assert [s["status"] for s in done["steps"]] == ["failed", "done", "skipped", "done"]
     assert "model is down" in done["steps"][0]["error"]
 
@@ -330,6 +335,23 @@ def test_a_task_can_be_stopped(client, auth):
     time.sleep(2.5)
     assert client.get(f"/api/v1/tasks/{run_id}", headers=auth).json()["status"] == "stopped"
     assert alerts(client, auth) == []
+
+
+def test_a_stopped_task_can_be_deleted_but_a_running_one_is_stopped_first(client, auth):
+    """A stopped "Today's plan" sat on the map with no way to remove it."""
+    runtime = setup(client, auth)
+    scripted(runtime, pause=2)
+    run_id = start(client, auth, plan(step("slow"), step("next", uses=["slow"])))
+    time.sleep(0.4)
+    busy = client.delete(f"/api/v1/tasks/{run_id}", headers=auth)
+    assert busy.status_code == 409 and "Stop the task first" in busy.json()["detail"]
+    client.post(f"/api/v1/tasks/{run_id}/stop", headers=auth)
+    assert client.delete(f"/api/v1/tasks/{run_id}", headers=auth).status_code == 204
+    assert client.get(f"/api/v1/tasks/{run_id}", headers=auth).status_code == 404
+    assert run_id not in [t["id"] for t in client.get("/api/v1/tasks", headers=auth).json()]
+    assert client.delete(f"/api/v1/tasks/{run_id}", headers=auth).status_code == 404
+    time.sleep(2.5)  # the cancelled step does not bring it back
+    assert client.get(f"/api/v1/tasks/{run_id}", headers=auth).status_code == 404
 
 
 # ---- agents that use tools, once -------------------------------------------------------------
@@ -389,10 +411,12 @@ def test_an_agent_uses_the_persons_default_actions_once_and_is_deleted(client, a
 
 
 def test_an_agent_that_runs_out_of_steps_has_not_finished_and_its_last_words_are_not_the_answer(
-    client, auth
+    client, auth, monkeypatch
 ):
     """It kept reading the same page and ran out of steps. Reporting its last progress note as the
     result ("Reading the page again") told the person a task was done when nothing was."""
+    monkeypatch.setattr("mavo.tasks.RUN_MAX", 2)  # Mavo's run ceiling, small for the test
+    monkeypatch.setattr("mavo.limits.RUN_MAX", 2)
     runtime = setup(client, auth)
     allow_browser(client, auth)
     fake_site(runtime)
@@ -401,7 +425,7 @@ def test_an_agent_that_runs_out_of_steps_has_not_finished_and_its_last_words_are
     assert done["status"] == "failed" and done["result"] is None, done
     assert done["steps"][0]["status"] == "failed"
     assert "ran out of steps" in done["error"] and "Reading the page again" in done["error"]
-    assert alerts(client, auth)[0]["message"].startswith("Could not finish.")
+    assert alerts(client, auth)[0]["message"].startswith("Could not finish: it needed more steps")
 
 
 def test_an_agent_that_builds_things_is_told_to_chain_actions_and_one_that_reads_is_not():
@@ -431,7 +455,7 @@ def test_an_agent_cannot_have_more_than_the_person_turned_on_and_is_told_what_to
     done = wait(client, auth, start(client, auth, plan(step("make", "agent"))))
     assert done["status"] == "needs_you" and done["steps"][0]["status"] == "blocked"
     assert "Turn on in Actions (Defaults): Open page, Read page" in done["steps"][0]["question"]
-    assert "Set all" in done["steps"][0]["question"]
+    assert "minimum required scope" in done["steps"][0]["question"]
     assert alerts(client, auth)[0]["message"].startswith("Needs you.")
     with runtime.factory() as session:
         assert (
@@ -515,8 +539,12 @@ def test_an_existing_crew_can_be_handed_a_step(client, auth):
 
 def test_a_step_naming_a_crew_that_is_gone_fails_cleanly(client, auth):
     setup(client, auth)
-    done = wait(client, auth, start(client, auth, plan(step("ask", "crew", crew_id="not-a-crew"))))
-    assert done["status"] == "failed" and "no longer exists" in done["error"]
+    response = client.post(
+        "/api/v1/tasks",
+        headers=auth,
+        json={"plan": plan(step("ask", "crew", crew_id="not-a-crew"))},
+    )
+    assert response.status_code == 409 and "unavailable Crew" in response.text
 
 
 # ---- housekeeping --------------------------------------------------------------------------
@@ -564,9 +592,10 @@ def test_after_mavo_closed_a_running_task_is_marked_and_its_agents_are_cleared(c
     with runtime.factory() as session:
         run = session.query(TaskRun).one()
         assert (
-            run.status == "failed"
-            and "Mavo closed" in run.error
-            and run.steps[0]["status"] == "failed"
+            run.status == "needs_you"
+            and "Interrupted tool work" in run.error
+            and run.steps[0]["status"] == "blocked"
+            and run.steps[0]["interrupted"]
         )
         assert session.query(CrewInstance).count() == 0
 
@@ -1142,7 +1171,7 @@ def test_try_again_runs_the_same_plan_after_the_person_has_put_things_right(clie
     desktop.user_window_open = lambda: True
     desktop.close_user_window = close_window
     again = client.post(f"/api/v1/tasks/{blocked['id']}/retry", headers=auth)
-    assert again.status_code == 201 and again.json()["id"] != blocked["id"]
+    assert again.status_code == 201 and again.json()["id"] == blocked["id"]
     assert closed == [True]  # the sign-in window is closed first, which saves its session
     done = wait(client, auth, again.json()["id"])
     assert done["status"] == "done" and done["result"] == "https://forms.example.com/r/abc123"
@@ -1150,9 +1179,7 @@ def test_try_again_runs_the_same_plan_after_the_person_has_put_things_right(clie
     with runtime.factory() as session:
         first, second = session.get(TaskRun, blocked["id"]), session.get(TaskRun, done["id"])
         assert first.plan == second.plan and first.request == second.request
-    assert (
-        client.get(f"/api/v1/tasks/{blocked['id']}", headers=auth).json()["status"] == "needs_you"
-    )
+    assert client.get(f"/api/v1/tasks/{blocked['id']}", headers=auth).json()["status"] == "done"
     assert client.post("/api/v1/tasks/nope/retry", headers=auth).status_code == 409
 
 

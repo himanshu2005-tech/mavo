@@ -114,6 +114,23 @@ async def main():
             assert await ready_card.get_attribute('data-activity') == 'ready'
             assert await ready_card.locator('.agent-ring-motion').evaluate('el => getComputedStyle(el).animationDuration') == '6s'
             assert await busy_card.locator('.agent-ring-motion').evaluate('el => getComputedStyle(el).animationDuration') == '1.15s'
+            # Attention is communicated by status/dots, not an orange outline around Crew cards.
+            needs_card = page.locator('.graph-agent[data-state=needs]').first
+            await needs_card.wait_for(state='attached')
+            assert await needs_card.evaluate("""el => {
+                const probe=document.createElement('span');
+                probe.style.borderColor='var(--border)'; el.appendChild(probe);
+                const neutral=getComputedStyle(probe).borderColor;
+                probe.remove();
+                return getComputedStyle(el).borderColor===neutral;
+            }""")
+            canvas = page.locator('.graph-canvas')
+            original_zoom = await canvas.get_attribute('data-zoom')
+            await canvas.evaluate("el => el.dataset.zoom='far'")
+            assert await needs_card.locator('.map-face').evaluate(
+                "el => getComputedStyle(el).boxShadow"
+            ) == 'none'
+            await canvas.evaluate('(el,value) => el.dataset.zoom=value',original_zoom)
             identity_colors = await read_identity_colors()
             assert len(set(identity_colors.values())) == len(identity_colors), identity_colors
             saved = await page.evaluate("() => JSON.parse(localStorage.getItem('mavo-identity-colors-v1'))")
@@ -183,6 +200,11 @@ async def main():
             await page.screenshot(path=str(output / f"{theme}-model.png"))
             panel = await page.locator(".graph-side").bounding_box()
             assert panel and panel["x"] >= 0 and panel["x"] + panel["width"] <= 1680
+            # Return to the overview: unrelated selection deliberately keeps live nodes compact.
+            await page.keyboard.press('Escape')
+            await page.mouse.move(800, 100)
+            await page.locator('.graph-side').wait_for(state='detached')
+            await page.wait_for_timeout(200)
             # Real execution is separate from persistent enabled state and hover previews.
             async def feed_snapshot(cursor,events,runs,calls):
                 await page.evaluate("""async value => {
@@ -199,19 +221,46 @@ async def main():
             assert await page.locator('.wire-route[data-provider-active=true]').count() == 1
             assert await page.locator('.connection-row[data-execution=requesting]').count() == 1
             assert 'Requesting' in await page.locator('.connection-row[data-execution=requesting]').inner_text()
-            assert 'Model request in progress' in await page.locator('.graph-run-notices').inner_text()
+            live_agent = page.locator('.graph-agent[data-identity="crew:inbox"]')
+            live_text = await live_agent.inner_text()
+            assert 'Model request in progress' in live_text, live_text
+            assert await live_agent.get_attribute('data-live-detail') == 'true'
+            assert await page.locator('.graph-run-notices, .graph-run-notice').count() == 0
+            label_size = await live_agent.locator('.agent-execution-line').evaluate(
+                'el => el.getBoundingClientRect().height'
+            )
+            assert label_size >= 10, label_size
             await page.screenshot(path=str(output/f'{theme}-actual-model-request.png'))
+            # The attached label stays readable and inside the graph in a compact window.
+            await page.locator('.map-preview').evaluate(
+                "el => { el.style.width='840px'; el.style.height='560px'; }"
+            )
+            await page.wait_for_timeout(600)
+            canvas_bounds = await page.locator('.graph-canvas').bounding_box()
+            live_bounds = await live_agent.bounding_box()
+            assert canvas_bounds and live_bounds
+            assert live_bounds['x'] >= canvas_bounds['x']
+            assert live_bounds['x'] + live_bounds['width'] <= canvas_bounds['x'] + canvas_bounds['width']
+            assert live_bounds['y'] >= canvas_bounds['y']
+            assert live_bounds['y'] + live_bounds['height'] <= canvas_bounds['y'] + canvas_bounds['height']
+            assert await live_agent.locator('.agent-execution-line').evaluate(
+                'el => el.getBoundingClientRect().height'
+            ) >= 10
+            await page.screenshot(path=str(output/f'{theme}-inline-request-compact.png'))
+            await page.locator('.map-preview').evaluate(
+                "el => { el.style.width='1600px'; el.style.height='940px'; }"
+            )
             response={**call,'seq':3,'kind':'model_finished','status':'responded'}
             finished={**run,'seq':4,'kind':'run_finished','status':'completed'}
             await feed_snapshot(4,[response,finished],[],[])
             assert await page.locator('.provider-request-pulse').count() == 0
             assert await page.locator('.connection-row[data-execution=responded]').count() == 1
-            assert 'Run completed' in await page.locator('.graph-run-notices').inner_text()
+            assert 'Run completed' in await live_agent.inner_text()
             await page.screenshot(path=str(output/f'{theme}-actual-run-completed.png'))
             # An entire request can finish between refreshes; completion remains noticeable.
             await feed_snapshot(8,[{**run,'seq':5},{**call,'seq':6},{**response,'seq':7},{**finished,'seq':8}],[],[])
             assert await page.locator('.provider-request-pulse').count() == 0
-            assert 'Run completed' in await page.locator('.graph-run-notices').inner_text()
+            assert 'Run completed' in await live_agent.inner_text()
             await page.evaluate("""async () => {
                 const {useAppStore}=await import('/src/store/app.ts');
                 useAppStore.setState({execution:null,executionError:null});
@@ -324,6 +373,48 @@ async def main():
         for key,color in before_colors.items():
             assert after_colors[key] == color
         assert len(set(after_colors.values())) == len(after_colors)
+        # Large maps retain actual connections and readable schedule dots. All data is synthetic.
+        await page.keyboard.press('Escape')
+        await page.evaluate("""async () => {
+            const {useAppStore}=await import('/src/store/app.ts');
+            const store=useAppStore.getState(), base=store.crew[0], now=Date.now();
+            store.setCrew(Array.from({length:100},(_,i)=>({...base,id:'dense-'+i,name:'Dense fixture '+i,
+                is_running:true,status:'active',runtime_state:'waiting',route_id:'local',trigger_type:'interval',
+                review_interval_minutes:60,next_run_at:new Date(now+(1+i%59)*60000).toISOString(),
+                last_run_at:new Date(now-60000).toISOString(),
+                permissions:i%2?['model:invoke','google:gmail:read','notifications:show']:['model:invoke'],
+                configuration_plan:{draft:{requested_google_resources:['gmail'],requested_notifications:true}}
+            })));
+        }""")
+        await page.locator('.graph-canvas[data-many=true]').wait_for()
+        await page.wait_for_timeout(700)
+        assert await page.locator('.run-clock').count() == 100
+        assert await page.locator('.wire-read, .wire-act').evaluate_all(
+            "els => els.length===200 && els.every(el=>getComputedStyle(el).display!=='none')"
+        )
+        assert await page.locator('.run-clock i').evaluate_all(
+            "els => els.every(el=>el.getBoundingClientRect().width>=3.8)"
+        )
+        assert '50 pending' in await page.locator('.graph-connections').inner_text()
+        for theme in ('dark','light'):
+            await page.evaluate('value => document.documentElement.dataset.theme=value',theme)
+            await page.screenshot(path=str(output/f'{theme}-hundred-connections.png'))
+        await page.get_by_role('button',name='Show connections',exact=True).click()
+        assert await page.locator('.wire-read, .wire-act').evaluate_all(
+            "els => els.every(el=>getComputedStyle(el).display==='none')"
+        )
+        await page.get_by_role('button',name='Show connections',exact=True).click()
+        await page.get_by_role('button',name='Show scheduled-run dots',exact=True).click()
+        assert await page.locator('.run-clock').evaluate_all(
+            "els => els.every(el=>getComputedStyle(el).display==='none')"
+        )
+        await page.get_by_role('button',name='Show scheduled-run dots',exact=True).click()
+        await page.evaluate("""async () => {
+            const {useAppStore}=await import('/src/store/app.ts');
+            const store=useAppStore.getState();
+            store.upsertCrew({...store.crew[0],runtime_state:'needs_input'});
+        }""")
+        await page.wait_for_function("document.querySelectorAll('.run-clock').length===99")
         assert not errors, errors
         assert len(writes) == 6  # two tests + four policy edits, all mocked
         print(json.dumps({"presentation": "graph-grouped-connections", "categories": ["resources", "actions", "model routes"], "themes": 2, "routes": 2, "trace": kinds,

@@ -13,7 +13,7 @@ export interface Happening {
 
 const LABELS: Record<string, string> = {
   "terminal.run": "Ran a command", "browser.open": "Opened a page", "browser.search": "Searched the web", "browser.navigate": "Went to a page",
-  "browser.read": "Read a page", "browser.click": "Clicked on a page", "browser.fill": "Filled in a field", "browser.select": "Chose an option",
+  "browser.read": "Read a page", "browser.click": "Clicked on a page", "browser.fill": "Filled in a field", "browser.upload": "Attached a saved file", "browser.select": "Chose an option",
   "browser.press": "Pressed a key on a page", "browser.scroll": "Scrolled a page", "browser.wait": "Waited for a page", "browser.close": "Closed the browser",
   "browser.double_click": "Double-clicked on a page", "browser.hover": "Pointed at something on a page", "browser.drag": "Dragged on a page",
   "project.create": "Made a project folder", "project.write": "Wrote a project file", "project.read": "Read project files", "project.run": "Ran a project script",

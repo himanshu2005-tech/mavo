@@ -39,7 +39,7 @@ def test_repairs_legacy_database_with_empty_revision(tmp_path) -> None:
     assert "reminder_events" in tables
     assert "provider" in message_columns
     assert "crew_runs" in tables
-    assert revision == ("0017",)
+    assert revision == ("0020",)
 
 
 def test_incomplete_legacy_setup_becomes_a_draft_without_losing_configuration(tmp_path):
@@ -153,4 +153,4 @@ def test_repair_empty_revision_after_multiple_chat_upgrade_is_non_destructive(tm
         connection.execute("DELETE FROM alembic_version")
     run_migrations(url)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("0017",)
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == ("0020",)

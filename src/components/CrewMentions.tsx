@@ -11,13 +11,19 @@ export function mentionQuery(text: string, caret: number): { start: number; quer
 
 /** The person's Crew that fit what follows the @: names starting with it first, then any
  *  containing it. Drafts are not Crew yet. */
-export function mentionMatches(crews: CrewInstance[], query: string): CrewInstance[] {
+export type MentionTarget = CrewInstance & {parentCrewId?:string;agentId?:string;mentionRole?:string};
+export function mentionMatches(crews: CrewInstance[], query: string): MentionTarget[] {
   const q = query.trim().toLowerCase();
-  const real = crews.filter(c => c.status !== "draft");
+  const visible=crews.filter(c=>c.status!=="draft");
+  const real:MentionTarget[] = visible.flatMap(c=>[c,...(c.agents??[]).filter(a=>a.status==='active').map(a=>({...c,id:a.id,parentCrewId:c.id,agentId:a.id,mentionRole:a.role,name:`${c.name}/${a.name}`,runtime_state:a.runtime_state}))]);
   if (!q) return real.slice(0, 8);
   const starts = real.filter(c => c.name.toLowerCase().startsWith(q));
   const contains = real.filter(c => !starts.includes(c) && c.name.toLowerCase().includes(q));
-  return [...starts, ...contains].slice(0, 8);
+  const fuzzy=real.filter(c=>!starts.includes(c)&&!contains.includes(c)).filter(c=>{
+    let at=0;for(const char of c.name.toLowerCase())if(char===q[at])at++;
+    return at===q.length;
+  });
+  return [...starts, ...contains,...fuzzy].slice(0, 8);
 }
 
 /** The text with the open @query replaced by the chosen Crew's name, and where the caret goes. */
@@ -33,18 +39,18 @@ function initials(name: string): string {
 
 /** The list that opens above the message box when the person types @. */
 export function CrewMentionMenu({ crews, active, onPick, onHover }: {
-  crews: CrewInstance[]; active: number; onPick: (crew: CrewInstance) => void; onHover: (index: number) => void;
+  crews: MentionTarget[]; active: number; onPick: (crew: MentionTarget) => void; onHover: (index: number) => void;
 }) {
   if (!crews.length) return null;
-  return <div className="mention-menu" role="listbox" aria-label="Your Crew">
+  return <div id="crew-mention-options" className="mention-menu" role="listbox" aria-label="Your Crew">
     <p className="mention-head">Your Crew</p>
     {crews.map((crew, i) => {
       const next = nextRun(crew);
-      return <button key={crew.id} type="button" role="option" aria-selected={i === active} className="mention-item" data-active={i === active}
+      return <button key={crew.id} id={`crew-mention-${crew.id}`} type="button" role="option" tabIndex={-1} aria-selected={i === active} className="mention-item" data-active={i === active}
         onMouseDown={e => { e.preventDefault(); onPick(crew); }} onMouseEnter={() => onHover(i)}>
         <span className="mention-face" style={agentStyle(crew)}>{initials(crew.name)}</span>
         <span className="min-w-0 flex-1 truncate">{crew.name}</span>
-        <span className="mention-next" data-tone={next.tone}>{next.text}</span>
+        <span className="mention-next" data-tone={next.tone}>{crew.agentId?`${crew.mentionRole} · ${crew.agentId.slice(-4)}`:next.text}</span>
       </button>;
     })}
     <p className="mention-hint">↑↓ to choose · Enter to add · Esc to close</p>

@@ -93,18 +93,24 @@ def test_status_reports_real_model_discovery(client: TestClient, auth: dict[str,
     )
 
 
-def test_normal_chat_never_falls_back_to_an_agent_key(client, auth):
+def test_without_a_mavo_account_chat_plans_with_your_own_model(client, auth):
+    """No account is needed to use Mavo: not signed in to Mavo Core, chat plans with the
+    person's own model connection (their key, their choice), never a dead end."""
+    import json
     from unittest.mock import AsyncMock
     from uuid import uuid4
 
     create_route(client, auth)
     runtime = client.app.state.crew_runtime
-    runtime.router.chat = AsyncMock(side_effect=AssertionError("Agent key used for Core"))
+    runtime.router.chat = AsyncMock(
+        return_value=json.dumps({"reply": "Hello! What should I set up?"})
+    )
     response = client.post(
         "/api/v1/core/turn", headers=auth, json={"message": "Hello", "request_id": str(uuid4())}
     )
-    assert response.status_code == 503
-    runtime.router.chat.assert_not_called()
+    assert response.status_code == 200, response.text
+    assert "Hello! What should I set up?" in response.text
+    runtime.router.chat.assert_called()
 
 
 def test_chat_validates_model_name(client: TestClient, auth: dict[str, str]) -> None:
@@ -578,3 +584,47 @@ def test_device_permission_is_explicit_and_can_be_revoked(client, auth):
         ).status_code
         == 400
     )
+
+
+def test_a_model_only_mavos_hidden_helper_holds_can_be_deleted(
+    client: TestClient, auth: dict[str, str]
+) -> None:
+    """ "Nothing is using Ollama, so why can't I delete it": the hidden "Mavo tasks" alert
+    carrier is always marked running and held the model. Only the person's agents hold one."""
+    from mavo.database import CrewInstance
+    from mavo.tasks import OWNER_NAME
+
+    local = create_route(client, auth, name="Ollama", provider="ollama", model="qwen")
+    create_route(client, auth, name="Cloud", provider="openai", model="gpt-test")
+    crew = client.post(
+        "/api/v1/crew",
+        headers=auth,
+        json={
+            "template_id": "schedule",
+            "name": "Planner",
+            "responsibilities": "Plan my week.",
+            "route_id": local["id"],
+        },
+    ).json()
+    owner = client.post(
+        "/api/v1/crew",
+        headers=auth,
+        json={
+            "template_id": "operator",
+            "name": "helper",
+            "responsibilities": "Carries alerts.",
+            "route_id": local["id"],
+        },
+    ).json()
+    factory = client.app.state.crew_runtime.factory
+    with factory() as session:
+        hidden = session.get(CrewInstance, owner["id"])
+        hidden.name, hidden.hidden, hidden.is_running = OWNER_NAME, True, True
+        session.commit()
+
+    held = client.delete(f"/api/v1/routes/{local['id']}", headers=auth)
+    assert held.status_code == 409 and held.json()["detail"].startswith("Planner uses this model")
+    assert client.delete(f"/api/v1/crew/{crew['id']}", headers=auth).status_code == 204
+    assert client.delete(f"/api/v1/routes/{local['id']}", headers=auth).status_code == 204
+    with factory() as session:
+        assert session.get(CrewInstance, owner["id"]).route_id is None

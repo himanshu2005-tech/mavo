@@ -22,11 +22,14 @@ import re
 from datetime import datetime
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from mavo.database import ActionRequest, CrewInstance, utcnow
 
-VERDICT = re.compile(r"^\s*VERDICT:\s*(pass|fix)\s*$", re.I | re.M)
+# A verdict that starts its own line, however it is decorated: "VERDICT: pass", "**VERDICT:
+# pass**", "VERDICT: fix - the time is wrong". Only the bare form was read, and a verifier's bold
+# "pass" failed a test. One mentioned mid-sentence is still not a verdict.
+VERDICT = re.compile(r"^[ \t*_`>#-]*VERDICT\s*[:=-]\s*[*_`]*\s*(pass|fix)\b[*_`]*", re.I | re.M)
 REVIEWER_RULES = (
     "\nYou are a REVIEWER in a line of agents. Check the work handed to you against the job "
     "and the person's standards: what is wrong or missing, and exactly how to fix it. Do not "
@@ -35,7 +38,10 @@ REVIEWER_RULES = (
     "change, most important first)."
 )
 FILE_KEYS = ("path", "to", "backup", "file", "folder", "created_path")
-WRITING = ("project.write", "project.create", "notes.write", "files.move", "files.backup")
+WRITING = (
+    "project.write", "project.create", "notes.write", "files.move", "files.backup",
+    "files.copy", "files.write", "files.delete",
+)
 WAKES = {"waiting", "waiting_event", "needs_input"}
 
 
@@ -98,6 +104,52 @@ def trim_handoffs(handoffs: list, used_at: str) -> list:
 
 
 def _add_handoff(crew: CrewInstance, note: dict) -> None:
+    session = object_session(crew)
+    if session is not None:
+        from mavo.orchestration import WorkMessage, event, publish
+
+        kind = {"revision": "revision_request", "report": "result", "task": "task_assignment"}.get(
+            note.get("kind"), "result"
+        )
+        sender = "crew:" + note["from_id"] if note.get("from_id") else "user"
+        source_run = session.info.get("handoff_run_id")
+        # One source run can make several different assignments in a bounded review cycle.
+        import hashlib
+
+        digest = hashlib.sha256(str(note.get("result", "")).encode()).hexdigest()[:20]
+        key = f"handoff:{source_run or note['at']}:{sender}:{crew.id}:{kind}:{digest}"
+        try:
+            message = publish(
+                session,
+                WorkMessage(
+                    key=key,
+                    kind=kind,
+                    sender=sender,
+                    recipients=[f"crew:{crew.id}"],
+                    run_id=source_run,
+                    summary=note.get("result", "")[:6000],
+                    artifacts=note.get("files", [])[:12],
+                    handoff_role=note.get("kind")
+                    if note.get("kind") in {"report", "task", "revision", "person"}
+                    else "result",
+                ),
+            )
+        except PermissionError:
+            hold(
+                crew,
+                {"kind": "sharing", "from_id": note.get("from_id")},
+                "This handoff needs separately authorized access to the source information.",
+            )
+            event(
+                session,
+                key + ":blocked",
+                "blocked",
+                sender,
+                {"summary": "Handoff blocked: recipient lacks source information access."},
+                crew_id=crew.id,
+            )
+            return
+        note = {**note, "message_id": message.id}
     observation = crew.observation or {}
     crew.observation = {
         **observation,
@@ -138,6 +190,24 @@ def hold(crew: CrewInstance, held: dict, question: str) -> None:
     if crew.is_running:
         crew.runtime_state = "needs_input"
         crew.next_run_at = None
+    session = object_session(crew)
+    if session and not crew.hidden:
+        import hashlib
+
+        from mavo.orchestration import event
+
+        kind = "approval_request" if held.get("kind") in {"approve", "review_stuck"} else "question"
+        key = hashlib.sha256((question + str(held)).encode()).hexdigest()[:24]
+        event(
+            session,
+            f"handoff-question:{crew.id}:{key}",
+            kind,
+            "core",
+            {"summary": question, "name": crew.name, "held": True},
+            crew_id=crew.id,
+            pending=True,
+            private=crew.template_id in {"health", "wellbeing"},
+        )
 
 
 def send_back(
@@ -183,7 +253,12 @@ def members_of(session: Session, lead: CrewInstance) -> list[CrewInstance]:
 
 def lead_rules(session: Session, lead: CrewInstance) -> str:
     team = [
-        {"name": m.name, "job": (m.responsibilities or "")[:400], "running": m.is_running}
+        {
+            "id": m.id,
+            "name": m.name,
+            "job": (m.responsibilities or "")[:400],
+            "running": m.is_running,
+        }
         for m in members_of(session, lead)
     ]
     steps = int((lead.observation or {}).get("round_steps", 0))
@@ -200,7 +275,7 @@ def lead_rules(session: Session, lead: CrewInstance) -> str:
         "costly or irreversible, or a real choice of taste); finish when the "
         "goal for this round is "
         "met. End your answer with exactly one line, valid JSON after the colon: "
-        '`DECISION: {"next": "<member name>", "task": "<what to do>"}` or '
+        '`DECISION: {"next": "<member id>", "task": "<what to do>"}` or '
         '`DECISION: {"ask": "<one short question for the person>"}` or '
         '`DECISION: {"done": "<what was achieved this round>"}`.'
     )
@@ -223,7 +298,12 @@ def _lead_decides(session: Session, lead: CrewInstance, result: str) -> None:
     if decision.get("next"):
         name = str(decision["next"]).strip().lower()
         member = next(
-            (m for m in members_of(session, lead) if m.name.strip().lower() == name), None
+            (
+                m
+                for m in members_of(session, lead)
+                if m.id == str(decision["next"]).strip() or m.name.strip().lower() == name
+            ),
+            None,
         )
         if member is None:
             hold(
